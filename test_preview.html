@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IoMT CardioAI — Test Results</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #07090d;
+  --surface: #0b0f14;
+  --panel: #0f141a;
+  --card: #131920;
+  --border: #1c2530;
+  --border2: #243040;
+  --pass: #22d688;
+  --fail: #f04060;
+  --warn: #f0a020;
+  --accent: #38b8f8;
+  --text: #b8ccd8;
+  --muted: #465a6a;
+  --dim: #2a3a4a;
+  --pass-bg: rgba(34,214,136,0.06);
+  --fail-bg: rgba(240,64,96,0.07);
+}
+
+body {
+  font-family: 'IBM Plex Mono', monospace;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  overflow: hidden;
+}
+
+/* ─── HEADER ─── */
+.header {
+  padding: 20px 28px 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.title-block h1 {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 1.35rem;
+  font-weight: 700;
+  color: #fff;
+  letter-spacing: -0.02em;
+}
+
+.title-block h1 em { color: var(--pass); font-style: normal; }
+
+.title-block .subtitle {
+  margin-top: 3px;
+  font-size: 0.6rem;
+  color: var(--muted);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.stats-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+
+.stat {
+  text-align: center;
+  padding: 8px 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.stat .n {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 1.4rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.stat .l {
+  font-size: 0.55rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-top: 3px;
+}
+
+.stat.s-pass { border-color: rgba(34,214,136,0.25); }
+.stat.s-pass .n { color: var(--pass); }
+.stat.s-fail { border-color: rgba(240,64,96,0.25); }
+.stat.s-fail .n { color: var(--fail); }
+.stat.s-info .n { color: var(--accent); }
+
+/* ─── PROGRESS BAR ─── */
+.prog-wrap {
+  padding: 14px 28px 0;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.prog-track {
+  flex: 1;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.prog-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--pass), var(--accent));
+  border-radius: 2px;
+  transition: width 1.4s cubic-bezier(0.22, 1, 0.36, 1);
+  box-shadow: 0 0 10px rgba(34,214,136,0.4);
+}
+
+.prog-label {
+  font-size: 0.62rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* ─── MAIN LAYOUT ─── */
+.body-layout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  overflow: hidden;
+  border-top: 1px solid var(--border);
+  margin-top: 14px;
+}
+
+/* ─── SIDEBAR ─── */
+.sidebar {
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+  padding: 10px 0;
+  background: var(--surface);
+}
+
+.sidebar::-webkit-scrollbar { width: 3px; }
+.sidebar::-webkit-scrollbar-thumb { background: var(--dim); }
+
+.sb-label {
+  padding: 10px 14px 5px;
+  font-size: 0.52rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+
+.sb-item {
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-left: 2px solid transparent;
+  cursor: pointer;
+  padding: 6px 14px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  transition: all 0.12s;
+}
+
+.sb-item:hover { background: rgba(255,255,255,0.025); }
+
+.sb-item.active {
+  background: var(--pass-bg);
+  border-left-color: var(--pass);
+}
+
+.sb-dot {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--pass);
+  box-shadow: 0 0 5px var(--pass);
+}
+
+.sb-dot.has-fail { background: var(--fail); box-shadow: 0 0 5px var(--fail); }
+
+.sb-name {
+  font-size: 0.66rem;
+  color: var(--text);
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sb-count {
+  font-size: 0.58rem;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: rgba(34,214,136,0.1);
+  color: var(--pass);
+  flex-shrink: 0;
+}
+
+.sb-count.has-fail {
+  background: rgba(240,64,96,0.1);
+  color: var(--fail);
+}
+
+/* ─── MAIN PANEL ─── */
+.main {
+  overflow-y: auto;
+  background: var(--panel);
+}
+
+.main::-webkit-scrollbar { width: 3px; }
+.main::-webkit-scrollbar-thumb { background: var(--dim); }
+
+.main-inner {
+  padding: 18px 22px;
+}
+
+/* filter chips */
+.filters {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 16px;
+  align-items: center;
+}
+
+.filter-chip {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.6rem;
+  letter-spacing: 0.08em;
+  padding: 4px 10px;
+  border-radius: 3px;
+  border: 1px solid var(--border2);
+  background: var(--card);
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.12s;
+  text-transform: uppercase;
+}
+
+.filter-chip:hover { border-color: var(--accent); color: var(--accent); }
+.filter-chip.on { background: var(--pass-bg); border-color: var(--pass); color: var(--pass); }
+.filter-chip.on-fail { background: var(--fail-bg); border-color: var(--fail); color: var(--fail); }
+
+.search-box {
+  margin-left: auto;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.62rem;
+  background: var(--card);
+  border: 1px solid var(--border2);
+  border-radius: 3px;
+  padding: 4px 10px;
+  color: var(--text);
+  width: 180px;
+  outline: none;
+  transition: border-color 0.12s;
+}
+
+.search-box:focus { border-color: var(--accent); }
+.search-box::placeholder { color: var(--dim); }
+
+/* suite section header */
+.suite-hdr {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.suite-hdr h2 {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: #fff;
+}
+
+.suite-hdr .s-meta {
+  font-size: 0.6rem;
+  color: var(--muted);
+  margin-top: 1px;
+}
+
+/* test rows */
+.test-list { }
+
+.t-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 3px;
+  margin-bottom: 2px;
+  border: 1px solid transparent;
+  animation: fadeSlide 0.2s ease both;
+}
+
+.t-row:hover { background: rgba(255,255,255,0.02); border-color: var(--border); }
+.t-row.failed { background: var(--fail-bg); border-color: rgba(240,64,96,0.15); }
+
+@keyframes fadeSlide {
+  from { opacity:0; transform: translateX(-4px); }
+  to   { opacity:1; transform: translateX(0); }
+}
+
+.t-status {
+  font-size: 0.58rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  width: 40px;
+  flex-shrink: 0;
+}
+
+.t-status.pass { color: var(--pass); }
+.t-status.fail { color: var(--fail); }
+
+.t-name {
+  font-size: 0.68rem;
+  color: var(--text);
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.t-param {
+  color: var(--accent);
+  opacity: 0.65;
+  font-size: 0.62rem;
+}
+
+.t-pct {
+  font-size: 0.58rem;
+  color: var(--dim);
+  width: 32px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+/* parametrized sub-rows */
+.param-rows {
+  margin: 1px 0 3px 44px;
+  border-left: 1px solid var(--border2);
+  padding-left: 10px;
+}
+
+.p-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  border-radius: 2px;
+  animation: fadeSlide 0.15s ease both;
+}
+
+.p-row:hover { background: rgba(255,255,255,0.02); }
+
+.p-dot {
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  background: var(--pass);
+  flex-shrink: 0;
+}
+
+.p-name {
+  font-size: 0.62rem;
+  color: var(--muted);
+}
+
+.p-name .param-val { color: var(--accent); opacity: 0.75; }
+
+/* empty state */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 0;
+  gap: 10px;
+  color: var(--dim);
+  font-size: 0.7rem;
+}
+
+/* ─── FOOTER ─── */
+.footer {
+  border-top: 1px solid var(--border);
+  padding: 6px 28px;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  background: var(--surface);
+  font-size: 0.58rem;
+  color: var(--muted);
+  letter-spacing: 0.1em;
+}
+
+.footer-item { display: flex; align-items: center; gap: 5px; }
+.footer-dot { width: 5px; height: 5px; border-radius: 50%; }
+.footer-dot.p { background: var(--pass); }
+.footer-dot.f { background: var(--fail); }
+.footer-dot.w { background: var(--warn); }
+
+.footer-right {
+  margin-left: auto;
+  background: rgba(34,214,136,0.08);
+  border: 1px solid rgba(34,214,136,0.15);
+  color: var(--pass);
+  padding: 2px 10px;
+  border-radius: 99px;
+  font-size: 0.57rem;
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="title-block">
+    <h1>IoMT <em>CardioAI</em> — Pytest Results</h1>
+    <div class="subtitle">test_iomt_cardioai_handshake.py &nbsp;·&nbsp; pytest 9.0.2 &nbsp;·&nbsp; python 3.12.3 &nbsp;·&nbsp; 6.76s</div>
+  </div>
+  <div class="stats-row">
+    <div class="stat s-pass"><div class="n">200</div><div class="l">Passed</div></div>
+    <div class="stat s-fail"><div class="n">0</div><div class="l">Failed</div></div>
+    <div class="stat s-info"><div class="n">20</div><div class="l">Suites</div></div>
+    <div class="stat s-info"><div class="n">88</div><div class="l">Warnings</div></div>
+  </div>
+</div>
+
+<div class="prog-wrap">
+  <div class="prog-track"><div class="prog-fill" id="pFill" style="width:0"></div></div>
+  <div class="prog-label" id="pLabel">0 / 200</div>
+</div>
+
+<div class="body-layout">
+  <nav class="sidebar" id="sidebar"></nav>
+  <main class="main" id="mainArea"><div class="main-inner" id="mainInner"></div></main>
+</div>
+
+<footer class="footer">
+  <div class="footer-item"><div class="footer-dot p"></div> PASSED</div>
+  <div class="footer-item"><div class="footer-dot f"></div> FAILED</div>
+  <div class="footer-item"><div class="footer-dot w"></div> 88 warnings (datetime.utcnow deprecation)</div>
+  <div class="footer-right">✓ 200/200 · 100% · 6.76s</div>
+</footer>
+
+<script>
+const SUITES = [{"id": "TestDataModels", "label": "Data Models", "passed": 5, "failed": 0, "tests": [{"suite": "TestDataModels", "name": "test_device_data_default_quality", "status": "PASSED", "pct": 0}, {"suite": "TestDataModels", "name": "test_alert_notified_parties_starts_empty", "status": "PASSED", "pct": 1}, {"suite": "TestDataModels", "name": "test_device_type_enum_values", "status": "PASSED", "pct": 1}, {"suite": "TestDataModels", "name": "test_alert_level_enum_values", "status": "PASSED", "pct": 2}, {"suite": "TestDataModels", "name": "test_all_arrhythmia_types_present", "status": "PASSED", "pct": 2}]}, {"id": "TestMessageBus", "label": "Message Bus", "passed": 7, "failed": 0, "tests": [{"suite": "TestMessageBus", "name": "test_subscribe_and_receive", "status": "PASSED", "pct": 3}, {"suite": "TestMessageBus", "name": "test_async_subscriber", "status": "PASSED", "pct": 3}, {"suite": "TestMessageBus", "name": "test_multiple_subscribers_same_topic", "status": "PASSED", "pct": 4}, {"suite": "TestMessageBus", "name": "test_no_bleed_between_topics", "status": "PASSED", "pct": 4}, {"suite": "TestMessageBus", "name": "test_message_history_appended", "status": "PASSED", "pct": 5}, {"suite": "TestMessageBus", "name": "test_subscriber_exception_does_not_crash_bus", "status": "PASSED", "pct": 5}, {"suite": "TestMessageBus", "name": "test_publish_to_topic_with_no_subscribers", "status": "PASSED", "pct": 6}]}, {"id": "TestBaseAgent", "label": "Base Agent", "passed": 3, "failed": 0, "tests": [{"suite": "TestBaseAgent", "name": "test_start_sets_running_true", "status": "PASSED", "pct": 6}, {"suite": "TestBaseAgent", "name": "test_stop_sets_running_false", "status": "PASSED", "pct": 7}, {"suite": "TestBaseAgent", "name": "test_agent_id_stored", "status": "PASSED", "pct": 7}]}, {"id": "TestDataAcquisitionAgent", "label": "Acquisition Agent", "passed": 15, "failed": 0, "tests": [{"suite": "TestDataAcquisitionAgent", "name": "test_register_device_stores_entry", "status": "PASSED", "pct": 8}, {"suite": "TestDataAcquisitionAgent", "name": "test_register_creates_stream_queue", "status": "PASSED", "pct": 8}, {"suite": "TestDataAcquisitionAgent", "name": "test_register_publishes_device_registered", "status": "PASSED", "pct": 9}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_unknown_device_silent", "status": "PASSED", "pct": 9}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_publishes_data_raw", "status": "PASSED", "pct": 10}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_updates_last_seen", "status": "PASSED", "pct": 10}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_normal_data", "status": "PASSED", "pct": 11}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_none_value", "status": "PASSED", "pct": 11}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_extreme_hr_high", "status": "PASSED", "pct": 12}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_extreme_hr_low", "status": "PASSED", "pct": 12}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_boundary_hr_exactly_30", "status": "PASSED", "pct": 13}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_boundary_hr_exactly_250", "status": "PASSED", "pct": 13}, {"suite": "TestDataAcquisitionAgent", "name": "test_process_dispatches_stream", "status": "PASSED", "pct": 14}, {"suite": "TestDataAcquisitionAgent", "name": "test_process_ignores_non_dict", "status": "PASSED", "pct": 14}, {"suite": "TestDataAcquisitionAgent", "name": "test_bus_device_register_topic_triggers_register", "status": "PASSED", "pct": 15}]}, {"id": "TestDataProcessingAgent", "label": "Processing Agent", "passed": 12, "failed": 0, "tests": [{"suite": "TestDataProcessingAgent", "name": "test_low_quality_dropped", "status": "PASSED", "pct": 15}, {"suite": "TestDataProcessingAgent", "name": "test_quality_threshold_boundary_accepted", "status": "PASSED", "pct": 16}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_signal_type", "status": "PASSED", "pct": 16}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_features_populated", "status": "PASSED", "pct": 17}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_rr_mean_from_hr", "status": "PASSED", "pct": 17}, {"suite": "TestDataProcessingAgent", "name": "test_bp_signal_type", "status": "PASSED", "pct": 18}, {"suite": "TestDataProcessingAgent", "name": "test_bp_features_correct", "status": "PASSED", "pct": 18}, {"suite": "TestDataProcessingAgent", "name": "test_bp_map_formula", "status": "PASSED", "pct": 19}, {"suite": "TestDataProcessingAgent", "name": "test_spo2_features", "status": "PASSED", "pct": 19}, {"suite": "TestDataProcessingAgent", "name": "test_generic_passthrough", "status": "PASSED", "pct": 20}, {"suite": "TestDataProcessingAgent", "name": "test_dispatch_routes_ecg", "status": "PASSED", "pct": 20}, {"suite": "TestDataProcessingAgent", "name": "test_dispatch_routes_bp", "status": "PASSED", "pct": 21}]}, {"id": "TestPatternRecognitionAgent", "label": "Pattern Recognition", "passed": 30, "failed": 0, "tests": [{"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[40-30-100-ArrhythmiaType.BRADYCARDIA]", "status": "PASSED", "pct": 21}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[72-30-95-ArrhythmiaType.NORMAL_SINUS]", "status": "PASSED", "pct": 22}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[115-80-90-ArrhythmiaType.ATRIAL_FIBRILLATION]", "status": "PASSED", "pct": 22}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[160-20-135-ArrhythmiaType.VENTRICULAR_TACHYCARDIA]", "status": "PASSED", "pct": 23}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[110-25-90-ArrhythmiaType.TACHYCARDIA]", "status": "PASSED", "pct": 23}, {"suite": "TestPatternRecognitionAgent", "name": "test_bradycardia_priority_over_wide_qrs", "status": "PASSED", "pct": 24}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.2-True]", "status": "PASSED", "pct": 24}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[-0.15-True]", "status": "PASSED", "pct": 25}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.05-False]", "status": "PASSED", "pct": 25}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.1-False]", "status": "PASSED", "pct": 26}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.101-True]", "status": "PASSED", "pct": 26}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[115-75-normal]", "status": "PASSED", "pct": 27}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[122-79-elevated]", "status": "PASSED", "pct": 27}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[132-82-stage_1]", "status": "PASSED", "pct": 28}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[145-92-stage_2]", "status": "PASSED", "pct": 28}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[185-125-hypertensive_crisis]", "status": "PASSED", "pct": 29}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[200-110-hypertensive_crisis]", "status": "PASSED", "pct": 29}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[120-80-stage_1]", "status": "PASSED", "pct": 30}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[130-80-stage_1]", "status": "PASSED", "pct": 30}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_pattern_required_keys", "status": "PASSED", "pct": 31}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_pattern_type_label", "status": "PASSED", "pct": 31}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_confidence_range", "status": "PASSED", "pct": 32}, {"suite": "TestPatternRecognitionAgent", "name": "test_abnormal_qt_high", "status": "PASSED", "pct": 32}, {"suite": "TestPatternRecognitionAgent", "name": "test_abnormal_qt_low", "status": "PASSED", "pct": 33}, {"suite": "TestPatternRecognitionAgent", "name": "test_normal_qt", "status": "PASSED", "pct": 33}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_pattern_type", "status": "PASSED", "pct": 34}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_hypotension_flag", "status": "PASSED", "pct": 34}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_no_hypotension_normal", "status": "PASSED", "pct": 35}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_wide_pulse_pressure", "status": "PASSED", "pct": 35}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_publishes_to_bus", "status": "PASSED", "pct": 36}]}, {"id": "TestDiagnosticAgent", "label": "Diagnostic Agent", "passed": 21, "failed": 0, "tests": [{"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-Atrial Fibrillation]", "status": "PASSED", "pct": 36}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.VENTRICULAR_TACHYCARDIA-Critical]", "status": "PASSED", "pct": 37}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.NORMAL_SINUS-Normal]", "status": "PASSED", "pct": 37}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.BRADYCARDIA-Bradycardia]", "status": "PASSED", "pct": 38}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.TACHYCARDIA-Tachycardia]", "status": "PASSED", "pct": 38}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_bp_includes_stage", "status": "PASSED", "pct": 39}, {"suite": "TestDiagnosticAgent", "name": "test_ascvd_in_range", "status": "PASSED", "pct": 39}, {"suite": "TestDiagnosticAgent", "name": "test_hf_risk_in_range", "status": "PASSED", "pct": 40}, {"suite": "TestDiagnosticAgent", "name": "test_stroke_risk_elevated_for_afib", "status": "PASSED", "pct": 40}, {"suite": "TestDiagnosticAgent", "name": "test_stroke_risk_low_without_afib", "status": "PASSED", "pct": 41}, {"suite": "TestDiagnosticAgent", "name": "test_scd_high_for_vtach", "status": "PASSED", "pct": 41}, {"suite": "TestDiagnosticAgent", "name": "test_scd_low_for_normal", "status": "PASSED", "pct": 42}, {"suite": "TestDiagnosticAgent", "name": "test_afib_anticoagulation_recommended", "status": "PASSED", "pct": 42}, {"suite": "TestDiagnosticAgent", "name": "test_vtach_immediate_intervention", "status": "PASSED", "pct": 43}, {"suite": "TestDiagnosticAgent", "name": "test_high_ascvd_statin", "status": "PASSED", "pct": 43}, {"suite": "TestDiagnosticAgent", "name": "test_ischemia_recommendations", "status": "PASSED", "pct": 44}, {"suite": "TestDiagnosticAgent", "name": "test_normal_no_recommendations", "status": "PASSED", "pct": 44}, {"suite": "TestDiagnosticAgent", "name": "test_generate_diagnosis_type", "status": "PASSED", "pct": 45}, {"suite": "TestDiagnosticAgent", "name": "test_generate_diagnosis_risk_scores_present", "status": "PASSED", "pct": 45}, {"suite": "TestDiagnosticAgent", "name": "test_process_stores_patient_history", "status": "PASSED", "pct": 46}, {"suite": "TestDiagnosticAgent", "name": "test_process_publishes_to_bus", "status": "PASSED", "pct": 46}]}, {"id": "TestAlertMonitoringAgent", "label": "Alert Monitoring", "passed": 22, "failed": 0, "tests": [{"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.VENTRICULAR_TACHYCARDIA-supporting0-AlertLevel.CRITICAL]", "status": "PASSED", "pct": 47}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.VENTRICULAR_FIBRILLATION-supporting1-AlertLevel.CRITICAL]", "status": "PASSED", "pct": 47}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-supporting2-AlertLevel.HIGH]", "status": "PASSED", "pct": 48}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-supporting3-AlertLevel.MEDIUM]", "status": "PASSED", "pct": 48}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_high_scd_risk", "status": "PASSED", "pct": 49}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_high_stroke_is_medium", "status": "PASSED", "pct": 49}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_ischemia_is_high", "status": "PASSED", "pct": 50}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_normal_is_none", "status": "PASSED", "pct": 50}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.CRITICAL-PREPARE_DEFIBRILLATOR]", "status": "PASSED", "pct": 51}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.CRITICAL-ACTIVATE_RAPID_RESPONSE]", "status": "PASSED", "pct": 51}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.HIGH-NOTIFY_CARDIOLOGIST]", "status": "PASSED", "pct": 52}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.HIGH-REVIEW_WITHIN_15_MIN]", "status": "PASSED", "pct": 52}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.MEDIUM-NOTIFY_PRIMARY_CARE]", "status": "PASSED", "pct": 53}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.LOW-ROUTINE_REVIEW]", "status": "PASSED", "pct": 53}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.CRITICAL-emergency_services]", "status": "PASSED", "pct": 54}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.CRITICAL-rapid_response_team]", "status": "PASSED", "pct": 54}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.HIGH-primary_cardiologist]", "status": "PASSED", "pct": 55}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.MEDIUM-primary_care_physician]", "status": "PASSED", "pct": 55}, {"suite": "TestAlertMonitoringAgent", "name": "test_create_alert_stored", "status": "PASSED", "pct": 56}, {"suite": "TestAlertMonitoringAgent", "name": "test_create_alert_correct_level", "status": "PASSED", "pct": 56}, {"suite": "TestAlertMonitoringAgent", "name": "test_dispatch_publishes_to_bus", "status": "PASSED", "pct": 57}, {"suite": "TestAlertMonitoringAgent", "name": "test_dispatch_populates_notified_parties", "status": "PASSED", "pct": 57}]}, {"id": "TestPersonalizationAgent", "label": "Personalization", "passed": 11, "failed": 0, "tests": [{"suite": "TestPersonalizationAgent", "name": "test_new_patient_profile_created", "status": "PASSED", "pct": 58}, {"suite": "TestPersonalizationAgent", "name": "test_sample_count_increments", "status": "PASSED", "pct": 58}, {"suite": "TestPersonalizationAgent", "name": "test_running_average_stable_on_constant_input", "status": "PASSED", "pct": 59}, {"suite": "TestPersonalizationAgent", "name": "test_learn_from_alert_stores_entry", "status": "PASSED", "pct": 59}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[heart_rate_high-100]", "status": "PASSED", "pct": 60}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[spo2_low-92]", "status": "PASSED", "pct": 60}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[systolic_high-140]", "status": "PASSED", "pct": 61}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[diastolic_high-90]", "status": "PASSED", "pct": 61}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[unknown_param-0]", "status": "PASSED", "pct": 62}, {"suite": "TestPersonalizationAgent", "name": "test_personalized_threshold_falls_back_to_default", "status": "PASSED", "pct": 62}, {"suite": "TestPersonalizationAgent", "name": "test_non_numeric_features_skipped", "status": "PASSED", "pct": 63}]}, {"id": "TestCommunicationAgent", "label": "Communication", "passed": 8, "failed": 0, "tests": [{"suite": "TestCommunicationAgent", "name": "test_summary_contains_patient_id", "status": "PASSED", "pct": 63}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_level", "status": "PASSED", "pct": 64}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_action", "status": "PASSED", "pct": 64}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_notified", "status": "PASSED", "pct": 65}, {"suite": "TestCommunicationAgent", "name": "test_generate_report_stored", "status": "PASSED", "pct": 65}, {"suite": "TestCommunicationAgent", "name": "test_report_structure", "status": "PASSED", "pct": 66}, {"suite": "TestCommunicationAgent", "name": "test_multiple_reports_accumulate", "status": "PASSED", "pct": 66}, {"suite": "TestCommunicationAgent", "name": "test_handle_alert_no_exception", "status": "PASSED", "pct": 67}]}, {"id": "TestCardioAISystem", "label": "CardioAI Coordinator", "passed": 13, "failed": 0, "tests": [{"suite": "TestCardioAISystem", "name": "test_seven_agents_initialised", "status": "PASSED", "pct": 67}, {"suite": "TestCardioAISystem", "name": "test_all_expected_agent_keys", "status": "PASSED", "pct": 68}, {"suite": "TestCardioAISystem", "name": "test_start_all_running", "status": "PASSED", "pct": 68}, {"suite": "TestCardioAISystem", "name": "test_stop_all_stopped", "status": "PASSED", "pct": 69}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[normal-60-90]", "status": "PASSED", "pct": 69}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[afib-110-150]", "status": "PASSED", "pct": 70}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[vtach-150-200]", "status": "PASSED", "pct": 70}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[bradycardia-35-50]", "status": "PASSED", "pct": 71}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[normal-110-130]", "status": "PASSED", "pct": 71}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[hypertension-140-170]", "status": "PASSED", "pct": 72}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[hypertensive_crisis-180-220]", "status": "PASSED", "pct": 72}, {"suite": "TestCardioAISystem", "name": "test_simulate_ecg_registers_device", "status": "PASSED", "pct": 73}, {"suite": "TestCardioAISystem", "name": "test_all_agents_share_same_bus", "status": "PASSED", "pct": 73}]}, {"id": "TestProtocolHelpers", "label": "Protocol Helpers", "passed": 6, "failed": 0, "tests": [{"suite": "TestProtocolHelpers", "name": "test_build_message_fields", "status": "PASSED", "pct": 74}, {"suite": "TestProtocolHelpers", "name": "test_build_message_unique_ids", "status": "PASSED", "pct": 74}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_valid", "status": "PASSED", "pct": 75}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_invalid_json", "status": "PASSED", "pct": 75}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_empty_string", "status": "PASSED", "pct": 76}, {"suite": "TestProtocolHelpers", "name": "test_all_msg_types_roundtrip", "status": "PASSED", "pct": 76}]}, {"id": "TestHandshakeConfig", "label": "Handshake Config", "passed": 5, "failed": 0, "tests": [{"suite": "TestHandshakeConfig", "name": "test_default_port", "status": "PASSED", "pct": 77}, {"suite": "TestHandshakeConfig", "name": "test_default_queue_size", "status": "PASSED", "pct": 77}, {"suite": "TestHandshakeConfig", "name": "test_default_reconnect_attempts", "status": "PASSED", "pct": 78}, {"suite": "TestHandshakeConfig", "name": "test_default_jwt_algorithm", "status": "PASSED", "pct": 78}, {"suite": "TestHandshakeConfig", "name": "test_override_values", "status": "PASSED", "pct": 79}]}, {"id": "TestSecurityManager", "label": "Security Manager", "passed": 12, "failed": 0, "tests": [{"suite": "TestSecurityManager", "name": "test_challenge_decodes_to_16_bytes", "status": "PASSED", "pct": 79}, {"suite": "TestSecurityManager", "name": "test_challenge_unique", "status": "PASSED", "pct": 80}, {"suite": "TestSecurityManager", "name": "test_sign_is_deterministic", "status": "PASSED", "pct": 80}, {"suite": "TestSecurityManager", "name": "test_verify_correct_signature", "status": "PASSED", "pct": 81}, {"suite": "TestSecurityManager", "name": "test_verify_wrong_signature", "status": "PASSED", "pct": 81}, {"suite": "TestSecurityManager", "name": "test_verify_tampered_challenge", "status": "PASSED", "pct": 82}, {"suite": "TestSecurityManager", "name": "test_token_is_string", "status": "PASSED", "pct": 82}, {"suite": "TestSecurityManager", "name": "test_token_correct_sub", "status": "PASSED", "pct": 83}, {"suite": "TestSecurityManager", "name": "test_token_device_ids", "status": "PASSED", "pct": 83}, {"suite": "TestSecurityManager", "name": "test_expired_token_rejected", "status": "PASSED", "pct": 84}, {"suite": "TestSecurityManager", "name": "test_wrong_jwt_secret_rejected", "status": "PASSED", "pct": 84}, {"suite": "TestSecurityManager", "name": "test_different_secrets_different_sigs", "status": "PASSED", "pct": 85}]}, {"id": "TestDeviceSessionRegistry", "label": "Device Registry", "passed": 12, "failed": 0, "tests": [{"suite": "TestDeviceSessionRegistry", "name": "test_register_returns_session", "status": "PASSED", "pct": 85}, {"suite": "TestDeviceSessionRegistry", "name": "test_get_registered", "status": "PASSED", "pct": 86}, {"suite": "TestDeviceSessionRegistry", "name": "test_get_unknown_returns_none", "status": "PASSED", "pct": 86}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_increments_count", "status": "PASSED", "pct": 87}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_sets_last_data_at", "status": "PASSED", "pct": 87}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_resets_missed_heartbeats", "status": "PASSED", "pct": 88}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_inactive", "status": "PASSED", "pct": 88}, {"suite": "TestDeviceSessionRegistry", "name": "test_active_devices_excludes_inactive", "status": "PASSED", "pct": 89}, {"suite": "TestDeviceSessionRegistry", "name": "test_summary_counts", "status": "PASSED", "pct": 89}, {"suite": "TestDeviceSessionRegistry", "name": "test_summary_device_entry_fields", "status": "PASSED", "pct": 90}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_on_unknown_is_silent", "status": "PASSED", "pct": 90}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_inactive_on_unknown_is_silent", "status": "PASSED", "pct": 91}]}, {"id": "TestRPMDataPump", "label": "RPM Data Pump", "passed": 5, "failed": 0, "tests": [{"suite": "TestRPMDataPump", "name": "test_pump_processes_frame", "status": "PASSED", "pct": 91}, {"suite": "TestRPMDataPump", "name": "test_stats_start_at_zero", "status": "PASSED", "pct": 92}, {"suite": "TestRPMDataPump", "name": "test_auto_register_unknown_device", "status": "PASSED", "pct": 92}, {"suite": "TestRPMDataPump", "name": "test_optional_callback_invoked", "status": "PASSED", "pct": 93}, {"suite": "TestRPMDataPump", "name": "test_stop_event_exits_run", "status": "PASSED", "pct": 93}]}, {"id": "TestDeviceHealthMonitor", "label": "Health Monitor", "passed": 3, "failed": 0, "tests": [{"suite": "TestDeviceHealthMonitor", "name": "test_stale_device_marked_inactive_and_event_published", "status": "PASSED", "pct": 94}, {"suite": "TestDeviceHealthMonitor", "name": "test_fresh_device_stays_active", "status": "PASSED", "pct": 94}, {"suite": "TestDeviceHealthMonitor", "name": "test_device_never_sent_data_not_flagged", "status": "PASSED", "pct": 95}]}, {"id": "TestEndToEndPipeline", "label": "End-to-End Pipeline", "passed": 7, "failed": 0, "tests": [{"suite": "TestEndToEndPipeline", "name": "test_vtach_produces_critical_alert", "status": "PASSED", "pct": 95}, {"suite": "TestEndToEndPipeline", "name": "test_afib_produces_medium_or_high_alert", "status": "PASSED", "pct": 96}, {"suite": "TestEndToEndPipeline", "name": "test_hypertensive_crisis_diagnosis_text", "status": "PASSED", "pct": 96}, {"suite": "TestEndToEndPipeline", "name": "test_personalization_updated_after_signal", "status": "PASSED", "pct": 97}, {"suite": "TestEndToEndPipeline", "name": "test_communication_report_stored", "status": "PASSED", "pct": 97}, {"suite": "TestEndToEndPipeline", "name": "test_acquisition_to_diagnosis_full_path", "status": "PASSED", "pct": 98}, {"suite": "TestEndToEndPipeline", "name": "test_normal_ecg_does_not_produce_critical", "status": "PASSED", "pct": 98}]}, {"id": "TestWebSocketHandshakeLoopback", "label": "WebSocket Loopback", "passed": 2, "failed": 0, "tests": [{"suite": "TestWebSocketHandshakeLoopback", "name": "test_full_3way_hmac_handshake", "status": "PASSED", "pct": 99}, {"suite": "TestWebSocketHandshakeLoopback", "name": "test_wrong_secret_fails_auth", "status": "PASSED", "pct": 99}]}, {"id": "TestBackPressure", "label": "Back-Pressure", "passed": 1, "failed": 0, "tests": [{"suite": "TestBackPressure", "name": "test_full_queue_evicts_oldest_frame", "status": "PASSED", "pct": 100}]}];
+
+let activeSuite = SUITES[0].id;
+let filter = 'all'; // all | pass | fail
+let query = '';
+
+function fmt(name) {
+  // strip parametrize brackets for base name display
+  const base = name.replace(/\[.*\]$/, '');
+  const param = name.match(/\[(.+)\]$/);
+  return { base, param: param ? param[1] : null };
+}
+
+function humanize(s) {
+  return s.replace(/^test_/, '').replace(/_/g, ' ');
+}
+
+// Build sidebar
+function buildSidebar() {
+  const sb = document.getElementById('sidebar');
+  sb.innerHTML = '<div class="sb-label">Test Suites</div>';
+
+  for (const suite of SUITES) {
+    const total = suite.passed + suite.failed;
+    const hasFail = suite.failed > 0;
+    const btn = document.createElement('button');
+    btn.className = 'sb-item' + (suite.id === activeSuite ? ' active' : '');
+    btn.dataset.sid = suite.id;
+    btn.innerHTML = `
+      <div class="sb-dot${hasFail ? ' has-fail' : ''}"></div>
+      <span class="sb-name">${suite.label}</span>
+      <span class="sb-count${hasFail ? ' has-fail' : ''}">${total}</span>`;
+    btn.addEventListener('click', () => {
+      activeSuite = suite.id;
+      document.querySelectorAll('.sb-item').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderMain();
+    });
+    sb.appendChild(btn);
+  }
+}
+
+// Render main panel
+function renderMain() {
+  const suite = SUITES.find(s => s.id === activeSuite);
+  if (!suite) return;
+
+  const inner = document.getElementById('mainInner');
+  inner.innerHTML = '';
+
+  // suite header
+  const hdr = document.createElement('div');
+  hdr.className = 'suite-hdr';
+  hdr.innerHTML = `<h2>${suite.label}</h2><span class="s-meta">${suite.tests.length} tests &nbsp;·&nbsp; ${suite.passed} passed · ${suite.failed} failed</span>`;
+  inner.appendChild(hdr);
+
+  // filter bar
+  const filters = document.createElement('div');
+  filters.className = 'filters';
+  const fOpts = [{k:'all',l:'All'},{k:'pass',l:'Passed'},{k:'fail',l:'Failed'}];
+  for (const f of fOpts) {
+    const ch = document.createElement('button');
+    ch.className = 'filter-chip' + (filter === f.k ? (f.k === 'fail' ? ' on-fail' : ' on') : '');
+    ch.textContent = f.l;
+    ch.addEventListener('click', () => { filter = f.k; renderMain(); });
+    filters.appendChild(ch);
+  }
+  const srch = document.createElement('input');
+  srch.type = 'text';
+  srch.className = 'search-box';
+  srch.placeholder = 'search tests…';
+  srch.value = query;
+  srch.addEventListener('input', e => { query = e.target.value; renderMain(); });
+  filters.appendChild(srch);
+  inner.appendChild(filters);
+
+  // group tests by base name (collapse parametrized)
+  const groups = [];
+  const seen = new Map();
+
+  for (const t of suite.tests) {
+    const { base, param } = fmt(t.name);
+    if (param !== null) {
+      if (!seen.has(base)) {
+        const g = { base, isParam: true, status: t.status, items: [] };
+        seen.set(base, g);
+        groups.push(g);
+      }
+      seen.get(base).items.push({ param, status: t.status, pct: t.pct });
+      if (t.status === 'FAILED') seen.get(base).status = 'FAILED';
+    } else {
+      groups.push({ base, isParam: false, status: t.status, pct: t.pct, items: [] });
+    }
+  }
+
+  // apply filter and search
+  const filtered = groups.filter(g => {
+    if (filter === 'pass' && g.status === 'FAILED') return false;
+    if (filter === 'fail' && g.status === 'PASSED') return false;
+    if (query) {
+      const q = query.toLowerCase();
+      return g.base.includes(q) || humanize(g.base).includes(q) ||
+             g.items.some(i => i.param.toLowerCase().includes(q));
+    }
+    return true;
+  });
+
+  if (filtered.length === 0) {
+    inner.insertAdjacentHTML('beforeend', `<div class="empty-state"><svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><span>No tests match</span></div>`);
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'test-list';
+
+  let delay = 0;
+  for (const g of filtered) {
+    const isPassed = g.status === 'PASSED';
+    const statusClass = isPassed ? 'pass' : 'fail';
+    const statusLabel = isPassed ? 'PASS' : 'FAIL';
+
+    if (!g.isParam) {
+      const row = document.createElement('div');
+      row.className = `t-row ${isPassed ? '' : 'failed'}`;
+      row.style.animationDelay = delay + 'ms';
+      row.innerHTML = `
+        <span class="t-status ${statusClass}">${statusLabel}</span>
+        <span class="t-name">${humanize(g.base)}</span>
+        <span class="t-pct">${g.pct}%</span>`;
+      list.appendChild(row);
+      delay += 15;
+    } else {
+      // parametrized group
+      const row = document.createElement('div');
+      row.className = `t-row ${isPassed ? '' : 'failed'}`;
+      row.style.animationDelay = delay + 'ms';
+      row.innerHTML = `
+        <span class="t-status ${statusClass}">${statusLabel}</span>
+        <span class="t-name">${humanize(g.base)} <span class="t-param">×${g.items.length}</span></span>
+        <span class="t-pct"></span>`;
+      list.appendChild(row);
+      delay += 15;
+
+      // sub-rows
+      const sub = document.createElement('div');
+      sub.className = 'param-rows';
+      for (let i = 0; i < g.items.length; i++) {
+        const item = g.items[i];
+        const show = filter === 'fail' ? item.status === 'FAILED' : filter === 'pass' ? item.status === 'PASSED' : true;
+        if (!show) continue;
+        const pr = document.createElement('div');
+        pr.className = 'p-row';
+        pr.style.animationDelay = (delay + i * 12) + 'ms';
+        const pStatus = item.status === 'PASSED' ? 'pass' : 'fail';
+        pr.innerHTML = `
+          <div class="p-dot" style="background:var(--${pStatus});box-shadow:0 0 4px var(--${pStatus})"></div>
+          <span class="p-name"><span class="param-val">${item.param}</span></span>
+          <span style="margin-left:auto;font-size:0.55rem;color:var(--dim)">${item.pct}%</span>`;
+        sub.appendChild(pr);
+      }
+      list.appendChild(sub);
+      delay += g.items.length * 12;
+    }
+  }
+
+  inner.appendChild(list);
+}
+
+buildSidebar();
+renderMain();
+
+// animate progress
+setTimeout(() => {
+  document.getElementById('pFill').style.width = '100%';
+  document.getElementById('pLabel').textContent = '200 / 200 — 100%';
+}, 120);
+</script>
+</body>
+</html>
