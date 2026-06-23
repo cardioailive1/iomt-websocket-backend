@@ -19,8 +19,11 @@ Architecture
                               CommunicationAgent
                                         │
                               HTTP API (aiohttp)
+                              ├── POST /auth/apple    ← Sign in with Apple (iOS)
                               ├── POST /auth/login    ← user authentication
                               ├── POST /auth/refresh  ← token refresh
+                              ├── POST /auth/logout   ← revoke session
+                              ├── POST /devices/register ← register BLE device
                               ├── GET  /health        ← bridge status
                               ├── GET  /devices       ← device registry
                               ├── GET  /alerts        ← active alerts
@@ -30,10 +33,12 @@ Security model
 --------------
   1. 3-way HMAC-SHA256 challenge/response at WebSocket connection time.
   2. JWT (HS256) session token for every subsequent WS message.
-  3. POST /auth/login  — verifies user credentials (LDAP / stub), issues
+  3. POST /auth/apple  — verifies Apple identityToken with Apple's public keys,
+     creates/loads the patient record, and issues access + refresh tokens.
+  4. POST /auth/login  — verifies user credentials (LDAP / stub), issues
      short-lived access token (1h) + long-lived refresh token (7d).
-  4. POST /auth/refresh — exchanges a valid refresh token for a new pair.
-  5. All protected HTTP endpoints require Bearer JWT in Authorization header.
+  5. POST /auth/refresh — exchanges a valid refresh token for a new pair.
+  6. All protected HTTP endpoints require Bearer JWT in Authorization header.
   6. Secrets loaded exclusively from environment variables.
   7. All comparisons use constant-time hmac.compare_digest().
 
@@ -2008,12 +2013,15 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
     Routes
     ------
-    POST /auth/login     — authenticate user, issue access + refresh tokens
-    POST /auth/refresh   — rotate refresh token, issue new access token
-    GET  /health         — bridge status (requires Bearer)
-    GET  /devices        — device registry (requires Bearer)
-    GET  /alerts         — active alerts   (requires Bearer)
-    GET  /reports        — clinical reports (requires Bearer)
+    POST /auth/apple        — Sign in with Apple (iOS app)
+    POST /auth/login        — authenticate user, issue access + refresh tokens
+    POST /auth/refresh      — rotate refresh token, issue new access token
+    POST /auth/logout       — revoke all refresh tokens for user
+    POST /devices/register  — register a paired BLE device (requires Bearer)
+    GET  /health            — bridge status (requires Bearer)
+    GET  /devices           — device registry (requires Bearer)
+    GET  /alerts            — active alerts   (requires Bearer)
+    GET  /reports           — clinical reports (requires Bearer)
     """
     cfg = bridge.cfg
 
@@ -2325,15 +2333,335 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
         return _web.json_response(store[-50:])  # last 50 reports
 
+
+    # ── POST /auth/apple ──────────────────────────────────────────────────
+    #
+    # Called by the iOS app immediately after Sign in with Apple succeeds.
+    # The iOS ASAuthorizationAppleIDCredential contains:
+    #   - identityToken:      a short-lived JWT signed by Apple
+    #   - authorizationCode:  a one-time code for server-side token exchange
+    #   - fullName:           optional, only provided on first sign-in
+    #
+    # Verification strategy
+    # ─────────────────────
+    # Production: validate the identityToken JWT signature against Apple's
+    #   public keys at https://appleid.apple.com/auth/keys using python-jose:
+    #       pip install python-jose[cryptography] httpx
+    #       keys = httpx.get("https://appleid.apple.com/auth/keys").json()
+    #       payload = jose.jwt.decode(token, keys, algorithms=["RS256"],
+    #                                 audience="com.cardioai.iomt")
+    #
+    # Development: the stub below decodes without signature verification.
+    #   Set APPLE_VERIFY_TOKENS=true in production to enable full verification.
+
+    async def apple_signin(request: _web.Request) -> _web.Response:
+        """
+        Authenticate an iOS patient via Sign in with Apple.
+
+        Request body (JSON)
+        -------------------
+        {
+          "identity_token":      "<Apple JWT>",      # required
+          "authorization_code":  "<one-time code>",  # required
+          "first_name":          "John",             # optional, first login only
+          "last_name":           "Anderson"          # optional, first login only
+        }
+
+        Success (200)
+        -------------
+        {
+          "access_token":  "<JWT>",
+          "refresh_token": "<opaque>",
+          "token_type":    "Bearer",
+          "expires_in":    3600,
+          "user": {
+            "id":         "<apple_user_id>",
+            "name":       "John Anderson",
+            "email":      "user@privaterelay.appleid.com",
+            "role":       "patient",
+            "patient_id": "<apple_user_id>"
+          }
+        }
+
+        Errors
+        ------
+        400  missing_fields
+        401  invalid_apple_token
+        403  account_disabled
+        429  rate_limited
+        """
+        # ── Parse body ────────────────────────────────────────────────────
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response(
+                {"error": "invalid_json", "message": "Request body must be valid JSON"},
+                status=400,
+            )
+
+        identity_token     = (body.get("identity_token")     or "").strip()
+        authorization_code = (body.get("authorization_code") or "").strip()
+        first_name         = (body.get("first_name")         or "").strip()
+        last_name          = (body.get("last_name")          or "").strip()
+
+        if not identity_token or not authorization_code:
+            return _web.json_response(
+                {"error": "missing_fields",
+                 "message": "Both 'identity_token' and 'authorization_code' are required"},
+                status=400,
+            )
+
+        # ── Rate limit by IP (shares pool with /auth/login) ───────────────
+        client_ip = request.remote or "unknown"
+        if not _AUTH_RATE_LIMITER.is_allowed(client_ip):
+            logger.warning("[AppleAuth] rate limited IP=%s", client_ip)
+            return _web.json_response(
+                {"error": "rate_limited",
+                 "message": "Too many sign-in attempts. Try again in 5 minutes."},
+                status=429,
+            )
+
+        # ── Verify Apple identity token ───────────────────────────────────
+        verify_tokens = _optional_env("APPLE_VERIFY_TOKENS", "false").lower() == "true"
+
+        try:
+            if verify_tokens:
+                # Production path — full RS256 signature verification
+                # Requires: pip install python-jose[cryptography] httpx
+                try:
+                    import httpx as _httpx                      # type: ignore
+                    from jose import jwt as _jose_jwt           # type: ignore
+                    from jose.exceptions import JWTError        # type: ignore
+
+                    apple_keys = _httpx.get(
+                        "https://appleid.apple.com/auth/keys", timeout=10
+                    ).json()
+                    apple_payload = _jose_jwt.decode(
+                        identity_token,
+                        apple_keys,
+                        algorithms=["RS256"],
+                        audience=_optional_env("APPLE_BUNDLE_ID", "com.cardioai.iomt"),
+                    )
+                except ImportError:
+                    logger.error(
+                        "[AppleAuth] APPLE_VERIFY_TOKENS=true but python-jose / httpx "
+                        "are not installed. Run: pip install python-jose[cryptography] httpx"
+                    )
+                    return _web.json_response(
+                        {"error": "server_configuration",
+                         "message": "Apple token verification not configured"},
+                        status=500,
+                    )
+                except Exception as exc:
+                    logger.warning("[AppleAuth] token verification failed: %s", exc)
+                    return _web.json_response(
+                        {"error": "invalid_apple_token",
+                         "message": "Apple identity token is invalid or expired"},
+                        status=401,
+                    )
+            else:
+                # Development path — decode without verification
+                # WARNING: this trusts the token blindly — never use in production
+                import base64 as _b64
+                parts = identity_token.split(".")
+                if len(parts) != 3:
+                    raise ValueError("Not a valid JWT structure")
+                padding       = "=" * (4 - len(parts[1]) % 4)
+                decoded_bytes = _b64.urlsafe_b64decode(parts[1] + padding)
+                apple_payload = json.loads(decoded_bytes.decode("utf-8"))
+
+        except Exception as exc:
+            logger.warning("[AppleAuth] token decode failed: %s", exc)
+            return _web.json_response(
+                {"error": "invalid_apple_token",
+                 "message": "Could not decode Apple identity token"},
+                status=401,
+            )
+
+        # ── Extract user identity from Apple payload ───────────────────────
+        apple_user_id = apple_payload.get("sub", "")
+        if not apple_user_id:
+            return _web.json_response(
+                {"error": "invalid_apple_token",
+                 "message": "Apple token missing subject claim"},
+                status=401,
+            )
+
+        apple_email = apple_payload.get("email", "")
+        # Apple relays a private email if user hides their real email
+        if not apple_email:
+            apple_email = f"{apple_user_id[:8].lower()}@privaterelay.appleid.com"
+
+        # Build display name — Apple only provides fullName on the very first sign-in
+        display_name = f"{first_name} {last_name}".strip()
+        if not display_name:
+            display_name = apple_email.split("@")[0].replace(".", " ").title()
+
+        # ── Load or create patient record ──────────────────────────────────
+        # First: try to find an existing user by Apple user ID or email
+        existing_user = (
+            next((u for u in _STUB_USERS.values() if u.id == apple_user_id), None)
+            or _load_user_by_email(apple_email)
+        )
+
+        if existing_user:
+            user = existing_user
+            if not user.is_active:
+                return _web.json_response(
+                    {"error": "account_disabled",
+                     "message": "Your account has been disabled. Contact your administrator."},
+                    status=403,
+                )
+        else:
+            # First-ever sign-in — auto-provision a patient account
+            user = HospitalUser(
+                id            = apple_user_id,
+                email         = apple_email,
+                name          = display_name,
+                role          = UserRole.PATIENT,
+                patient_id    = apple_user_id,   # use Apple user ID as patient ID
+                password_hash = "",              # no password — auth is via Apple
+                is_active     = True,
+                mfa_secret    = None,
+            )
+            # Register in the stub store so future requests find this user
+            # In production: INSERT INTO users (...) or upsert via LDAP
+            _STUB_USERS[apple_email] = user
+            logger.info(
+                "[AppleAuth] auto-provisioned patient apple_id=%s email=%s",
+                apple_user_id[:12], apple_email,
+            )
+
+        # ── Issue tokens ───────────────────────────────────────────────────
+        _AUTH_RATE_LIMITER.reset(client_ip)
+        access_token  = _issue_access_token(user, cfg)
+        refresh_token = _REFRESH_STORE.issue(user.id, cfg.refresh_token_ttl)
+
+        logger.info(
+            "[AppleAuth] sign-in successful apple_id=%s role=%s IP=%s",
+            apple_user_id[:12], user.role.value, client_ip,
+        )
+
+        return _web.json_response({
+            "access_token":  access_token,
+            "refresh_token": refresh_token,
+            "token_type":    "Bearer",
+            "expires_in":    cfg.token_ttl_seconds,
+            "user": {
+                "id":         user.id,
+                "name":       user.name,
+                "email":      user.email,
+                "role":       user.role.value,
+                "patient_id": user.patient_id,
+            },
+        })
+
+    # ── POST /devices/register ────────────────────────────────────────────
+    #
+    # Called by the iOS app after a BLE device is paired.
+    # Registers the device in the DeviceSessionRegistry so it appears in
+    # /devices, receives RPM data, and is monitored by DeviceHealthMonitor.
+
+    @_require_auth(cfg)
+    async def device_register(request: _web.Request) -> _web.Response:
+        """
+        Register a patient's paired BLE device with the IoMT pipeline.
+
+        Request body (JSON)
+        -------------------
+        {
+          "device_id":   "<BLE peripheral UUID>",   # required
+          "device_type": "ecg_monitor",             # required
+          "patient_id":  "PT_12345",                # required
+          "device_name": "My ECG Monitor"           # optional
+        }
+
+        Success (200)
+        -------------
+        {
+          "device_id":  "<id>",
+          "patient_id": "<pid>",
+          "status":     "registered"
+        }
+
+        Errors
+        ------
+        400  missing_fields
+        403  patient_id_mismatch  (patient trying to register for another patient)
+        """
+        user = request["user"]
+
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        device_id   = (body.get("device_id")   or "").strip()
+        device_type = (body.get("device_type") or "ecg_monitor").strip()
+        patient_id  = (body.get("patient_id")  or "").strip()
+        device_name = (body.get("device_name") or device_id[:12]).strip()
+
+        if not device_id or not patient_id:
+            return _web.json_response(
+                {"error": "missing_fields",
+                 "message": "Both 'device_id' and 'patient_id' are required"},
+                status=400,
+            )
+
+        # Patients can only register devices for themselves
+        if user.get("role") == UserRole.PATIENT.value:
+            own_pid = user.get("patient_id") or user.get("sub")
+            if patient_id != own_pid:
+                logger.warning(
+                    "[DeviceRegister] patient_id mismatch user=%s attempted=%s",
+                    own_pid, patient_id,
+                )
+                return _web.json_response(
+                    {"error": "patient_id_mismatch",
+                     "message": "You can only register devices for your own patient ID"},
+                    status=403,
+                )
+
+        # Register in the device session registry
+        existing = bridge.registry.get(device_id)
+        if existing:
+            # Re-activate if it was previously marked inactive
+            existing.is_active = True
+            logger.info(
+                "[DeviceRegister] re-activated device=%s patient=%s",
+                device_id, patient_id,
+            )
+        else:
+            bridge.registry.register(device_id, device_type, patient_id)
+            logger.info(
+                "[DeviceRegister] registered device=%s type=%s patient=%s name=%s",
+                device_id, device_type, patient_id, device_name,
+            )
+
+        # Also register with the acquisition agent so the pipeline is ready
+        acq_agent = bridge.system.agents["acquisition"]
+        import asyncio as _asyncio
+        _asyncio.create_task(
+            acq_agent.register_device(device_id, device_type, patient_id)
+        )
+
+        return _web.json_response({
+            "device_id":  device_id,
+            "patient_id": patient_id,
+            "status":     "registered",
+        })
+
     # ── Register routes ───────────────────────────────────────────────────
 
-    app.router.add_post("/auth/login",   login)
-    app.router.add_post("/auth/refresh", refresh)
-    app.router.add_post("/auth/logout",  logout)
-    app.router.add_get( "/health",       health)
-    app.router.add_get( "/devices",      devices)
-    app.router.add_get( "/alerts",       alerts)
-    app.router.add_get( "/reports",      reports)
+    app.router.add_post("/auth/apple",        apple_signin)
+    app.router.add_post("/auth/login",        login)
+    app.router.add_post("/auth/refresh",      refresh)
+    app.router.add_post("/auth/logout",       logout)
+    app.router.add_post("/devices/register",  device_register)
+    app.router.add_get( "/health",            health)
+    app.router.add_get( "/devices",           devices)
+    app.router.add_get( "/alerts",            alerts)
+    app.router.add_get( "/reports",           reports)
 
     return app
 
