@@ -1,0 +1,20 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cardioai-netpol
+  namespace: cardioai
+spec:
+  podSelector:
+    matchLabels:
+      app: cardioai-backend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - ports:
+    - port: 8765
+    - port: 8080
+  egress:
+  - ports:
+    - port: 443
+    - port: 8765
