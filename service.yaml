@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cardioai-backend
+  namespace: cardioai
+spec:
+  selector:
+    app: cardioai-backend
+  ports:
+  - name: websocket
+    port: 8765
+    targetPort: websocket
+  - name: health
+    port: 8080
+    targetPort: health
+  type: ClusterIP
