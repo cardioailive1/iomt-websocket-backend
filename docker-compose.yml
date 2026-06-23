@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  cardioai-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cardioai-backend:latest
+    container_name: cardioai-backend
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${CARDIOAI_WS_PORT:-8765}:8765"
+      - "${CARDIOAI_HEALTH_PORT:-8080}:8080"
+    networks:
+      - cardioai_net
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=8)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: "512M"
+        reservations:
+          cpus: "0.25"
+          memory: "256M"
+
+  cardioai-nginx:
+    image: nginx:alpine
+    container_name: cardioai-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - ../frontend:/usr/share/nginx/html:ro
+    depends_on:
+      - cardioai-backend
+    networks:
+      - cardioai_net
+
+networks:
+  cardioai_net:
+    driver: bridge
