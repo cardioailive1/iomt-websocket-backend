@@ -2,7 +2,7 @@
 IoMT CardioAI — Production System
 ===================================
 IoMT Server ↔ CardioAI Backend: HMAC-SHA256 handshake, real-time RPM
-streaming, and 7-agent clinical AI pipeline.
+streaming, 7-agent clinical AI pipeline, and authenticated HTTP API.
 
 Architecture
 ------------
@@ -18,15 +18,24 @@ Architecture
                               PersonalizationAgent
                               CommunicationAgent
                                         │
-                              EHR / GCP / Alerts
+                              HTTP API (aiohttp)
+                              ├── POST /auth/login    ← user authentication
+                              ├── POST /auth/refresh  ← token refresh
+                              ├── GET  /health        ← bridge status
+                              ├── GET  /devices       ← device registry
+                              ├── GET  /alerts        ← active alerts
+                              └── GET  /reports       ← clinical reports
 
 Security model
 --------------
-  1. 3-way HMAC-SHA256 challenge/response at connection time.
-  2. JWT (HS256) session token for every subsequent message.
-  3. Secrets loaded exclusively from environment variables —
-     never hard-coded or committed to source control.
-  4. All comparisons use constant-time hmac.compare_digest().
+  1. 3-way HMAC-SHA256 challenge/response at WebSocket connection time.
+  2. JWT (HS256) session token for every subsequent WS message.
+  3. POST /auth/login  — verifies user credentials (LDAP / stub), issues
+     short-lived access token (1h) + long-lived refresh token (7d).
+  4. POST /auth/refresh — exchanges a valid refresh token for a new pair.
+  5. All protected HTTP endpoints require Bearer JWT in Authorization header.
+  6. Secrets loaded exclusively from environment variables.
+  7. All comparisons use constant-time hmac.compare_digest().
 
 Required environment variables
 -------------------------------
@@ -37,23 +46,28 @@ Required environment variables
 
 Optional environment variables
 -------------------------------
-  IOMT_SERVER_REST_URL     https://host/api/v1
-  IOMT_SERVER_ID           server identifier
-  CARDIOAI_WS_HOST         WebSocket listener host  (default 0.0.0.0)
-  CARDIOAI_WS_PORT         WebSocket listener port  (default 8765)
-  JWT_ALGORITHM            HS256 | HS512              (default HS256)
-  TOKEN_TTL_SECONDS        session token TTL          (default 3600)
-  RPM_POLL_INTERVAL_SEC    seconds between polls      (default 1.0)
-  HEARTBEAT_INTERVAL_SEC   WS keep-alive interval     (default 10.0)
-  RECONNECT_MAX_ATTEMPTS   before giving up           (default 5)
-  RECONNECT_BASE_DELAY_SEC exponential back-off seed  (default 2.0)
-  INBOUND_QUEUE_MAXSIZE    back-pressure cap          (default 2000)
-  LOG_LEVEL                DEBUG|INFO|WARNING|ERROR   (default INFO)
-  LOG_FORMAT               json | text                (default text)
+  IOMT_SERVER_REST_URL       https://host/api/v1
+  IOMT_SERVER_ID             server identifier
+  CARDIOAI_WS_HOST           WebSocket listener host    (default 0.0.0.0)
+  CARDIOAI_WS_PORT           WebSocket listener port    (default 8765)
+  CARDIOAI_API_HOST          HTTP API host              (default 0.0.0.0)
+  CARDIOAI_API_PORT          HTTP API port              (default 8080)
+  JWT_ALGORITHM              HS256 | HS512              (default HS256)
+  TOKEN_TTL_SECONDS          access token TTL           (default 3600)
+  REFRESH_TOKEN_TTL_SECONDS  refresh token TTL          (default 604800)
+  MFA_REQUIRED               true | false               (default false)
+  ALLOWED_ORIGINS            CORS allowed origins       (default *)
+  RPM_POLL_INTERVAL_SEC      seconds between polls      (default 1.0)
+  HEARTBEAT_INTERVAL_SEC     WS keep-alive interval     (default 10.0)
+  RECONNECT_MAX_ATTEMPTS     before giving up           (default 5)
+  RECONNECT_BASE_DELAY_SEC   exponential back-off seed  (default 2.0)
+  INBOUND_QUEUE_MAXSIZE      back-pressure cap          (default 2000)
+  LOG_LEVEL                  DEBUG|INFO|WARNING|ERROR   (default INFO)
+  LOG_FORMAT                 json | text                (default text)
 
 Python dependencies
 -------------------
-  pip install websockets aiohttp pyjwt numpy
+  pip install websockets aiohttp pyjwt numpy bcrypt
 
 External module dependencies (ship alongside this file)
 -------------------------------------------------------
@@ -93,6 +107,8 @@ import numpy as np          # pip install numpy
 import websockets            # pip install websockets
 import aiohttp               # pip install aiohttp
 import jwt                   # pip install pyjwt
+import bcrypt                 # pip install bcrypt
+from aiohttp import web as _web
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 
 # ============================================================================
@@ -250,6 +266,28 @@ class HandshakeConfig:
             reconnect_base_delay_seconds = float(_optional_env("RECONNECT_BASE_DELAY_SEC",  "2.0")),
             inbound_queue_maxsize        = int(_optional_env("INBOUND_QUEUE_MAXSIZE",       "2000")),
         )
+
+    # ── Auth API config helpers ────────────────────────────────────────────
+
+    @property
+    def api_host(self) -> str:
+        return _optional_env("CARDIOAI_API_HOST", "0.0.0.0")
+
+    @property
+    def api_port(self) -> int:
+        return int(_optional_env("CARDIOAI_API_PORT", "8080"))
+
+    @property
+    def refresh_token_ttl(self) -> int:
+        return int(_optional_env("REFRESH_TOKEN_TTL_SECONDS", "604800"))  # 7 days
+
+    @property
+    def mfa_required(self) -> bool:
+        return _optional_env("MFA_REQUIRED", "false").lower() == "true"
+
+    @property
+    def allowed_origins(self) -> str:
+        return _optional_env("ALLOWED_ORIGINS", "*")
 
     def __repr__(self) -> str:
         # Redact secrets from repr so they cannot appear in logs or tracebacks.
@@ -1654,6 +1692,677 @@ class IoMTCardioAIBridge:
         }
 
 
+
+# ============================================================================
+# SECTION 19b — USER AUTHENTICATION & HTTP API
+# ============================================================================
+#
+# Two authentication flows are supported:
+#
+#   POST /auth/login
+#   ────────────────
+#   Body : { "email": "...", "password": "...", "mfa_code": "..." (optional) }
+#   Returns:
+#     200 { "access_token": "...", "refresh_token": "...",
+#           "token_type": "Bearer", "expires_in": 3600,
+#           "user": { "id": "...", "name": "...", "role": "...", "patient_id": "..." } }
+#     401 { "error": "invalid_credentials" }
+#     403 { "error": "mfa_required" }
+#     429 { "error": "rate_limited" }
+#
+#   POST /auth/refresh
+#   ──────────────────
+#   Body : { "refresh_token": "..." }
+#   Returns:
+#     200 { "access_token": "...", "refresh_token": "...",
+#           "token_type": "Bearer", "expires_in": 3600 }
+#     401 { "error": "invalid_refresh_token" }
+#     401 { "error": "refresh_token_expired" }
+#
+# All other endpoints require:
+#   Authorization: Bearer <access_token>
+#
+# ============================================================================
+
+import re as _re
+import time as _time
+from collections import defaultdict as _defaultdict
+from datetime import timedelta as _timedelta
+from functools import wraps as _wraps
+
+
+# ── User roles ────────────────────────────────────────────────────────────────
+
+class UserRole(str, Enum):
+    PATIENT       = "patient"
+    NURSE         = "nurse"
+    CARDIOLOGIST  = "cardiologist"
+    ADMIN         = "admin"
+
+
+# ── User model ────────────────────────────────────────────────────────────────
+
+@dataclass
+class HospitalUser:
+    """Represents an authenticated user.  Passwords are never stored in plain text."""
+
+    id:           str
+    email:        str
+    name:         str
+    role:         UserRole
+    patient_id:   Optional[str]        # set for patient role only
+    # bcrypt hash — loaded from DB / LDAP, never logged
+    password_hash: str = field(repr=False)
+    is_active:    bool  = True
+    mfa_secret:   Optional[str] = field(default=None, repr=False)
+
+    def verify_password(self, plain: str) -> bool:
+        """Constant-time bcrypt verification."""
+        try:
+            return bcrypt.checkpw(
+                plain.encode("utf-8"),
+                self.password_hash.encode("utf-8"),
+            )
+        except Exception:
+            return False
+
+
+# ── In-memory user store (replace with LDAP / DB in production) ───────────────
+# Passwords hashed with bcrypt cost 12.
+# To generate a hash: python3 -c "import bcrypt; print(bcrypt.hashpw(b'yourpassword', bcrypt.gensalt(12)).decode())"
+
+def _make_stub_users() -> Dict[str, HospitalUser]:
+    """
+    Stub user directory for development.
+    In production replace _load_user_by_email() with an LDAP or DB query.
+    Passwords below are bcrypt hashes of 'changeme_in_prod' (cost 12).
+    """
+    stub_hash = bcrypt.hashpw(b"changeme_in_prod", bcrypt.gensalt(12)).decode()
+    return {
+        "patient@hospital.local": HospitalUser(
+            id="USR-001", email="patient@hospital.local",
+            name="John Anderson", role=UserRole.PATIENT,
+            patient_id="PT_12345", password_hash=stub_hash,
+        ),
+        "nurse@hospital.local": HospitalUser(
+            id="USR-002", email="nurse@hospital.local",
+            name="Sarah Chen", role=UserRole.NURSE,
+            patient_id=None, password_hash=stub_hash,
+        ),
+        "cardio@hospital.local": HospitalUser(
+            id="USR-003", email="cardio@hospital.local",
+            name="Dr. James Okafor", role=UserRole.CARDIOLOGIST,
+            patient_id=None, password_hash=stub_hash,
+        ),
+    }
+
+
+_STUB_USERS: Dict[str, HospitalUser] = {}
+
+
+def _load_user_by_email(email: str) -> Optional[HospitalUser]:
+    """
+    Look up a user by email address.
+
+    Production replacement
+    ----------------------
+    Replace this function body with an async LDAP query or DB lookup:
+
+        async with ldap3.Connection(server, ...) as conn:
+            conn.search("ou=users,dc=hospital,dc=local",
+                        f"(mail={email})", attributes=["*"])
+            entry = conn.entries[0]
+            return HospitalUser(id=str(entry.uid), ...)
+
+    Or a SQLAlchemy query:
+        user = await db.execute(select(User).where(User.email == email))
+        return user.scalar_one_or_none()
+    """
+    return _STUB_USERS.get(email.lower().strip())
+
+
+# ── Refresh token store (replace with Redis / DB in production) ───────────────
+
+class RefreshTokenStore:
+    """
+    In-memory refresh token store.
+
+    Production replacement
+    ----------------------
+    Replace with Redis:
+        await redis.setex(f"refresh:{token_id}", ttl_seconds, user_id)
+        user_id = await redis.get(f"refresh:{token_id}")
+        await redis.delete(f"refresh:{token_id}")
+    """
+
+    def __init__(self) -> None:
+        # token_id → (user_id, expires_at_unix)
+        self._store: Dict[str, tuple[str, float]] = {}
+
+    def issue(self, user_id: str, ttl_seconds: int) -> str:
+        token_id = secrets.token_urlsafe(48)
+        self._store[token_id] = (user_id, _time.time() + ttl_seconds)
+        return token_id
+
+    def consume(self, token_id: str) -> Optional[str]:
+        """
+        Validate and rotate — one-time use, returns user_id or None.
+        Rotation means each refresh issues a brand-new token ID,
+        so a stolen token can only be used once before being invalidated.
+        """
+        entry = self._store.pop(token_id, None)
+        if entry is None:
+            return None
+        user_id, expires_at = entry
+        if _time.time() > expires_at:
+            return None
+        return user_id
+
+    def revoke_all_for_user(self, user_id: str) -> int:
+        """Revoke all sessions for a user (sign-out everywhere)."""
+        before = len(self._store)
+        self._store = {
+            k: v for k, v in self._store.items() if v[0] != user_id
+        }
+        return before - len(self._store)
+
+    def purge_expired(self) -> int:
+        """Remove expired tokens — call periodically."""
+        now    = _time.time()
+        before = len(self._store)
+        self._store = {k: v for k, v in self._store.items() if v[1] > now}
+        return before - len(self._store)
+
+
+_REFRESH_STORE = RefreshTokenStore()
+
+
+# ── Rate limiter ───────────────────────────────────────────────────────────────
+
+class RateLimiter:
+    """
+    Simple in-memory sliding-window rate limiter for auth endpoints.
+    Replace with Redis in a multi-instance deployment.
+    """
+
+    def __init__(self, max_attempts: int = 5, window_seconds: int = 300) -> None:
+        self._max      = max_attempts
+        self._window   = window_seconds
+        self._attempts: Dict[str, list[float]] = _defaultdict(list)
+
+    def is_allowed(self, key: str) -> bool:
+        now = _time.time()
+        window_start = now - self._window
+        attempts = [t for t in self._attempts[key] if t > window_start]
+        self._attempts[key] = attempts
+        if len(attempts) >= self._max:
+            return False
+        self._attempts[key].append(now)
+        return True
+
+    def reset(self, key: str) -> None:
+        self._attempts.pop(key, None)
+
+
+_AUTH_RATE_LIMITER = RateLimiter(max_attempts=5, window_seconds=300)
+
+
+# ── JWT helpers for user tokens ────────────────────────────────────────────────
+
+def _issue_access_token(user: HospitalUser, cfg: "HandshakeConfig") -> str:
+    """Issue a short-lived access token (default 1h) for a user."""
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "iss":        cfg.cardioai_backend_id,
+            "sub":        user.id,
+            "email":      user.email,
+            "role":       user.role.value,
+            "patient_id": user.patient_id,
+            "iat":        now,
+            "exp":        now + _timedelta(seconds=cfg.token_ttl_seconds),
+            "token_type": "access",
+        },
+        cfg.jwt_secret,
+        algorithm=cfg.jwt_algorithm,
+    )
+
+
+def _verify_access_token(token: str, cfg: "HandshakeConfig") -> Dict[str, Any]:
+    """
+    Decode and validate a user access token.
+    Raises AuthenticationError on expiry, bad sig, wrong type.
+    """
+    try:
+        payload = jwt.decode(
+            token,
+            cfg.jwt_secret,
+            algorithms=[cfg.jwt_algorithm],
+        )
+    except ExpiredSignatureError as exc:
+        raise AuthenticationError("Access token has expired") from exc
+    except InvalidTokenError as exc:
+        raise AuthenticationError(f"Invalid access token: {exc}") from exc
+
+    if payload.get("token_type") != "access":
+        raise AuthenticationError("Token is not an access token")
+
+    return payload
+
+
+# ── CORS middleware ────────────────────────────────────────────────────────────
+
+def _cors_middleware(allowed_origins: str):
+    @_web.middleware
+    async def middleware(request, handler):
+        origin = request.headers.get("Origin", "")
+        if request.method == "OPTIONS":
+            resp = _web.Response(status=204)
+        else:
+            try:
+                resp = await handler(request)
+            except _web.HTTPException as exc:
+                resp = _web.Response(
+                    status=exc.status,
+                    content_type="application/json",
+                    body=json.dumps({"error": exc.reason}).encode(),
+                )
+
+        allowed = allowed_origins if allowed_origins == "*" else allowed_origins
+        resp.headers["Access-Control-Allow-Origin"]  = allowed
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+        resp.headers["Access-Control-Max-Age"]       = "86400"
+        return resp
+    return middleware
+
+
+# ── Bearer auth decorator ──────────────────────────────────────────────────────
+
+def _require_auth(cfg: "HandshakeConfig"):
+    """Decorator that validates Bearer JWT before calling the handler."""
+    def decorator(handler):
+        @_wraps(handler)
+        async def wrapper(request: _web.Request) -> _web.Response:
+            auth_header = request.headers.get("Authorization", "")
+            if not auth_header.startswith("Bearer "):
+                raise _web.HTTPUnauthorized(
+                    reason="Missing or malformed Authorization header"
+                )
+            token = auth_header[7:].strip()
+            try:
+                payload = _verify_access_token(token, cfg)
+            except AuthenticationError as exc:
+                raise _web.HTTPUnauthorized(reason=str(exc))
+            request["user"] = payload
+            return await handler(request)
+        return wrapper
+    return decorator
+
+
+# ── HTTP API factory ───────────────────────────────────────────────────────────
+
+def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
+    """
+    Construct and return the aiohttp Application with all routes mounted.
+
+    Routes
+    ------
+    POST /auth/login     — authenticate user, issue access + refresh tokens
+    POST /auth/refresh   — rotate refresh token, issue new access token
+    GET  /health         — bridge status (requires Bearer)
+    GET  /devices        — device registry (requires Bearer)
+    GET  /alerts         — active alerts   (requires Bearer)
+    GET  /reports        — clinical reports (requires Bearer)
+    """
+    cfg = bridge.cfg
+
+    app = _web.Application(
+        middlewares=[_cors_middleware(cfg.allowed_origins)]
+    )
+
+    # ── POST /auth/login ──────────────────────────────────────────────────
+
+    async def login(request: _web.Request) -> _web.Response:
+        """
+        Authenticate a hospital user and issue tokens.
+
+        Request body (JSON)
+        -------------------
+        {
+          "email":    "user@hospital.local",   # required
+          "password": "plaintext_password",    # required
+          "mfa_code": "123456"                 # required only if MFA_REQUIRED=true
+        }
+
+        Success (200)
+        -------------
+        {
+          "access_token":  "<JWT>",
+          "refresh_token": "<opaque token>",
+          "token_type":    "Bearer",
+          "expires_in":    3600,
+          "user": {
+            "id":         "<uuid>",
+            "name":       "John Anderson",
+            "role":       "patient",
+            "patient_id": "PT_12345"   (null for non-patient roles)
+          }
+        }
+
+        Errors
+        ------
+        400  missing_fields
+        401  invalid_credentials
+        403  mfa_required   (when MFA_REQUIRED=true and mfa_code absent)
+        403  invalid_mfa    (wrong MFA code)
+        403  account_disabled
+        429  rate_limited
+        """
+        # ── Parse body ────────────────────────────────────────────────────
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response(
+                {"error": "invalid_json", "message": "Request body must be valid JSON"},
+                status=400,
+            )
+
+        email    = (body.get("email")    or "").strip().lower()
+        password = (body.get("password") or "").strip()
+        mfa_code = (body.get("mfa_code") or "").strip()
+
+        if not email or not password:
+            return _web.json_response(
+                {"error": "missing_fields",
+                 "message": "Both 'email' and 'password' are required"},
+                status=400,
+            )
+
+        # ── Email format guard ────────────────────────────────────────────
+        if not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            return _web.json_response(
+                {"error": "invalid_email", "message": "Invalid email format"},
+                status=400,
+            )
+
+        # ── Rate limiting (by IP) ─────────────────────────────────────────
+        client_ip = request.remote or "unknown"
+        if not _AUTH_RATE_LIMITER.is_allowed(client_ip):
+            logger.warning("[Auth] rate limited IP=%s email=%s", client_ip, email)
+            return _web.json_response(
+                {"error": "rate_limited",
+                 "message": "Too many login attempts. Try again in 5 minutes."},
+                status=429,
+            )
+
+        # ── Load user ─────────────────────────────────────────────────────
+        user = _load_user_by_email(email)
+        if user is None:
+            # Return the same error as wrong password — prevents user enumeration
+            logger.warning("[Auth] unknown email=%s IP=%s", email, client_ip)
+            return _web.json_response(
+                {"error": "invalid_credentials",
+                 "message": "Email or password is incorrect"},
+                status=401,
+            )
+
+        # ── Account active check ──────────────────────────────────────────
+        if not user.is_active:
+            logger.warning("[Auth] disabled account email=%s", email)
+            return _web.json_response(
+                {"error": "account_disabled",
+                 "message": "Your account has been disabled. Contact your administrator."},
+                status=403,
+            )
+
+        # ── Password verification (bcrypt, constant-time) ─────────────────
+        if not user.verify_password(password):
+            logger.warning("[Auth] wrong password email=%s IP=%s", email, client_ip)
+            return _web.json_response(
+                {"error": "invalid_credentials",
+                 "message": "Email or password is incorrect"},
+                status=401,
+            )
+
+        # ── MFA check ─────────────────────────────────────────────────────
+        if cfg.mfa_required:
+            if not mfa_code:
+                return _web.json_response(
+                    {"error": "mfa_required",
+                     "message": "A 6-digit MFA code is required",
+                     "next_step": "submit mfa_code"},
+                    status=403,
+                )
+            # Stub MFA: accept any 6-digit numeric code in dev, validate TOTP in prod
+            # Production: replace with pyotp.TOTP(user.mfa_secret).verify(mfa_code)
+            if not (_re.match(r"^\d{6}$", mfa_code)):
+                return _web.json_response(
+                    {"error": "invalid_mfa",
+                     "message": "Invalid MFA code"},
+                    status=403,
+                )
+
+        # ── Issue tokens ──────────────────────────────────────────────────
+        _AUTH_RATE_LIMITER.reset(client_ip)   # successful login resets counter
+        access_token  = _issue_access_token(user, cfg)
+        refresh_token = _REFRESH_STORE.issue(user.id, cfg.refresh_token_ttl)
+
+        logger.info(
+            "[Auth] login successful email=%s role=%s IP=%s",
+            email, user.role.value, client_ip,
+        )
+
+        return _web.json_response({
+            "access_token":  access_token,
+            "refresh_token": refresh_token,
+            "token_type":    "Bearer",
+            "expires_in":    cfg.token_ttl_seconds,
+            "user": {
+                "id":         user.id,
+                "name":       user.name,
+                "role":       user.role.value,
+                "patient_id": user.patient_id,
+            },
+        })
+
+    # ── POST /auth/refresh ────────────────────────────────────────────────
+
+    async def refresh(request: _web.Request) -> _web.Response:
+        """
+        Rotate a refresh token and issue a new access token.
+
+        Implements refresh token rotation: the submitted token is
+        immediately invalidated, and a brand-new refresh token is returned
+        alongside the new access token.
+
+        Request body (JSON)
+        -------------------
+        { "refresh_token": "<opaque token>" }
+
+        Success (200)
+        -------------
+        {
+          "access_token":  "<new JWT>",
+          "refresh_token": "<new opaque token>",
+          "token_type":    "Bearer",
+          "expires_in":    3600
+        }
+
+        Errors
+        ------
+        400  missing_fields
+        401  invalid_refresh_token
+        401  refresh_token_expired
+        404  user_not_found
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response(
+                {"error": "invalid_json"},
+                status=400,
+            )
+
+        token_id = (body.get("refresh_token") or "").strip()
+        if not token_id:
+            return _web.json_response(
+                {"error": "missing_fields",
+                 "message": "'refresh_token' is required"},
+                status=400,
+            )
+
+        # consume() validates, removes the token, and returns user_id
+        user_id = _REFRESH_STORE.consume(token_id)
+
+        if user_id is None:
+            logger.warning("[Auth] invalid or expired refresh token")
+            return _web.json_response(
+                {"error": "invalid_refresh_token",
+                 "message": "Refresh token is invalid or has expired. Please sign in again."},
+                status=401,
+            )
+
+        # Re-load the user to pick up any role/status changes since last login
+        user = next(
+            (u for u in _STUB_USERS.values() if u.id == user_id),
+            None,
+        )
+        if user is None or not user.is_active:
+            return _web.json_response(
+                {"error": "user_not_found",
+                 "message": "User account no longer exists or has been disabled"},
+                status=404,
+            )
+
+        # Issue rotated tokens
+        new_access  = _issue_access_token(user, cfg)
+        new_refresh = _REFRESH_STORE.issue(user.id, cfg.refresh_token_ttl)
+
+        logger.info("[Auth] token refreshed user_id=%s", user_id)
+
+        return _web.json_response({
+            "access_token":  new_access,
+            "refresh_token": new_refresh,
+            "token_type":    "Bearer",
+            "expires_in":    cfg.token_ttl_seconds,
+        })
+
+    # ── GET /auth/logout ──────────────────────────────────────────────────
+
+    @_require_auth(cfg)
+    async def logout(request: _web.Request) -> _web.Response:
+        """
+        Revoke all refresh tokens for the authenticated user.
+        The client is responsible for discarding the access token locally.
+        """
+        user_payload = request["user"]
+        revoked = _REFRESH_STORE.revoke_all_for_user(user_payload["sub"])
+        logger.info("[Auth] logout user_id=%s revoked=%d", user_payload["sub"], revoked)
+        return _web.json_response(
+            {"message": "Signed out successfully", "tokens_revoked": revoked}
+        )
+
+    # ── GET /health ───────────────────────────────────────────────────────
+
+    @_require_auth(cfg)
+    async def health(request: _web.Request) -> _web.Response:
+        return _web.json_response(bridge.status())
+
+    # ── GET /devices ──────────────────────────────────────────────────────
+
+    @_require_auth(cfg)
+    async def devices(request: _web.Request) -> _web.Response:
+        user   = request["user"]
+        summary = bridge.registry.summary()
+
+        # Patients can only see their own device
+        if user.get("role") == UserRole.PATIENT.value:
+            pid     = user.get("patient_id")
+            summary = {
+                **summary,
+                "devices": [d for d in summary["devices"] if d["patient_id"] == pid],
+            }
+
+        return _web.json_response(summary)
+
+    # ── GET /alerts ───────────────────────────────────────────────────────
+
+    @_require_auth(cfg)
+    async def alerts(request: _web.Request) -> _web.Response:
+        user   = request["user"]
+        agent  = bridge.system.agents["alert_monitoring"]
+        all_alerts = [
+            {
+                "alert_id":   a.alert_id,
+                "patient_id": a.patient_id,
+                "level":      a.alert_level.value,
+                "description": a.description,
+                "actions":    a.required_actions,
+                "notified":   a.notified_parties,
+                "timestamp":  a.timestamp,
+            }
+            for a in agent.active_alerts.values()
+        ]
+
+        # Patients see only their own alerts
+        if user.get("role") == UserRole.PATIENT.value:
+            pid        = user.get("patient_id")
+            all_alerts = [a for a in all_alerts if a["patient_id"] == pid]
+
+        return _web.json_response(all_alerts)
+
+    # ── GET /reports ──────────────────────────────────────────────────────
+
+    @_require_auth(cfg)
+    async def reports(request: _web.Request) -> _web.Response:
+        user  = request["user"]
+        store = bridge.system.agents["communication"].report_store
+
+        if user.get("role") == UserRole.PATIENT.value:
+            pid   = user.get("patient_id")
+            store = [r for r in store if r.get("patient_id") == pid]
+
+        return _web.json_response(store[-50:])  # last 50 reports
+
+    # ── Register routes ───────────────────────────────────────────────────
+
+    app.router.add_post("/auth/login",   login)
+    app.router.add_post("/auth/refresh", refresh)
+    app.router.add_post("/auth/logout",  logout)
+    app.router.add_get( "/health",       health)
+    app.router.add_get( "/devices",      devices)
+    app.router.add_get( "/alerts",       alerts)
+    app.router.add_get( "/reports",      reports)
+
+    return app
+
+
+async def start_http_api(
+    bridge: "IoMTCardioAIBridge",
+    host:   str = "0.0.0.0",
+    port:   int = 8080,
+) -> "_web.AppRunner":
+    """
+    Start the HTTP API server and return the runner (call runner.cleanup() on shutdown).
+    """
+    # Initialise stub users (replace with DB/LDAP bootstrap in production)
+    global _STUB_USERS
+    _STUB_USERS = _make_stub_users()
+
+    app    = build_http_app(bridge)
+    runner = _web.AppRunner(app)
+    await runner.setup()
+    site   = _web.TCPSite(runner, host, port)
+    await site.start()
+    logger.info("[API] HTTP server listening on http://%s:%d", host, port)
+    logger.info(
+        "[API] Routes: POST /auth/login  POST /auth/refresh  "
+        "POST /auth/logout  GET /health  GET /devices  GET /alerts  GET /reports"
+    )
+    return runner
+
+
 # ============================================================================
 # SECTION 20 — ENTRY POINT
 # ============================================================================
@@ -1703,13 +2412,26 @@ async def main() -> None:
             # Windows does not support loop.add_signal_handler
             pass
 
+    # Start HTTP API (auth + dashboard data endpoints)
+    api_runner = await start_http_api(
+        bridge,
+        host = cfg.api_host,
+        port = cfg.api_port,
+    )
+
     await bridge.start()
     logger.info("[Startup] bridge running — awaiting shutdown signal")
+    logger.info(
+        "[Startup] HTTP API: http://%s:%d  |  WebSocket: ws://%s:%d",
+        cfg.api_host, cfg.api_port,
+        cfg.cardioai_ws_host, cfg.cardioai_ws_port,
+    )
 
     await shutdown_event.wait()
 
-    logger.info("[Shutdown] stopping bridge ...")
+    logger.info("[Shutdown] stopping services ...")
     await bridge.stop()
+    await api_runner.cleanup()
 
     # Final status snapshot
     logger.info("[Shutdown] final status: %s", json.dumps(bridge.status(), default=str))
