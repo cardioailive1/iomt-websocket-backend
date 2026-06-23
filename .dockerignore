@@ -1,0 +1,10 @@
+.env
+*.pyc
+__pycache__/
+.git/
+*.md
+tests/
+*.sh
+deploy/
+logs/
+.venv/
