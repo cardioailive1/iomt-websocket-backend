@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cardioai
+  namespace: cardioai
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cardioai-role
+  namespace: cardioai
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["cardioai-secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cardioai-rolebinding
+  namespace: cardioai
+subjects:
+- kind: ServiceAccount
+  name: cardioai
+  namespace: cardioai
+roleRef:
+  kind: Role
+  name: cardioai-role
+  apiGroup: rbac.authorization.k8s.io
