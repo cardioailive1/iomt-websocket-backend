@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cardioai-config
+  namespace: cardioai
+data:
+  IOMT_SERVER_WS_URL:       "wss://iomt.hospital.local/stream"
+  IOMT_SERVER_REST_URL:     "https://iomt.hospital.local/api/v1"
+  IOMT_SERVER_ID:           "IOMT-SRV-001"
+  CARDIOAI_BACKEND_ID:      "cardioai-prod-01"
+  CARDIOAI_WS_HOST:         "0.0.0.0"
+  CARDIOAI_WS_PORT:         "8765"
+  CARDIOAI_HEALTH_PORT:     "8080"
+  JWT_ALGORITHM:            "HS256"
+  TOKEN_TTL_SECONDS:        "3600"
+  RPM_POLL_INTERVAL_SEC:    "1.0"
+  HEARTBEAT_INTERVAL_SEC:   "10.0"
+  RECONNECT_MAX_ATTEMPTS:   "5"
+  RECONNECT_BASE_DELAY_SEC: "2.0"
+  INBOUND_QUEUE_MAXSIZE:    "2000"
+  LOG_LEVEL:                "INFO"
+  LOG_FORMAT:               "json"
