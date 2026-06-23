@@ -1,24 +1,8 @@
-# Secrets — never commit
 .env
-backend/.env
-*.key
-*.pem
-*.crt
-
-# Python
 *.pyc
 __pycache__/
+logs/
+*.log
 *.egg-info/
 .venv/
 venv/
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Logs
-logs/
-*.log
-
-# OS
-.DS_Store
-Thumbs.db
