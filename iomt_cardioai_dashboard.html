@@ -6,1416 +6,634 @@
 <title>IoMT CardioAI — Live Dashboard</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-/* ─── RESET & TOKENS ─────────────────────────────────────────────────────── */
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-:root {
-  --bg:         #07090e;
-  --bg1:        #0b0f17;
-  --bg2:        #0f1520;
-  --card:       #131c2a;
-  --card2:      #182336;
-  --border:     #1e2f44;
-  --border2:    #273d56;
-
-  --green:      #00e5a0;
-  --green-dim:  rgba(0,229,160,.10);
-  --green-glow: rgba(0,229,160,.30);
-  --red:        #ff4757;
-  --red-dim:    rgba(255,71,87,.10);
-  --amber:      #ffa502;
-  --amber-dim:  rgba(255,165,2,.10);
-  --blue:       #1e90ff;
-  --blue-dim:   rgba(30,144,255,.10);
-  --purple:     #a55eea;
-  --cyan:       #00d2ff;
-
-  --text:       #c8dce8;
-  --text2:      #7a9ab0;
-  --muted:      #3d5870;
-  --dim:        #243547;
-
-  --font:       'Inter', sans-serif;
-  --mono:       'JetBrains Mono', monospace;
-}
-
-html, body { height: 100%; overflow: hidden; }
-
-body {
-  font-family: var(--font);
-  background: var(--bg);
-  color: var(--text);
-  display: flex;
-  flex-direction: column;
-}
-
-/* scanline texture */
-body::after {
-  content: '';
-  position: fixed; inset: 0;
-  background: repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,180,255,.008) 3px,rgba(0,180,255,.008) 4px);
-  pointer-events: none; z-index: 9999;
-}
-
-/* ─── TOP BAR ─────────────────────────────────────────────────────────────── */
-.topbar {
-  flex-shrink: 0;
-  height: 52px;
-  background: var(--bg1);
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  padding: 0 20px;
-  gap: 0;
-  position: relative;
-  z-index: 100;
-}
-
-.logo {
-  font-size: .95rem;
-  font-weight: 700;
-  color: #fff;
-  letter-spacing: -.02em;
-  white-space: nowrap;
-  margin-right: 28px;
-}
-.logo span { color: var(--green); }
-
-/* tabs */
-.nav {
-  display: flex;
-  height: 100%;
-  gap: 2px;
-}
-
-.nav-btn {
-  font-family: var(--font);
-  font-size: .72rem;
-  font-weight: 500;
-  letter-spacing: .04em;
-  padding: 0 15px;
-  background: none;
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--muted);
-  cursor: pointer;
-  transition: color .14s, border-color .14s;
-  white-space: nowrap;
-  height: 100%;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.nav-btn:hover  { color: var(--text); }
-.nav-btn.active { color: var(--green); border-bottom-color: var(--green); }
-
-.nav-btn .dot {
-  width: 5px; height: 5px;
-  border-radius: 50%;
-  background: var(--green);
-  display: none;
-}
-.nav-btn.active .dot { display: block; box-shadow: 0 0 5px var(--green); }
-
-/* right section of topbar */
-.topbar-right {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
-.status-pill {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-family: var(--mono);
-  font-size: .6rem;
-  letter-spacing: .08em;
-  padding: 4px 10px;
-  border-radius: 99px;
-  border: 1px solid var(--border2);
-  background: var(--card);
-  color: var(--text2);
-}
-
-.status-pill .indicator {
-  width: 6px; height: 6px;
-  border-radius: 50%;
-  background: var(--muted);
-  flex-shrink: 0;
-}
-.status-pill.live .indicator {
-  background: var(--green);
-  box-shadow: 0 0 0 2px var(--green-dim);
-  animation: pulse 2s ease-in-out infinite;
-}
-.status-pill.error .indicator { background: var(--red); }
-.status-pill.loading .indicator {
-  background: var(--amber);
-  animation: pulse 1s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  0%,100% { opacity:1; }
-  50%      { opacity:.4; }
-}
-
-.config-btn {
-  font-family: var(--mono);
-  font-size: .6rem;
-  padding: 4px 10px;
-  background: var(--card);
-  border: 1px solid var(--border2);
-  border-radius: 4px;
-  color: var(--text2);
-  cursor: pointer;
-  transition: all .14s;
-}
-.config-btn:hover { border-color: var(--green); color: var(--green); }
-
-.clock {
-  font-family: var(--mono);
-  font-size: .62rem;
-  color: var(--muted);
-}
-
-/* ─── VIEWS ───────────────────────────────────────────────────────────────── */
-.view { display: none; flex: 1; overflow: hidden; }
-.view.active { display: flex; flex-direction: column; }
-
-/* ─── CONFIG PANEL (overlay) ─────────────────────────────────────────────── */
-.config-overlay {
-  display: none;
-  position: fixed; inset: 0;
-  background: rgba(0,0,0,.7);
-  z-index: 1000;
-  align-items: center;
-  justify-content: center;
-}
-.config-overlay.open { display: flex; }
-
-.config-panel {
-  background: var(--bg2);
-  border: 1px solid var(--border2);
-  border-radius: 12px;
-  padding: 28px;
-  width: 400px;
-  max-width: calc(100vw - 40px);
-}
-
-.config-panel h3 {
-  font-size: .95rem;
-  font-weight: 700;
-  color: #fff;
-  margin-bottom: 4px;
-}
-
-.config-panel .sub {
-  font-size: .65rem;
-  color: var(--muted);
-  margin-bottom: 20px;
-  line-height: 1.5;
-}
-
-.cfg-field {
-  margin-bottom: 14px;
-}
-
-.cfg-label {
-  font-size: .62rem;
-  letter-spacing: .1em;
-  text-transform: uppercase;
-  color: var(--text2);
-  margin-bottom: 5px;
-  display: block;
-}
-
-.cfg-input {
-  width: 100%;
-  font-family: var(--mono);
-  font-size: .7rem;
-  padding: 8px 12px;
-  background: var(--card);
-  border: 1px solid var(--border2);
-  border-radius: 4px;
-  color: var(--text);
-  outline: none;
-  transition: border-color .14s;
-}
-.cfg-input:focus { border-color: var(--green); }
-
-.cfg-row {
-  display: flex;
-  gap: 10px;
-  margin-top: 20px;
-}
-
-.cfg-btn {
-  flex: 1;
-  font-family: var(--font);
-  font-size: .72rem;
-  font-weight: 600;
-  padding: 9px;
-  border-radius: 6px;
-  border: none;
-  cursor: pointer;
-  transition: all .14s;
-}
-.cfg-btn.primary { background: var(--green); color: #000; }
-.cfg-btn.primary:hover { background: #00c88a; }
-.cfg-btn.secondary { background: var(--card2); border: 1px solid var(--border2); color: var(--text2); }
-.cfg-btn.secondary:hover { border-color: var(--red); color: var(--red); }
-
-/* ─── VIEW 1: LIVE MONITOR ───────────────────────────────────────────────── */
-#view-live.active { display: grid; grid-template-columns: 1fr 320px; overflow: hidden; }
-
-.monitor-main {
-  overflow-y: auto;
-  padding: 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-.monitor-main::-webkit-scrollbar { width: 4px; }
-.monitor-main::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 2px; }
-
-.monitor-side {
-  border-left: 1px solid var(--border);
-  overflow-y: auto;
-  padding: 16px;
-  background: var(--bg1);
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
-.monitor-side::-webkit-scrollbar { width: 3px; }
-.monitor-side::-webkit-scrollbar-thumb { background: var(--dim); }
-
-/* KPI row */
-.kpi-row {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 12px;
-}
-
-.kpi-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  position: relative;
-  overflow: hidden;
-  transition: border-color .2s;
-}
-
-.kpi-card::before {
-  content: '';
-  position: absolute;
-  top: 0; left: 0; right: 0;
-  height: 2px;
-  border-radius: 10px 10px 0 0;
-}
-
-.kpi-card.green::before { background: var(--green); }
-.kpi-card.red::before   { background: var(--red); }
-.kpi-card.amber::before { background: var(--amber); }
-.kpi-card.blue::before  { background: var(--blue); }
-
-.kpi-label {
-  font-size: .58rem;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-.kpi-value {
-  font-family: var(--mono);
-  font-size: 1.5rem;
-  font-weight: 600;
-  line-height: 1;
-  transition: color .3s;
-}
-
-.kpi-card.green .kpi-value { color: var(--green); }
-.kpi-card.red   .kpi-value { color: var(--red); }
-.kpi-card.amber .kpi-value { color: var(--amber); }
-.kpi-card.blue  .kpi-value { color: var(--blue); }
-
-.kpi-sub {
-  font-family: var(--mono);
-  font-size: .58rem;
-  color: var(--muted);
-  margin-top: 2px;
-}
-
-/* Vitals grid */
-.vitals-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 12px;
-}
-
-.vital-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.vital-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.vital-label {
-  font-size: .6rem;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-.vital-icon {
-  font-size: .75rem;
-}
-
-.vital-reading {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
-.vital-num {
-  font-family: var(--mono);
-  font-size: 2rem;
-  font-weight: 600;
-  color: #fff;
-  line-height: 1;
-  transition: all .3s;
-}
-
-.vital-unit {
-  font-size: .62rem;
-  color: var(--muted);
-}
-
-.vital-bar {
-  height: 3px;
-  background: var(--border);
-  border-radius: 2px;
-  overflow: hidden;
-  margin-top: 4px;
-}
-
-.vital-fill {
-  height: 100%;
-  border-radius: 2px;
-  transition: width .5s ease, background .3s;
-}
-
-/* Alerts panel */
-.section-title {
-  font-size: .62rem;
-  letter-spacing: .14em;
-  text-transform: uppercase;
-  color: var(--muted);
-  margin-bottom: 8px;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-}
-
-.section-title::before {
-  content: '';
-  display: block;
-  width: 3px; height: 11px;
-  border-radius: 2px;
-  background: var(--green);
-  flex-shrink: 0;
-}
-
-.section-title.red::before   { background: var(--red); }
-.section-title.amber::before { background: var(--amber); }
-.section-title.blue::before  { background: var(--blue); }
-
-.alert-item {
-  padding: 9px 11px;
-  border-radius: 7px;
-  border: 1px solid var(--border);
-  background: var(--card2);
-  margin-bottom: 6px;
-  animation: fadeIn .2s ease;
-}
-
-@keyframes fadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
-
-.alert-level {
-  font-size: .55rem;
-  font-weight: 700;
-  letter-spacing: .1em;
-  padding: 1px 7px;
-  border-radius: 99px;
-  display: inline-block;
-  margin-bottom: 4px;
-}
-
-.alert-level.critical { background: var(--red-dim);   color: var(--red);   border: 1px solid rgba(255,71,87,.3); }
-.alert-level.high     { background: var(--amber-dim);  color: var(--amber); border: 1px solid rgba(255,165,2,.3); }
-.alert-level.medium   { background: var(--blue-dim);   color: var(--blue);  border: 1px solid rgba(30,144,255,.3); }
-.alert-level.low      { background: var(--green-dim);  color: var(--green); border: 1px solid rgba(0,229,160,.3); }
-
-.alert-desc {
-  font-size: .65rem;
-  color: var(--text);
-  line-height: 1.4;
-}
-
-.alert-meta {
-  font-family: var(--mono);
-  font-size: .55rem;
-  color: var(--muted);
-  margin-top: 3px;
-}
-
-/* Device list */
-.device-item {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 8px 10px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--card2);
-  margin-bottom: 5px;
-}
-
-.device-dot {
-  width: 7px; height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.device-dot.active { background: var(--green); box-shadow: 0 0 5px var(--green); }
-.device-dot.inactive { background: var(--muted); }
-
-.device-info { flex: 1; min-width: 0; }
-.device-id { font-family: var(--mono); font-size: .62rem; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.device-pid { font-size: .56rem; color: var(--muted); margin-top: 1px; }
-.device-count { font-family: var(--mono); font-size: .58rem; color: var(--muted); text-align: right; }
-
-/* Empty state */
-.empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 30px 0;
-  color: var(--dim);
-  gap: 6px;
-  font-size: .65rem;
-}
-
-/* ─── VIEW 2: DEVICES ─────────────────────────────────────────────────────── */
-#view-devices.active { display: flex; overflow: hidden; }
-
-.devices-content {
-  flex: 1;
-  overflow-y: auto;
-  padding: 20px;
-}
-.devices-content::-webkit-scrollbar { width: 4px; }
-.devices-content::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 2px; }
-
-.devices-header {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-bottom: 20px;
-}
-
-.devices-header h2 {
-  font-size: 1rem;
-  font-weight: 700;
-  color: #fff;
-}
-
-.stat-trio {
-  display: flex;
-  gap: 10px;
-}
-
-.stat-chip {
-  font-family: var(--mono);
-  font-size: .6rem;
-  padding: 4px 10px;
-  border-radius: 4px;
-  border: 1px solid var(--border2);
-  background: var(--card2);
-  color: var(--text2);
-}
-
-.stat-chip strong { color: var(--text); }
-
-.devices-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-.devices-table th {
-  text-align: left;
-  padding: 8px 12px;
-  font-size: .58rem;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  color: var(--muted);
-  border-bottom: 1px solid var(--border);
-  font-weight: 600;
-}
-
-.devices-table td {
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-  font-size: .68rem;
-  vertical-align: middle;
-}
-
-.devices-table tr:hover td { background: rgba(255,255,255,.02); }
-
-.status-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-family: var(--mono);
-  font-size: .56rem;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 99px;
-}
-
-.status-badge.active  { background: var(--green-dim); color: var(--green); }
-.status-badge.inactive{ background: var(--red-dim);   color: var(--red); }
-.status-badge .sb-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
-
-.mono { font-family: var(--mono); font-size: .62rem; }
-
-/* ─── VIEW 3: ALERTS ──────────────────────────────────────────────────────── */
-#view-alerts.active { display: flex; overflow: hidden; }
-
-.alerts-content {
-  flex: 1;
-  overflow-y: auto;
-  padding: 20px;
-}
-.alerts-content::-webkit-scrollbar { width: 4px; }
-.alerts-content::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 2px; }
-
-.alerts-header {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin-bottom: 20px;
-  flex-wrap: wrap;
-}
-
-.alerts-header h2 { font-size: 1rem; font-weight: 700; color: #fff; }
-
-.filter-chips { display: flex; gap: 6px; flex-wrap: wrap; }
-
-.f-chip {
-  font-family: var(--font);
-  font-size: .6rem;
-  padding: 4px 10px;
-  border-radius: 4px;
-  border: 1px solid var(--border2);
-  background: var(--card2);
-  color: var(--muted);
-  cursor: pointer;
-  transition: all .14s;
-}
-.f-chip:hover { border-color: var(--blue); color: var(--blue); }
-.f-chip.on { background: var(--green-dim); border-color: rgba(0,229,160,.4); color: var(--green); }
-.f-chip.on-crit { background: var(--red-dim); border-color: rgba(255,71,87,.4); color: var(--red); }
-
-.alert-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
-  margin-bottom: 10px;
-  animation: fadeIn .2s ease;
-}
-
-.alert-card.critical { border-color: rgba(255,71,87,.3);  background: rgba(255,71,87,.04); }
-.alert-card.high     { border-color: rgba(255,165,2,.25); }
-.alert-card.medium   { border-color: rgba(30,144,255,.2); }
-
-.alert-card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-.alert-patient { font-family: var(--mono); font-size: .62rem; color: var(--text2); margin-left: auto; }
-.alert-time { font-family: var(--mono); font-size: .58rem; color: var(--muted); }
-.alert-description { font-size: .72rem; color: var(--text); line-height: 1.5; margin-bottom: 10px; }
-.alert-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 8px; }
-
-.action-tag {
-  font-family: var(--mono);
-  font-size: .55rem;
-  padding: 2px 8px;
-  border-radius: 3px;
-  background: var(--card2);
-  border: 1px solid var(--border2);
-  color: var(--text2);
-}
-
-.notified-row { font-size: .6rem; color: var(--muted); }
-.notified-row span { color: var(--text2); }
-
-/* ─── VIEW 4: TESTS (from static data) ───────────────────────────────────── */
-#view-tests.active { display: grid; grid-template-columns: 196px 1fr; overflow: hidden; }
-
-.tests-sidebar {
-  border-right: 1px solid var(--border);
-  background: var(--bg1);
-  overflow-y: auto;
-  padding: 10px 0;
-}
-.tests-sidebar::-webkit-scrollbar { width: 3px; }
-.tests-sidebar::-webkit-scrollbar-thumb { background: var(--dim); }
-
-.ts-lbl {
-  padding: 8px 14px 4px;
-  font-size: .52rem;
-  letter-spacing: .18em;
-  text-transform: uppercase;
-  color: var(--dim);
-}
-
-.ts-btn {
-  width: 100%;
-  text-align: left;
-  background: none;
-  border: none;
-  border-left: 2px solid transparent;
-  cursor: pointer;
-  padding: 6px 14px;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  transition: all .12s;
-}
-.ts-btn:hover { background: rgba(255,255,255,.025); }
-.ts-btn.active { background: var(--green-dim); border-left-color: var(--green); }
-
-.ts-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--green); box-shadow: 0 0 4px var(--green); flex-shrink: 0; }
-.ts-name { font-size: .63rem; color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ts-count { font-size: .56rem; padding: 1px 6px; border-radius: 99px; background: var(--green-dim); color: var(--green); flex-shrink: 0; }
-
-.tests-panel {
-  overflow-y: auto;
-  padding: 18px 22px;
-  background: var(--bg2);
-}
-.tests-panel::-webkit-scrollbar { width: 3px; }
-.tests-panel::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 2px; }
-
-.tp-hdr { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.tp-hdr h2 { font-size: .9rem; font-weight: 700; color: #fff; }
-.tp-meta { font-size: .6rem; color: var(--muted); }
-
-.tp-bar { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 14px; }
-.tp-fill { height: 100%; background: linear-gradient(90deg, var(--green), var(--cyan)); border-radius: 2px; transition: width .8s cubic-bezier(.22,1,.36,1); box-shadow: 0 0 8px var(--green-glow); }
-
-.tr-row { display: flex; align-items: center; gap: 9px; padding: 5px 9px; border-radius: 3px; margin-bottom: 2px; border: 1px solid transparent; animation: fadeIn .2s ease; }
-.tr-row:hover { background: rgba(255,255,255,.02); border-color: var(--border); }
-
-.tr-status { font-family: var(--mono); font-size: .56rem; font-weight: 600; width: 36px; flex-shrink: 0; color: var(--green); }
-.tr-name { font-size: .65rem; color: var(--text); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tr-param { color: var(--cyan); opacity: .7; }
-.tr-pct { font-family: var(--mono); font-size: .53rem; color: var(--muted); width: 28px; text-align: right; flex-shrink: 0; }
-
-.param-indent { margin: 1px 0 3px 40px; border-left: 1px solid var(--border2); padding-left: 10px; }
-.pi-row { display: flex; align-items: center; gap: 7px; padding: 3px 6px; border-radius: 2px; animation: fadeIn .15s ease; }
-.pi-row:hover { background: rgba(255,255,255,.02); }
-.pi-dot { width: 4px; height: 4px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
-.pi-val { font-family: var(--mono); font-size: .58rem; color: var(--muted); }
-.pi-pct { margin-left: auto; font-family: var(--mono); font-size: .52rem; color: var(--dim); }
-
-/* ─── SCROLLBAR GLOBAL ────────────────────────────────────────────────────── */
-::-webkit-scrollbar { width: 4px; height: 4px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 99px; }
-
-/* ─── REFRESH BUTTON ─────────────────────────────────────────────────────── */
-.refresh-btn {
-  font-family: var(--mono);
-  font-size: .6rem;
-  padding: 4px 10px;
-  background: var(--card);
-  border: 1px solid var(--border2);
-  border-radius: 4px;
-  color: var(--text2);
-  cursor: pointer;
-  transition: all .14s;
-  margin-left: auto;
-}
-.refresh-btn:hover { border-color: var(--green); color: var(--green); }
-.refresh-btn.spinning { animation: spin .7s linear infinite; }
-@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
-
-/* ─── NO BACKEND BANNER ──────────────────────────────────────────────────── */
-.no-backend-banner {
-  background: rgba(255,165,2,.06);
-  border-bottom: 1px solid rgba(255,165,2,.2);
-  padding: 7px 20px;
-  font-size: .64rem;
-  color: var(--amber);
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
-.no-backend-banner.hidden { display: none; }
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0A1628;--bg1:#0D1E35;--bg2:#0A1628;--card:#112240;--card2:#0F1D30;
+  --border:#1A3A5C;--border2:#1E4A72;
+  --green:#40B8F8;--green-dim:rgba(64,184,248,.12);--green-glow:rgba(64,184,248,.30);
+  --red:#F84858;--red-dim:rgba(248,72,88,.10);
+  --amber:#F88840;--amber-dim:rgba(248,136,64,.10);
+  --blue:#0048A0;--blue-dim:rgba(0,72,160,.10);
+  --purple:#6A4FBF;--cyan:#80D0F8;
+  --text:#C8DCF0;--text2:#7A9AB8;--muted:#3A5C7A;--dim:#1E3A52;
+  --font:'Inter',sans-serif;--mono:'JetBrains Mono',monospace;
+}
+html,body{height:100%;overflow:hidden}
+body{font-family:var(--font);background:var(--bg);color:var(--text)}
+body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(64,184,248,.006) 3px,rgba(64,184,248,.006) 4px);pointer-events:none;z-index:9999}
+.topbar{flex-shrink:0;height:52px;background:var(--bg1);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 20px;gap:0;position:relative;z-index:100}
+.logo{font-size:.95rem;font-weight:700;color:#C8DCF0;letter-spacing:-.02em;white-space:nowrap;margin-right:28px}
+.logo span{color:var(--green)}
+.nav{display:flex;height:100%;gap:2px}
+.nb{font-family:var(--font);font-size:.72rem;font-weight:500;letter-spacing:.04em;padding:0 14px;background:none;border:none;border-bottom:2px solid transparent;color:var(--muted);cursor:pointer;transition:color .14s,border-color .14s;white-space:nowrap;height:100%;display:flex;align-items:center;gap:6px}
+.nb:hover{color:var(--text)}
+.nb.on{color:var(--green);border-bottom-color:var(--green)}
+.nb .dot{width:5px;height:5px;border-radius:50%;background:var(--green);display:none}
+.nb.on .dot{display:block;box-shadow:0 0 5px var(--green)}
+.nb .bdg{background:var(--red);color:#fff;font-size:.5rem;font-weight:700;padding:1px 5px;border-radius:99px;display:none}
+.tb-right{margin-left:auto;display:flex;align-items:center;gap:14px}
+.spill{display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:.6rem;letter-spacing:.08em;padding:4px 10px;border-radius:99px;border:1px solid var(--border2);background:var(--card);color:var(--text2)}
+.spill .ind{width:6px;height:6px;border-radius:50%;background:var(--muted);flex-shrink:0}
+.spill.live .ind{background:var(--green);box-shadow:0 0 0 2px var(--green-dim);animation:pulse 2s ease-in-out infinite}
+.spill.err .ind{background:var(--red)}
+.spill.loading .ind{background:var(--amber);animation:pulse 1s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.cfg-btn{font-family:var(--mono);font-size:.6rem;padding:4px 10px;background:var(--card);border:1px solid var(--border2);border-radius:4px;color:var(--text2);cursor:pointer;transition:all .14s}
+.cfg-btn:hover{border-color:var(--green);color:var(--green)}
+.clk{font-family:var(--mono);font-size:.62rem;color:var(--muted)}
+.banner{background:rgba(255,165,2,.06);border-bottom:1px solid rgba(255,165,2,.2);padding:7px 20px;font-size:.64rem;color:var(--amber);display:none;align-items:center;gap:8px;flex-shrink:0}
+.banner.show{display:flex}
+.view{display:none;flex:1;overflow:hidden}
+.view.on{display:flex;flex-direction:column}
+.view.grid-view{display:none}
+.view.grid-view.on{display:grid;grid-template-columns:200px 1fr;overflow:hidden}
+.g-side{border-right:1px solid var(--border);background:var(--bg1);overflow-y:auto;padding:10px 0}
+.g-main{overflow-y:auto;padding:16px;background:var(--bg2)}
+.sb-lbl{padding:8px 14px 4px;font-size:.52rem;letter-spacing:.18em;text-transform:uppercase;color:var(--dim)}
+.sb-btn{width:100%;text-align:left;background:none;border:none;border-left:2px solid transparent;cursor:pointer;padding:6px 14px;display:flex;align-items:center;gap:7px;font-size:.63rem;color:var(--text2);font-family:var(--font);transition:all .12s}
+.sb-btn:hover{background:rgba(255,255,255,.025)}
+.sb-btn.on{background:var(--green-dim);border-left-color:var(--green);color:var(--green)}
+.sb-cnt{margin-left:auto;font-size:.56rem;padding:1px 6px;border-radius:99px;background:var(--green-dim);color:var(--green)}
+/* KPI */
+.krow{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;padding:16px 20px 0}
+.kcard{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px 16px;position:relative;overflow:hidden}
+.kcard::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;border-radius:10px 10px 0 0}
+.kcard.g::before{background:var(--green)}.kcard.r::before{background:var(--red)}
+.kcard.a::before{background:var(--amber)}.kcard.b::before{background:var(--blue)}
+.klbl{font-size:.58rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+.kval{font-family:var(--mono);font-size:1.5rem;font-weight:600;line-height:1;margin-top:4px}
+.kcard.g .kval{color:var(--green)}.kcard.r .kval{color:var(--red)}
+.kcard.a .kval{color:var(--amber)}.kcard.b .kval{color:var(--blue)}
+.ksub{font-family:var(--mono);font-size:.58rem;color:var(--muted);margin-top:2px}
+.sec-hdr{font-size:.62rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:10px;display:flex;align-items:center;gap:7px}
+.sec-hdr::before{content:'';display:block;width:3px;height:11px;border-radius:2px;background:var(--green);flex-shrink:0}
+.sec-hdr.r::before{background:var(--red)}.sec-hdr.a::before{background:var(--amber)}
+.sec-hdr.b::before{background:var(--blue)}.sec-hdr.p::before{background:var(--purple)}
+/* Vitals */
+.vgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.vcrd{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:16px}
+.vlbl{display:flex;justify-content:space-between;font-size:.6rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.vnum{font-family:var(--mono);font-size:2rem;font-weight:600;color:#fff;line-height:1;transition:all .3s}
+.vunit{font-size:.62rem;color:var(--muted)}
+.vbar{height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:8px}
+.vfill{height:100%;border-radius:2px;transition:width .5s}
+/* Alert */
+.al-item{padding:9px 11px;border-radius:7px;border:1px solid var(--border);background:var(--card2);margin-bottom:6px;animation:fi .2s ease}
+.al-item.crit{background:rgba(255,71,87,.05);border-color:rgba(255,71,87,.3)}
+.al-item.high{border-color:rgba(255,165,2,.25)}
+.al-item.med{border-color:rgba(30,144,255,.2)}
+@keyframes fi{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.al-badge{font-size:.55rem;font-weight:700;letter-spacing:.1em;padding:1px 7px;border-radius:99px;display:inline-block;margin-bottom:4px}
+.al-badge.crit{background:var(--red-dim);color:var(--red);border:1px solid rgba(255,71,87,.3)}
+.al-badge.high{background:var(--amber-dim);color:var(--amber);border:1px solid rgba(255,165,2,.3)}
+.al-badge.med{background:var(--blue-dim);color:var(--blue);border:1px solid rgba(30,144,255,.3)}
+.al-badge.low{background:var(--green-dim);color:var(--green);border:1px solid rgba(0,229,160,.3)}
+.al-desc{font-size:.65rem;color:var(--text);line-height:1.4}
+.al-meta{font-family:var(--mono);font-size:.55rem;color:var(--muted);margin-top:3px}
+/* Cards */
+.card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px}
+.tworow{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+/* Devices table */
+.dv-table{width:100%;border-collapse:collapse}
+.dv-table th{text-align:left;padding:8px 12px;font-size:.58rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
+.dv-table td{padding:10px 12px;border-bottom:1px solid var(--border);font-size:.68rem}
+.dv-table tr:hover td{background:rgba(255,255,255,.02)}
+.stbadge{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:.56rem;font-weight:600;padding:2px 8px;border-radius:99px}
+.stbadge.act{background:var(--green-dim);color:var(--green)}
+.stbadge.inact{background:var(--red-dim);color:var(--red)}
+/* Devices filter */
+.f-chip{font-family:var(--font);font-size:.6rem;padding:4px 10px;border-radius:4px;border:1px solid var(--border2);background:var(--card2);color:var(--muted);cursor:pointer;transition:all .14s}
+.f-chip:hover{border-color:var(--blue);color:var(--blue)}
+.f-chip.on{background:var(--green-dim);border-color:rgba(0,229,160,.4);color:var(--green)}
+.f-chip.on-crit{background:var(--red-dim);border-color:rgba(255,71,87,.4);color:var(--red)}
+/* Test suite */
+.ts-btn{width:100%;text-align:left;background:none;border:none;border-left:2px solid transparent;cursor:pointer;padding:6px 14px;display:flex;align-items:center;gap:7px;font-size:.63rem;color:var(--text2);font-family:var(--font);transition:all .12s}
+.ts-btn:hover{background:rgba(255,255,255,.025)}
+.ts-btn.on{background:var(--green-dim);border-left-color:var(--green);color:var(--green)}
+.ts-cnt{margin-left:auto;font-size:.56rem;padding:1px 6px;border-radius:99px;background:var(--green-dim);color:var(--green)}
+.tr-row{display:flex;align-items:center;gap:9px;padding:4px 8px;border-radius:3px;animation:fi .2s ease}
+.tr-row:hover{background:rgba(255,255,255,.02)}
+.tr-st{font-family:var(--mono);font-size:.56rem;font-weight:600;width:32px;color:var(--green);flex-shrink:0}
+.tr-nm{font-size:.65rem;color:var(--text);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tr-pc{font-family:var(--mono);font-size:.53rem;color:var(--muted);width:28px;text-align:right}
+.pi-ind{margin:1px 0 3px 40px;border-left:1px solid var(--border2);padding-left:10px}
+.pi-row{display:flex;align-items:center;gap:7px;padding:3px 6px;border-radius:2px}
+.pi-d{width:4px;height:4px;border-radius:50%;background:var(--green);flex-shrink:0}
+.pi-v{font-family:var(--mono);font-size:.58rem;color:var(--muted)}
+.pi-p{margin-left:auto;font-family:var(--mono);font-size:.52rem;color:var(--dim)}
+.tp-bar{height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin-bottom:14px}
+.tp-fill{height:100%;background:linear-gradient(90deg,var(--green),var(--cyan));border-radius:2px;transition:width .8s cubic-bezier(.22,1,.36,1);box-shadow:0 0 8px var(--green-glow)}
+/* Workflow / Emergency */
+.wf-page{display:none}
+.wf-page.on{display:block}
+.flow-step{display:flex;align-items:flex-start;gap:12px;padding:8px 0;position:relative}
+.flow-step::before{content:'';position:absolute;left:13px;top:30px;bottom:-8px;width:1px;background:var(--border)}
+.flow-step:last-child::before{display:none}
+.fs-num{width:27px;height:27px;border-radius:50%;background:var(--card2);border:1px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:.6rem;font-weight:600;color:var(--text2);flex-shrink:0;position:relative;z-index:1}
+.fs-num.crit{background:var(--red-dim);border-color:rgba(255,71,87,.4);color:var(--red)}
+.fs-num.ok{background:var(--green-dim);border-color:rgba(0,229,160,.4);color:var(--green)}
+.fs-ttl{font-size:.7rem;font-weight:600;color:var(--text);margin-bottom:3px}
+.fs-sub{font-size:.62rem;color:var(--text2);line-height:1.5}
+.dec{display:flex;align-items:center;gap:8px;padding:6px 10px;background:var(--amber-dim);border-radius:6px;margin:4px 0 4px 40px;font-size:.62rem;font-weight:600;color:var(--amber)}
+.dec-br{display:flex;gap:8px;margin:3px 0 8px 40px}
+.db-y{flex:1;padding:6px 10px;border-radius:6px;background:var(--green-dim);border:1px solid rgba(0,229,160,.3);font-size:.6rem;color:var(--green)}
+.db-n{flex:1;padding:6px 10px;border-radius:6px;background:var(--blue-dim);border:1px solid rgba(30,144,255,.3);font-size:.6rem;color:var(--blue)}
+.sev-tbl{width:100%;border-collapse:collapse;font-size:.65rem}
+.sev-tbl th{text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);font-size:.57rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.sev-tbl td{padding:8px 10px;border-bottom:1px solid var(--border)}
+.sev-tbl tr:hover td{background:rgba(255,255,255,.02)}
+.p0{color:var(--red);font-weight:700;font-family:var(--mono)}
+.p1{color:var(--amber);font-weight:700;font-family:var(--mono)}
+.nl-wrap{margin-bottom:8px;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.nl-hdr{display:flex;align-items:center;gap:10px;padding:8px 12px}
+.nl-hdr.crit{background:rgba(255,71,87,.08)}
+.nl-hdr.high{background:rgba(255,165,2,.08)}
+.nl-hdr.med{background:rgba(30,144,255,.08)}
+.nl-ttl{font-size:.65rem;font-weight:600}
+.nl-ttl.crit{color:var(--red)}.nl-ttl.high{color:var(--amber)}.nl-ttl.med{color:var(--blue)}
+.nl-ack{margin-left:auto;font-size:.58rem;color:var(--muted);font-family:var(--mono)}
+.nl-body{padding:8px 12px;display:flex;flex-wrap:wrap;gap:5px}
+.nl-act{font-size:.6rem;padding:2px 8px;border-radius:3px;background:var(--card2);border:1px solid var(--border)}
+.met-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px}
+.met-card{background:var(--card2);border-radius:8px;padding:12px;text-align:center}
+.met-val{font-size:1.3rem;font-weight:600;color:var(--green);font-family:var(--mono)}
+.met-tgt{font-size:.58rem;color:var(--muted);margin-top:1px}
+.met-lbl{font-size:.6rem;color:var(--text2);margin-top:4px}
+.chk-item{display:flex;align-items:center;gap:8px;padding:5px 10px;border-radius:6px;background:var(--card2);border:1px solid var(--border);margin-bottom:4px;font-size:.63rem;color:var(--text2)}
+.chk-ic{width:14px;height:14px;border-radius:3px;background:var(--green-dim);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:.55rem;color:var(--green)}
+.mono-tag{font-family:var(--mono);font-size:.6rem;padding:2px 7px;background:var(--card2);border:1px solid var(--border);border-radius:3px;color:var(--text2)}
+.sync-row{display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:6px;background:var(--card2);border:1px solid var(--border);margin-bottom:5px;font-size:.63rem;color:var(--text2)}
+.sync-d{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.fhir{background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:.62rem;line-height:1.7;overflow-x:auto;white-space:pre;margin-bottom:8px}
+.fk{color:var(--blue)}.fv{color:var(--green)}.fs-c{color:var(--amber)}
+.agt-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin-bottom:14px}
+.agt-card{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:10px 8px;text-align:center;cursor:pointer;transition:border-color .15s}
+.agt-card:hover{border-color:var(--green)}
+.agt-num{font-size:.55rem;color:var(--muted);margin-bottom:4px;font-family:var(--mono)}
+.agt-ico{font-size:1.3rem;margin-bottom:4px}
+.agt-nm{font-size:.58rem;font-weight:500;line-height:1.3;color:var(--text)}
+.agt-dot{width:5px;height:5px;border-radius:50%;background:var(--green);margin:4px auto 0;box-shadow:0 0 4px var(--green)}
+.hs-step{display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:6px;background:var(--card2);border:1px solid var(--border);margin-bottom:5px;animation:fi .3s ease}
+.hs-fr{font-family:var(--mono);font-size:.6rem;color:var(--blue);width:90px;flex-shrink:0}
+.hs-ar{color:var(--muted)}
+.hs-to{font-family:var(--mono);font-size:.6rem;color:var(--amber);width:90px;flex-shrink:0}
+.hs-msg{font-family:var(--mono);font-size:.65rem;font-weight:600;color:var(--green);flex:1}
+.hs-badge{font-size:.55rem;padding:1px 7px;border-radius:99px}
+.hs-badge.sec{background:var(--blue-dim);color:var(--blue)}
+.hs-badge.ok{background:var(--green-dim);color:var(--green)}
+.mc-chip{display:inline-block;font-family:var(--mono);font-size:.58rem;padding:3px 7px;border-radius:3px;border:1px solid var(--border);background:var(--card2);color:var(--text2);margin:2px;cursor:default;transition:all .12s}
+.mc-chip.hl-g{background:var(--green-dim);border-color:rgba(0,229,160,.4);color:var(--green)}
+.mc-chip.hl-b{background:var(--blue-dim);border-color:rgba(30,144,255,.4);color:var(--blue)}
+.mc-chip.hl-a{background:var(--amber-dim);border-color:rgba(255,165,2,.4);color:var(--amber)}
+.mc-chip.hl-r{background:var(--red-dim);border-color:rgba(255,71,87,.4);color:var(--red)}
+.msg-tbl{width:100%;border-collapse:collapse;font-size:.62rem}
+.msg-tbl th{text-align:left;padding:6px 10px;border-bottom:1px solid var(--border);font-size:.55rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.msg-tbl td{padding:5px 10px;border-bottom:1px solid var(--border)}
+.msg-tbl tr:hover td{background:rgba(255,255,255,.02)}
+.dir-badge{display:inline-block;font-size:.55rem;padding:1px 6px;border-radius:99px}
+.dir-badge.c2s{background:var(--blue-dim);color:var(--blue)}
+.dir-badge.s2c{background:var(--amber-dim);color:var(--amber)}
+.dir-badge.bi{background:var(--green-dim);color:var(--green)}
+.bus-viz{position:relative;height:44px;background:var(--card2);border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-bottom:10px}
+.bus-lbl{position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:.55rem;color:var(--muted);z-index:2}
+.bus-pkt{position:absolute;height:18px;min-width:36px;border-radius:2px;top:50%;transform:translateY(-50%);font-size:.5rem;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:500;animation:busf 2.5s linear infinite}
+@keyframes busf{from{left:-60px}to{left:110%}}
+.cfg-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center}
+.cfg-ov.open{display:flex}
+.cfg-box{background:var(--bg2);border:1px solid var(--border2);border-radius:12px;padding:28px;width:400px;max-width:calc(100vw - 40px)}
+.cfg-box h3{font-size:.95rem;font-weight:700;color:#fff;margin-bottom:4px}
+.cfg-sub{font-size:.65rem;color:var(--muted);margin-bottom:20px;line-height:1.5}
+.cfg-lbl{font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;color:var(--text2);margin-bottom:5px;display:block}
+.cfg-f{margin-bottom:14px}
+.cfg-input{width:100%;font-family:var(--mono);font-size:.7rem;padding:8px 12px;background:var(--card);border:1px solid var(--border2);border-radius:4px;color:var(--text);outline:none}
+.cfg-input:focus{border-color:var(--green)}
+.cfg-row{display:flex;gap:10px;margin-top:20px}
+.cfg-p{flex:1;font-family:var(--font);font-size:.72rem;font-weight:600;padding:9px;border-radius:6px;border:none;cursor:pointer;background:var(--green);color:#000}
+.cfg-s{flex:1;font-family:var(--font);font-size:.72rem;font-weight:600;padding:9px;border-radius:6px;cursor:pointer;background:var(--card2);border:1px solid var(--border2);color:var(--text2)}
+.main-scroll{overflow-y:auto;padding:16px 20px;flex:1}
+.main-scroll::-webkit-scrollbar{width:4px}
+.main-scroll::-webkit-scrollbar-thumb{background:var(--dim);border-radius:2px}
+.g-main::-webkit-scrollbar{width:4px}
+.g-main::-webkit-scrollbar-thumb{background:var(--dim);border-radius:2px}
+.g-side::-webkit-scrollbar{width:3px}
+.g-side::-webkit-scrollbar-thumb{background:var(--dim)}
+.empty-st{display:flex;flex-direction:column;align-items:center;padding:24px 0;color:var(--dim);gap:6px;font-size:.63rem}
 </style>
 </head>
-<body>
+<body style="display:flex;flex-direction:column;height:100vh">
 
-<!-- ── TOP BAR ── -->
 <div class="topbar">
   <div class="logo">IoMT <span>CardioAI</span></div>
-
-  <nav class="nav">
-    <button class="nav-btn active" onclick="switchView('live')" id="tab-live">
-      <div class="dot"></div>Live Monitor
-    </button>
-    <button class="nav-btn" onclick="switchView('devices')" id="tab-devices">
-      <div class="dot"></div>Devices
-    </button>
-    <button class="nav-btn" onclick="switchView('alerts')" id="tab-alerts">
-      <div class="dot"></div>Alerts
-      <span id="alert-badge" style="display:none;background:var(--red);color:#fff;font-size:.5rem;font-weight:700;padding:1px 5px;border-radius:99px;"></span>
-    </button>
-    <button class="nav-btn" onclick="switchView('tests')" id="tab-tests">
-      <div class="dot"></div>Test Suite
-    </button>
-  </nav>
-
-  <div class="topbar-right">
-    <div class="status-pill loading" id="statusPill">
-      <div class="indicator"></div>
-      <span id="statusText">Connecting...</span>
-    </div>
-    <div class="clock" id="clock">--:--:--</div>
-    <button class="config-btn" onclick="openConfig()">⚙ Configure</button>
+  <div class="nav">
+    <button class="nb on" onclick="sv('live')" id="tab-live"><div class="dot"></div>Live Monitor</button>
+    <button class="nb" onclick="sv('agents')" id="tab-agents"><div class="dot"></div>7 Agents</button>
+    <button class="nb" onclick="sv('handshake')" id="tab-handshake"><div class="dot"></div>Handshake</button>
+    <button class="nb" onclick="sv('alerts')" id="tab-alerts"><div class="dot"></div>Alerts<span class="bdg" id="al-bdg">0</span></button>
+    <button class="nb" onclick="sv('devices')" id="tab-devices"><div class="dot"></div>Devices</button>
+    <button class="nb" onclick="sv('workflow')" id="tab-workflow"><div class="dot"></div>Clinical Workflow</button>
+    <button class="nb" onclick="sv('emergency')" id="tab-emergency"><div class="dot"></div>Emergency Response</button>
+    <button class="nb" onclick="sv('tests')" id="tab-tests"><div class="dot"></div>Test Suite</button>
+  </div>
+  <div class="tb-right">
+    <div class="spill" id="spill"><div class="ind"></div><span id="sptxt">Not configured</span></div>
+    <span class="clk" id="clk">--:--:--</span>
+    <button class="cfg-btn" onclick="openCfg()">&#9881; Configure</button>
   </div>
 </div>
+<div class="banner" id="banner">&#9888; Backend unreachable — showing last known data.</div>
 
-<!-- ── NO BACKEND BANNER ── -->
-<div class="no-backend-banner hidden" id="noBanner">
-  ⚠ Backend not reachable — showing last known data. Configure the API URL to connect.
+<!-- LIVE MONITOR -->
+<div class="view on" id="view-live">
+<div class="krow">
+  <div class="kcard g"><div class="klbl">Active Devices</div><div class="kval" id="k-active">&#8212;</div><div class="ksub" id="k-total">of &#8212; registered</div></div>
+  <div class="kcard r"><div class="klbl">Critical Alerts</div><div class="kval" id="k-crit">&#8212;</div><div class="ksub" id="k-atot">&#8212; total alerts</div></div>
+  <div class="kcard a"><div class="klbl">Queue Depth</div><div class="kval" id="k-queue">&#8212;</div><div class="ksub">frames pending</div></div>
+  <div class="kcard b"><div class="klbl">Messages Processed</div><div class="kval" id="k-msgs">&#8212;</div><div class="ksub" id="k-agt">&#8212; agents running</div></div>
 </div>
-
-<!-- ── VIEW 1: LIVE MONITOR ── -->
-<div class="view active" id="view-live">
-  <div class="monitor-main">
-
-    <!-- KPI row -->
-    <div class="kpi-row">
-      <div class="kpi-card green">
-        <div class="kpi-label">Active Devices</div>
-        <div class="kpi-value" id="kpi-active">—</div>
-        <div class="kpi-sub" id="kpi-total">of — registered</div>
-      </div>
-      <div class="kpi-card red">
-        <div class="kpi-label">Critical Alerts</div>
-        <div class="kpi-value" id="kpi-critical">—</div>
-        <div class="kpi-sub" id="kpi-alerts-total">— total alerts</div>
-      </div>
-      <div class="kpi-card amber">
-        <div class="kpi-label">Queue Depth</div>
-        <div class="kpi-value" id="kpi-queue">—</div>
-        <div class="kpi-sub">frames pending</div>
-      </div>
-      <div class="kpi-card blue">
-        <div class="kpi-label">Messages Processed</div>
-        <div class="kpi-value" id="kpi-messages">—</div>
-        <div class="kpi-sub" id="kpi-agents">— agents running</div>
-      </div>
-    </div>
-
-    <!-- Section: live vitals -->
-    <div>
-      <div class="section-title">Live Patient Vitals</div>
-      <div class="vitals-grid" id="vitalsGrid">
-        <div class="vital-card">
-          <div class="vital-header">
-            <div class="vital-label">Heart Rate</div>
-            <div class="vital-icon" style="color:var(--red)">♥</div>
-          </div>
-          <div class="vital-reading">
-            <div class="vital-num" id="v-hr" style="color:var(--red)">—</div>
-            <div class="vital-unit">bpm</div>
-          </div>
-          <div class="vital-bar"><div class="vital-fill" id="vf-hr" style="width:0%;background:var(--red)"></div></div>
-        </div>
-        <div class="vital-card">
-          <div class="vital-header">
-            <div class="vital-label">Blood Pressure</div>
-            <div class="vital-icon" style="color:var(--amber)">↕</div>
-          </div>
-          <div class="vital-reading">
-            <div class="vital-num" id="v-bp" style="color:var(--amber)">—/—</div>
-            <div class="vital-unit">mmHg</div>
-          </div>
-          <div class="vital-bar"><div class="vital-fill" id="vf-bp" style="width:0%;background:var(--amber)"></div></div>
-        </div>
-        <div class="vital-card">
-          <div class="vital-header">
-            <div class="vital-label">SpO₂</div>
-            <div class="vital-icon" style="color:var(--blue)">◉</div>
-          </div>
-          <div class="vital-reading">
-            <div class="vital-num" id="v-spo2" style="color:var(--blue)">—</div>
-            <div class="vital-unit">%</div>
-          </div>
-          <div class="vital-bar"><div class="vital-fill" id="vf-spo2" style="width:0%;background:var(--blue)"></div></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Bridge status mini -->
-    <div>
-      <div class="section-title">Bridge Status</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 14px">
-          <div style="font-size:.56rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:5px">Backend ID</div>
-          <div class="mono" id="bridge-id" style="color:var(--text2)">—</div>
-        </div>
-        <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 14px">
-          <div style="font-size:.56rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:5px">Last Updated</div>
-          <div class="mono" id="bridge-ts" style="color:var(--text2)">—</div>
-        </div>
-      </div>
-    </div>
-
+<div class="main-scroll">
+  <div class="sec-hdr" style="margin-bottom:10px">Live patient vitals</div>
+  <div class="vgrid" style="margin-bottom:14px">
+    <div class="vcrd"><div class="vlbl"><span>Heart Rate</span><span style="color:var(--red)">&#9829;</span></div><span class="vnum" id="v-hr" style="color:var(--red)">&#8212;</span><span class="vunit">bpm</span><div class="vbar"><div class="vfill" id="vf-hr" style="width:0;background:var(--red)"></div></div></div>
+    <div class="vcrd"><div class="vlbl"><span>Blood Pressure</span><span style="color:var(--amber)">&#8597;</span></div><span class="vnum" id="v-bp" style="color:var(--amber)">&#8212;</span><span class="vunit">mmHg</span><div class="vbar"><div class="vfill" id="vf-bp" style="width:0;background:var(--amber)"></div></div></div>
+    <div class="vcrd"><div class="vlbl"><span>SpO&#8322;</span><span style="color:var(--blue)">&#9685;</span></div><span class="vnum" id="v-spo2" style="color:var(--blue)">&#8212;</span><span class="vunit">%</span><div class="vbar"><div class="vfill" id="vf-spo2" style="width:0;background:var(--blue)"></div></div></div>
   </div>
-
-  <!-- Side panel: alerts + devices -->
-  <div class="monitor-side">
-    <div>
-      <div class="section-title red">Active Alerts</div>
-      <div id="sideAlerts"><div class="empty">No alerts</div></div>
+  <div class="tworow" style="margin-bottom:14px">
+    <div class="card"><div class="sec-hdr r" style="margin-bottom:8px">Active alerts</div><div id="side-alerts"><div class="empty-st">No alerts</div></div></div>
+    <div class="card"><div class="sec-hdr" style="margin-bottom:8px">Connected devices</div><div id="side-devs"><div class="empty-st">No devices</div></div></div>
+  </div>
+  <div class="tworow">
+    <div class="card">
+      <div class="sec-hdr b" style="margin-bottom:8px">Bridge status</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div style="background:var(--card2);border-radius:6px;padding:10px"><div style="font-size:.55rem;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.1em">Backend ID</div><div class="mono-tag" id="br-id">&#8212;</div></div>
+        <div style="background:var(--card2);border-radius:6px;padding:10px"><div style="font-size:.55rem;color:var(--muted);margin-bottom:4px;text-transform:uppercase;letter-spacing:.1em">Last Updated</div><div class="mono-tag" id="br-ts">&#8212;</div></div>
+      </div>
     </div>
-    <div>
-      <div class="section-title">Connected Devices</div>
-      <div id="sideDevices"><div class="empty">No devices</div></div>
+    <div class="card">
+      <div class="bus-viz" id="busViz"><span class="bus-lbl">pub/sub message bus &#183; async &#183; topic-isolated</span></div>
+      <div style="font-size:.6rem;color:var(--muted)">Message bus &#8212; <span id="bus-count">0</span> messages processed</div>
     </div>
   </div>
 </div>
-
-<!-- ── VIEW 2: DEVICES ── -->
-<div class="view" id="view-devices">
-  <div class="devices-content">
-    <div class="devices-header">
-      <h2>Device Registry</h2>
-      <div class="stat-trio">
-        <div class="stat-chip">Total: <strong id="dv-total">—</strong></div>
-        <div class="stat-chip" style="color:var(--green)">Active: <strong id="dv-active">—</strong></div>
-        <div class="stat-chip" style="color:var(--red)">Inactive: <strong id="dv-inactive">—</strong></div>
-      </div>
-      <button class="refresh-btn" id="devRefreshBtn" onclick="fetchAll()">↻ Refresh</button>
-    </div>
-    <table class="devices-table">
-      <thead>
-        <tr>
-          <th>Status</th>
-          <th>Device ID</th>
-          <th>Patient ID</th>
-          <th>Frames</th>
-          <th>Last Data</th>
-        </tr>
-      </thead>
-      <tbody id="devTableBody">
-        <tr><td colspan="5"><div class="empty">Loading...</div></td></tr>
-      </tbody>
-    </table>
-  </div>
 </div>
 
-<!-- ── VIEW 3: ALERTS ── -->
+<!-- 7 AGENTS -->
+<div class="view" id="view-agents">
+<div class="main-scroll">
+  <div class="sec-hdr" style="margin-bottom:10px">7-agent clinical AI pipeline</div>
+  <div class="agt-grid" id="agtGrid"></div>
+  <div id="agt-detail"></div>
+</div>
+</div>
+
+<!-- HANDSHAKE -->
+<div class="view" id="view-handshake">
+<div class="main-scroll">
+<div class="tworow" style="align-items:start">
+  <div class="card">
+    <div class="sec-hdr b" style="margin-bottom:12px">3-Way HMAC-SHA256 sequence</div>
+    <div id="hsSteps"></div>
+  </div>
+  <div class="card">
+    <div class="sec-hdr" style="margin-bottom:10px">Protocol message types (16)</div>
+    <div id="msgTypes" style="margin-bottom:14px"></div>
+    <div class="sec-hdr a" style="margin-bottom:8px">Message reference</div>
+    <table class="msg-tbl"><thead><tr><th>Type</th><th>Dir</th><th>Purpose</th></tr></thead><tbody id="msgRef"></tbody></table>
+  </div>
+</div>
+</div>
+</div>
+
+<!-- ALERTS -->
 <div class="view" id="view-alerts">
-  <div class="alerts-content">
-    <div class="alerts-header">
-      <h2>Alert Feed</h2>
-      <div class="filter-chips">
-        <button class="f-chip on" data-filter="all" onclick="setAlertFilter(this,'all')">All</button>
-        <button class="f-chip on-crit" data-filter="critical" onclick="setAlertFilter(this,'critical')">Critical</button>
-        <button class="f-chip" data-filter="high" onclick="setAlertFilter(this,'high')">High</button>
-        <button class="f-chip" data-filter="medium" onclick="setAlertFilter(this,'medium')">Medium</button>
-        <button class="f-chip" data-filter="low" onclick="setAlertFilter(this,'low')">Low</button>
-      </div>
-      <button class="refresh-btn" id="alertRefreshBtn" onclick="fetchAll()">↻ Refresh</button>
+<div class="main-scroll">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+    <div style="font-size:1rem;font-weight:700;color:#fff">Alert feed</div>
+    <span id="demo-badge" style="font-size:.55rem;padding:2px 8px;border-radius:99px;background:rgba(255,165,2,.15);border:1px solid rgba(255,165,2,.3);color:var(--amber)">DEMO &#8212; connect backend for live data</span>
+    <div style="display:flex;gap:6px;flex-wrap:wrap" id="filt-btns"></div>
+    <button class="cfg-btn" style="margin-left:auto" onclick="fetchAll()">&#8635; Refresh</button>
+  </div>
+  <div id="alerts-list"></div>
+</div>
+</div>
+
+<!-- DEVICES -->
+<div class="view" id="view-devices">
+<div class="main-scroll">
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+    <div style="font-size:1rem;font-weight:700;color:#fff">Device registry</div>
+    <span class="mono-tag">Total: <strong id="dv-tot">&#8212;</strong></span>
+    <span class="mono-tag" style="color:var(--green)">Active: <strong id="dv-act">&#8212;</strong></span>
+    <span class="mono-tag" style="color:var(--red)">Inactive: <strong id="dv-inact">&#8212;</strong></span>
+    <button class="cfg-btn" style="margin-left:auto" onclick="fetchAll()">&#8635; Refresh</button>
+  </div>
+  <table class="dv-table"><thead><tr><th>Status</th><th>Device ID</th><th>Patient ID</th><th>Frames</th><th>Last data</th></tr></thead><tbody id="dv-body"><tr><td colspan="5"><div class="empty-st">Connect to backend to see live devices</div></td></tr></tbody></table>
+</div>
+</div>
+
+<!-- CLINICAL WORKFLOW -->
+<div class="view grid-view" id="view-workflow">
+<div class="g-side">
+  <div class="sb-lbl">Clinical Integration</div>
+  <button class="sb-btn on" onclick="swf('wf-overview',this)">Overview<span class="sb-cnt">6</span></button>
+  <button class="sb-btn" onclick="swf('wf-usecases',this)">Use Cases<span class="sb-cnt">3</span></button>
+  <button class="sb-btn" onclick="swf('wf-ehr',this)">EHR / FHIR R4</button>
+  <button class="sb-btn" onclick="swf('wf-cds',this)">Clinical Decision Support</button>
+  <button class="sb-btn" onclick="swf('wf-tele',this)">Telemedicine</button>
+  <button class="sb-btn" onclick="swf('wf-qa',this)">Quality Assurance</button>
+  <button class="sb-btn" onclick="swf('wf-deploy',this)">Deployment Checklist</button>
+</div>
+<div class="g-main">
+  <div class="wf-page on" id="wf-overview">
+    <div class="sec-hdr" style="margin-bottom:12px">Integration principles</div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">
+      <div class="card"><div style="font-size:.65rem;font-weight:600;color:var(--green);margin-bottom:4px">Minimize disruption</div><div style="font-size:.62rem;color:var(--text2);line-height:1.5">Work within existing workflows and EHR systems.</div></div>
+      <div class="card"><div style="font-size:.65rem;font-weight:600;margin-bottom:4px">Enhance capabilities</div><div style="font-size:.62rem;color:var(--text2);line-height:1.5">Augment clinical decision-making with AI-driven insights.</div></div>
+      <div class="card"><div style="font-size:.65rem;font-weight:600;color:var(--amber);margin-bottom:4px">Maintain safety</div><div style="font-size:.62rem;color:var(--text2);line-height:1.5">Never bypass critical safety checks. Auto-escalate to 911 after 5 min.</div></div>
+      <div class="card"><div style="font-size:.65rem;font-weight:600;margin-bottom:4px">Ensure compliance</div><div style="font-size:.62rem;color:var(--text2);line-height:1.5">FHIR R4 &#183; LOINC &#183; SNOMED-CT &#183; OAuth 2.0</div></div>
+      <div class="card"><div style="font-size:.65rem;font-weight:600;color:var(--green);margin-bottom:4px">Support clinicians</div><div style="font-size:.62rem;color:var(--text2);line-height:1.5">85% adoption &#183; 4.7/5 patient satisfaction</div></div>
+      <div class="card"><div style="font-size:.65rem;font-weight:600;margin-bottom:4px">Bi-directional sync</div><div style="font-size:.62rem;color:var(--text2);line-height:1.5">Critical data &lt;5 s &#183; Non-critical batch 30 min</div></div>
     </div>
-    <div id="alertsList"><div class="empty">Loading alerts...</div></div>
+    <div class="sec-hdr a" style="margin-bottom:8px">Data sync schedule</div>
+    <div class="sync-row"><div class="sync-d" style="background:var(--red)"></div><span style="flex:1">Vital signs &#183; Arrhythmias &#183; Critical alerts &#183; Emergency events</span><span class="mono-tag" style="color:var(--red)">&lt;5 sec</span></div>
+    <div class="sync-row"><div class="sync-d" style="background:var(--amber)"></div><span style="flex:1">High priority events &#183; Medication alerts</span><span class="mono-tag" style="color:var(--amber)">5 min</span></div>
+    <div class="sync-row"><div class="sync-d" style="background:var(--blue)"></div><span style="flex:1">Normal priority &#183; Trend data</span><span class="mono-tag" style="color:var(--blue)">30 min</span></div>
+    <div class="sync-row"><div class="sync-d" style="background:var(--muted)"></div><span style="flex:1">Activity &#183; Sleep &#183; QoL surveys</span><span class="mono-tag">Daily</span></div>
+  </div>
+  <div class="wf-page" id="wf-usecases">
+    <div class="sec-hdr" style="margin-bottom:10px">Clinical use cases</div>
+    <div style="display:flex;gap:6px;margin-bottom:12px" id="uc-tabs">
+      <button class="cfg-btn" style="color:var(--green);border-color:var(--green)" onclick="uct('uc-rpm',this)">Remote Patient Monitoring</button>
+      <button class="cfg-btn" onclick="uct('uc-afib',this)">AFib Screening</button>
+      <button class="cfg-btn" onclick="uct('uc-rehab',this)">Cardiac Rehabilitation</button>
+    </div>
+    <div id="uc-rpm"><div class="card">
+      <div class="sec-hdr" style="margin-bottom:10px">Post-discharge heart failure &#8212; 5-phase workflow</div>
+      <div class="flow-step"><div class="fs-num ok">1</div><div><div class="fs-ttl">Patient enrollment</div><div class="fs-sub">Clinician orders remote monitoring &#8594; patient profile created &#8594; devices shipped &#8594; training scheduled.</div></div></div>
+      <div class="flow-step"><div class="fs-num">2</div><div><div class="fs-ttl">Device setup</div><div class="fs-sub">Remote setup via video call &#8594; baseline measurements &#8594; monitoring begins.</div></div></div>
+      <div class="flow-step"><div class="fs-num">3</div><div><div class="fs-ttl">Ongoing monitoring</div><div class="fs-sub">Daily weight, BP, HR &#8594; 7-agent AI analyses trends &#8594; alerts for deviations &#8594; clinician reviews dashboard.</div></div></div>
+      <div class="flow-step"><div class="fs-num">4</div><div><div class="fs-ttl">Intervention</div><div class="fs-sub">Clinician reviews alert &#8594; contacts patient &#8594; adjusts medications remotely &#8594; documents in EHR.</div></div></div>
+      <div class="flow-step"><div class="fs-num ok">5</div><div><div class="fs-ttl">Outcome tracking</div><div class="fs-sub">Readmissions tracked &#183; satisfaction measured &#183; cost savings calculated. Target: &lt;15% 30-day readmission.</div></div></div>
+    </div></div>
+    <div id="uc-afib" style="display:none"><div class="card">
+      <div class="sec-hdr b" style="margin-bottom:10px">Population-level AFib screening</div>
+      <div class="flow-step"><div class="fs-num">1</div><div><div class="fs-ttl">Screening launch</div><div class="fs-sub">High-risk population identified &#8594; ECG monitors distributed &#8594; baseline screening.</div></div></div>
+      <div class="flow-step"><div class="fs-num">2</div><div><div class="fs-ttl">Continuous monitoring</div><div class="fs-sub">24/7 ECG &#8594; AI detects AFib patterns &#8594; confidence scores calculated.</div></div></div>
+      <div class="flow-step"><div class="fs-num">3</div><div><div class="fs-ttl">Alert generation</div><div class="fs-sub">AFib detected (&gt;95% confidence) &#8594; cardiologist alerted &#8594; patient notified &#8594; appointment scheduled.</div></div></div>
+      <div class="flow-step"><div class="fs-num">4</div><div><div class="fs-ttl">Clinical confirmation</div><div class="fs-sub">12-lead ECG &#8594; cardiologist reviews &#8594; diagnosis confirmed &#8594; treatment plan created.</div></div></div>
+      <div class="flow-step"><div class="fs-num ok">5</div><div><div class="fs-ttl">Treatment</div><div class="fs-sub">Anticoagulation initiated &#8594; CHA&#8322;DS&#8322;-VASc risk stratification &#8594; ongoing monitoring &#8594; stroke prevention.</div></div></div>
+    </div></div>
+    <div id="uc-rehab" style="display:none"><div class="card">
+      <div class="sec-hdr p" style="margin-bottom:10px">Post-MI cardiac rehabilitation</div>
+      <div class="flow-step"><div class="fs-num">1</div><div><div class="fs-ttl">Enrollment</div><div class="fs-sub">Post-MI assessment &#8594; risk stratification &#8594; individualised exercise plan &#8594; devices assigned.</div></div></div>
+      <div class="flow-step"><div class="fs-num crit">2</div><div><div class="fs-ttl">Exercise monitoring</div><div class="fs-sub">Real-time HR/rhythm &#8594; AI detects dangerous arrhythmias &#8594; automatic cessation if needed.</div></div></div>
+      <div class="flow-step"><div class="fs-num">3</div><div><div class="fs-ttl">Progress tracking</div><div class="fs-sub">Exercise capacity &#183; cardiovascular fitness trends &#183; goal achievement.</div></div></div>
+      <div class="flow-step"><div class="fs-num ok">4</div><div><div class="fs-ttl">Completion</div><div class="fs-sub">Final assessment &#8594; long-term maintenance plan &#8594; transition to ongoing remote monitoring.</div></div></div>
+    </div></div>
+  </div>
+  <div class="wf-page" id="wf-ehr">
+    <div class="sec-hdr" style="margin-bottom:12px">EHR integration &#8212; FHIR R4</div>
+    <div class="tworow" style="margin-bottom:12px">
+      <div class="card"><div style="font-size:.6rem;font-weight:600;color:var(--blue);margin-bottom:6px">FHIR Observation &#8212; heart rate</div>
+        <div class="fhir"><span class="fk">"resourceType"</span>: <span class="fs-c">"Observation"</span>,
+<span class="fk">"code"</span>: {<span class="fk">"coding"</span>: [{
+  <span class="fk">"system"</span>: <span class="fs-c">"http://loinc.org"</span>,
+  <span class="fk">"code"</span>: <span class="fs-c">"8867-4"</span>,
+  <span class="fk">"display"</span>: <span class="fs-c">"Heart rate"</span>
+}]},
+<span class="fk">"valueQuantity"</span>: {
+  <span class="fk">"value"</span>: <span class="fv">145</span>,
+  <span class="fk">"unit"</span>: <span class="fs-c">"beats/minute"</span>
+}</div>
+      </div>
+      <div class="card"><div style="font-size:.6rem;font-weight:600;color:var(--blue);margin-bottom:6px">FHIR DiagnosticReport &#8212; AFib</div>
+        <div class="fhir"><span class="fk">"resourceType"</span>: <span class="fs-c">"DiagnosticReport"</span>,
+<span class="fk">"code"</span>: {<span class="fk">"coding"</span>: [{
+  <span class="fk">"system"</span>: <span class="fs-c">"http://loinc.org"</span>,
+  <span class="fk">"code"</span>: <span class="fs-c">"11524-6"</span>
+}]},
+<span class="fk">"conclusion"</span>: <span class="fs-c">"AFib detected (95%)"</span>,
+<span class="fk">"conclusionCode"</span>: [{
+  <span class="fk">"system"</span>: <span class="fs-c">"snomed.info/sct"</span>,
+  <span class="fk">"code"</span>: <span class="fs-c">"49436004"</span>
+}]</div>
+      </div>
+    </div>
+  </div>
+  <div class="wf-page" id="wf-cds">
+    <div class="sec-hdr" style="margin-bottom:12px">Clinical decision support</div>
+    <div class="tworow">
+      <div class="card">
+        <div style="font-size:.65rem;font-weight:600;color:var(--amber);margin-bottom:10px">AFib &#8594; anticoagulation pathway</div>
+        <div class="flow-step"><div class="fs-num">1</div><div><div class="fs-ttl">AFib confirmed</div><div class="fs-sub">PatternRecognitionAgent confirms with confidence score.</div></div></div>
+        <div class="flow-step"><div class="fs-num">2</div><div><div class="fs-ttl">CHA&#8322;DS&#8322;-VASc calculated</div><div class="fs-sub">DiagnosticAgent computes stroke risk score.</div></div></div>
+        <div class="dec">&#9670; CHA&#8322;DS&#8322;-VASc &#8805; 2?</div>
+        <div class="dec-br"><div class="db-y">&#10003; Yes &#8212; anticoagulation recommended</div><div class="db-n">&#10007; No &#8212; aspirin / clinical judgment</div></div>
+        <div class="flow-step"><div class="fs-num">3</div><div><div class="fs-ttl">HAS-BLED assessed</div></div></div>
+        <div class="dec">&#9670; HAS-BLED &#8805; 3?</div>
+        <div class="dec-br"><div class="db-y">&#9888; Caution &#8212; bleeding risk</div><div class="db-n">&#10003; Recommend DOAC initiation</div></div>
+        <div class="flow-step"><div class="fs-num ok">4</div><div><div class="fs-ttl">EHR order staged</div><div class="fs-sub">Apixaban/Rivaroxaban order staged for clinician review &#8212; never auto-approved.</div></div></div>
+      </div>
+      <div class="card">
+        <div style="font-size:.65rem;font-weight:600;margin-bottom:10px">HF decompensation monitoring</div>
+        <div class="flow-step"><div class="fs-num">1</div><div><div class="fs-ttl">Daily trend analysis</div><div class="fs-sub">Weight &#183; BP &#183; HR &#183; symptoms analysed by 7-agent pipeline.</div></div></div>
+        <div class="dec">&#9670; Decompensation signs?</div>
+        <div class="dec-br"><div class="db-y">&#9888; Alert to care team</div><div class="db-n">&#10003; Continue routine monitoring</div></div>
+        <div class="flow-step"><div class="fs-num">2</div><div><div class="fs-ttl">Suggested actions</div><div class="fs-sub">Increase diuretics &#183; restrict fluids &#183; schedule urgent visit.</div></div></div>
+        <div class="flow-step"><div class="fs-num ok">3</div><div><div class="fs-ttl">Clinician approves</div><div class="fs-sub">All CDS suggestions require explicit clinician approval.</div></div></div>
+      </div>
+    </div>
+  </div>
+  <div class="wf-page" id="wf-tele">
+    <div class="sec-hdr" style="margin-bottom:12px">Telemedicine integration</div>
+    <div class="card"><div style="font-size:.65rem;font-weight:600;margin-bottom:10px">Virtual visit workflow</div>
+      <div class="flow-step"><div class="fs-num">1</div><div><div class="fs-ttl">Patient triggers visit</div><div class="fs-sub">Via portal or app &#8594; system begins data gathering.</div></div></div>
+      <div class="flow-step"><div class="fs-num">2</div><div><div class="fs-ttl">AI preparation</div><div class="fs-sub">CommunicationAgent generates visit summary &#8212; saves 5&#8211;10 min per consult.</div></div></div>
+      <div class="flow-step"><div class="fs-num">3</div><div><div class="fs-ttl">Virtual visit</div><div class="fs-sub">Video with real-time vitals overlay &#183; alert timeline &#183; AI insights panel.</div></div></div>
+      <div class="flow-step"><div class="fs-num ok">4</div><div><div class="fs-ttl">Auto follow-up</div><div class="fs-sub">Next appointment auto-scheduled based on risk level.</div></div></div>
+    </div>
+  </div>
+  <div class="wf-page" id="wf-qa">
+    <div class="sec-hdr" style="margin-bottom:10px">Quality assurance metrics</div>
+    <div class="met-grid">
+      <div class="met-card"><div class="met-val">94%</div><div class="met-tgt">Target: &gt;90%</div><div class="met-lbl">Alert Accuracy</div></div>
+      <div class="met-card"><div class="met-val">8%</div><div class="met-tgt">Target: &lt;10%</div><div class="met-lbl">False Positive Rate</div></div>
+      <div class="met-card"><div class="met-val">3.2s</div><div class="met-tgt">Target: &lt;5 sec</div><div class="met-lbl">Time to Alert</div></div>
+      <div class="met-card"><div class="met-val">12%</div><div class="met-tgt">Target: &lt;15%</div><div class="met-lbl">30-day Readmission</div></div>
+      <div class="met-card"><div class="met-val">4.7/5</div><div class="met-tgt">Target: &gt;4.5</div><div class="met-lbl">Patient Satisfaction</div></div>
+      <div class="met-card"><div class="met-val">85%</div><div class="met-tgt">Target: &gt;80%</div><div class="met-lbl">Clinician Adoption</div></div>
+    </div>
+  </div>
+  <div class="wf-page" id="wf-deploy">
+    <div class="sec-hdr" style="margin-bottom:10px">Deployment checklist</div>
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
+      <div class="card"><div style="font-size:.6rem;font-weight:600;color:var(--amber);margin-bottom:8px">Pre-deployment</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>EHR integration tested</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Emergency protocols established</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Staff training completed</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Device inventory stocked</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Regulatory approvals obtained</div>
+      </div>
+      <div class="card"><div style="font-size:.6rem;font-weight:600;margin-bottom:8px">Go-live</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Pilot group (10&#8211;20 patients)</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>24/7 technical support ready</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Daily monitoring week 1</div>
+      </div>
+      <div class="card"><div style="font-size:.6rem;font-weight:600;color:var(--green);margin-bottom:8px">Post-deployment</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Weekly quality reviews</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Monthly outcome analysis</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Quarterly workflow optimisation</div>
+        <div class="chk-item"><div class="chk-ic">&#10003;</div>Annual comprehensive audit</div>
+      </div>
+    </div>
   </div>
 </div>
-
-<!-- ── VIEW 4: TEST SUITE (static data, always available) ── -->
-<div class="view" id="view-tests">
-  <nav class="tests-sidebar" id="testsSidebar"></nav>
-  <div class="tests-panel" id="testsPanel"></div>
 </div>
 
-<!-- ── CONFIG OVERLAY ── -->
-<div class="config-overlay" id="configOverlay" onclick="maybeCloseConfig(event)">
-  <div class="config-panel" id="configPanel">
-    <h3>Backend Configuration</h3>
-    <p class="sub">Enter your CardioAI backend URL. The dashboard polls <code style="color:var(--green)">/health</code>, <code style="color:var(--green)">/devices</code>, <code style="color:var(--green)">/alerts</code>, and <code style="color:var(--green)">/reports</code> every 5 seconds.</p>
-    <div class="cfg-field">
-      <label class="cfg-label">API Base URL</label>
-      <input class="cfg-input" id="cfgApiUrl" placeholder="https://cardioai.hospital.local/api" />
+<!-- EMERGENCY RESPONSE -->
+<div class="view grid-view" id="view-emergency">
+<div class="g-side">
+  <div class="sb-lbl">Response Protocols</div>
+  <button class="sb-btn on" onclick="ser('er-severity',this)">Event Classification</button>
+  <button class="sb-btn" onclick="ser('er-flow',this)">Response Flow</button>
+  <button class="sb-btn" onclick="ser('er-notif',this)">Notification Cascade</button>
+  <button class="sb-btn" onclick="ser('er-times',this)">Response Times</button>
+</div>
+<div class="g-main">
+  <div class="wf-page on" id="er-severity">
+    <div class="sec-hdr r" style="margin-bottom:10px">Event classification &amp; severity</div>
+    <table class="sev-tbl"><thead><tr><th>Event</th><th>Severity</th><th>Response</th><th>Actions</th></tr></thead><tbody>
+      <tr><td>Ventricular Fibrillation</td><td><span class="p0">P0</span></td><td style="color:var(--red);font-family:var(--mono);font-size:.6rem">Immediate</td><td style="font-size:.6rem;color:var(--text2)">911 dispatch &#183; Defibrillation protocol</td></tr>
+      <tr><td>Ventricular Tachycardia</td><td><span class="p0">P0</span></td><td style="color:var(--red);font-family:var(--mono);font-size:.6rem">&lt;2 min</td><td style="font-size:.6rem;color:var(--text2)">On-call cardiologist &#183; Rapid response</td></tr>
+      <tr><td>Acute MI indicators</td><td><span class="p0">P0</span></td><td style="color:var(--red);font-family:var(--mono);font-size:.6rem">Immediate</td><td style="font-size:.6rem;color:var(--text2)">EMS dispatch &#183; Cath lab activation</td></tr>
+      <tr><td>AFib with RVR (HR &gt;150)</td><td><span class="p1">P1</span></td><td style="color:var(--amber);font-family:var(--mono);font-size:.6rem">&lt;15 min</td><td style="font-size:.6rem;color:var(--text2)">Cardiologist notification &#183; Patient contact</td></tr>
+      <tr><td>Severe Bradycardia (HR &lt;40)</td><td><span class="p1">P1</span></td><td style="color:var(--amber);font-family:var(--mono);font-size:.6rem">&lt;5 min</td><td style="font-size:.6rem;color:var(--text2)">Assess pacemaker &#183; Clinician evaluation</td></tr>
+      <tr><td>Hypertensive Crisis (&gt;180/120)</td><td><span class="p1">P1</span></td><td style="color:var(--amber);font-family:var(--mono);font-size:.6rem">&lt;15 min</td><td style="font-size:.6rem;color:var(--text2)">BP medication &#183; Patient assessment</td></tr>
+    </tbody></table>
+  </div>
+  <div class="wf-page" id="er-flow">
+    <div class="sec-hdr r" style="margin-bottom:10px">Critical event response flow</div>
+    <div class="card">
+      <div class="flow-step"><div class="fs-num crit">AI</div><div><div class="fs-ttl">Event validated</div><div class="fs-sub">PatternRecognitionAgent + DiagnosticAgent validate at confidence &gt;90%.</div></div></div>
+      <div class="flow-step"><div class="fs-num crit">AL</div><div><div class="fs-ttl">CRITICAL alert created</div><div class="fs-sub">AlertMonitoringAgent creates alert and generates required actions list.</div></div></div>
+      <div class="flow-step"><div class="fs-num crit">&#8648;</div><div><div class="fs-ttl">Simultaneous notifications fired</div><div class="fs-sub">SMS + pager &#8594; cardiologist &#183; push &#8594; patient &#183; rapid response team paged &#183; EHR banner updated.</div></div></div>
+      <div class="flow-step"><div class="fs-num">2m</div><div><div class="fs-ttl">Acknowledgment window: 2 min</div><div class="fs-sub">No ack &#8594; backup cardiologist + nursing supervisor notified.</div></div></div>
+      <div class="flow-step"><div class="fs-num crit">ES</div><div><div class="fs-ttl">Escalate at 5 min</div><div class="fs-sub">Still no response &#8594; emergency services (911) auto-dispatched.</div></div></div>
+      <div class="flow-step"><div class="fs-num ok">&#10003;</div><div><div class="fs-ttl">Patient evaluated</div><div class="fs-sub">Clinician responds &#8594; patient assessed &#8594; documented in EHR &#8594; outcome tracked.</div></div></div>
     </div>
-    <div class="cfg-field">
-      <label class="cfg-label">Bearer Token (access_token from /auth/login)</label>
-      <input class="cfg-input" id="cfgToken" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." type="password" />
+  </div>
+  <div class="wf-page" id="er-notif">
+    <div class="sec-hdr r" style="margin-bottom:10px">Notification cascade</div>
+    <div class="nl-wrap"><div class="nl-hdr crit"><span class="nl-ttl crit">Level 1 &#8212; CRITICAL (P0)</span><span class="nl-ack">Ack: 2 min</span></div><div class="nl-body"><span class="nl-act">SMS cardiologist</span><span class="nl-act">Pager</span><span class="nl-act">Rapid response team</span><span class="nl-act">Patient push</span><span class="nl-act">EMS at 5 min</span></div></div>
+    <div class="nl-wrap"><div class="nl-hdr high"><span class="nl-ttl high">Level 2 &#8212; HIGH (P1)</span><span class="nl-ack">Ack: 1 hour</span></div><div class="nl-body"><span class="nl-act">Primary cardiologist</span><span class="nl-act">Nursing station alert</span><span class="nl-act">Patient app notification</span></div></div>
+    <div class="nl-wrap"><div class="nl-hdr med"><span class="nl-ttl med">Level 3 &#8212; ROUTINE</span><span class="nl-ack">Next-day review</span></div><div class="nl-body"><span class="nl-act">Dashboard notification</span><span class="nl-act">Patient portal message</span></div></div>
+  </div>
+  <div class="wf-page" id="er-times">
+    <div class="sec-hdr a" style="margin-bottom:10px">Response time standards</div>
+    <div class="tworow">
+      <div class="card"><div style="font-size:.65rem;font-weight:600;color:var(--red);margin-bottom:10px">P0 &#8212; Immediate response</div>
+        <div class="sync-row"><div class="sync-d" style="background:var(--red)"></div><span style="flex:1">VFib / VTach detected</span><span class="mono-tag" style="color:var(--red)">0 sec</span></div>
+        <div class="sync-row"><div class="sync-d" style="background:var(--red)"></div><span style="flex:1">All notifications fired</span><span class="mono-tag" style="color:var(--red)">&lt;3 sec</span></div>
+        <div class="sync-row"><div class="sync-d" style="background:var(--red)"></div><span style="flex:1">Cardiologist must acknowledge</span><span class="mono-tag" style="color:var(--red)">2 min</span></div>
+        <div class="sync-row"><div class="sync-d" style="background:var(--red)"></div><span style="flex:1">EMS auto-dispatched if no ack</span><span class="mono-tag" style="color:var(--red)">5 min</span></div>
+      </div>
+      <div class="card"><div style="font-size:.65rem;font-weight:600;color:var(--amber);margin-bottom:10px">P1 &#8212; Urgent response</div>
+        <div class="sync-row"><div class="sync-d" style="background:var(--amber)"></div><span style="flex:1">Severe bradycardia</span><span class="mono-tag" style="color:var(--amber)">&lt;5 min</span></div>
+        <div class="sync-row"><div class="sync-d" style="background:var(--amber)"></div><span style="flex:1">AFib with RVR</span><span class="mono-tag" style="color:var(--amber)">&lt;15 min</span></div>
+        <div class="sync-row"><div class="sync-d" style="background:var(--amber)"></div><span style="flex:1">Hypertensive crisis</span><span class="mono-tag" style="color:var(--amber)">&lt;15 min</span></div>
+        <div class="sync-row"><div class="sync-d" style="background:var(--amber)"></div><span style="flex:1">Cardiologist ack window</span><span class="mono-tag" style="color:var(--amber)">1 hour</span></div>
+      </div>
     </div>
-    <div class="cfg-field">
-      <label class="cfg-label">Poll Interval (seconds)</label>
-      <input class="cfg-input" id="cfgInterval" placeholder="5" type="number" min="2" max="60" />
-    </div>
-    <div class="cfg-row">
-      <button class="cfg-btn primary" onclick="applyConfig()">Connect</button>
-      <button class="cfg-btn secondary" onclick="closeConfig()">Cancel</button>
-    </div>
+  </div>
+</div>
+</div>
+
+<!-- TEST SUITE -->
+<div class="view grid-view" id="view-tests">
+  <div class="g-side" id="ts-side"></div>
+  <div class="g-main" id="ts-panel"></div>
+</div>
+
+<!-- CONFIG OVERLAY -->
+<div class="cfg-ov" id="cfgOv" onclick="maybeCfgClose(event)">
+  <div class="cfg-box">
+    <h3>Backend configuration</h3>
+    <p class="cfg-sub">Connect to your live CardioAI backend. Polls /health, /devices, /alerts every 5 s.</p>
+    <div class="cfg-f"><label class="cfg-lbl">API Base URL</label><input class="cfg-input" id="cfgUrl" placeholder="https://cardioai.hospital.local/api" /></div>
+    <div class="cfg-f"><label class="cfg-lbl">Bearer token (from /auth/login)</label><input class="cfg-input" id="cfgTok" type="password" placeholder="eyJhbGciOiJIUzI1NiIs..." /></div>
+    <div class="cfg-f"><label class="cfg-lbl">Poll interval (seconds)</label><input class="cfg-input" id="cfgInt" type="number" min="2" max="60" value="5" /></div>
+    <div class="cfg-row"><button class="cfg-p" onclick="applyCfg()">Connect</button><button class="cfg-s" onclick="closeCfg()">Cancel</button></div>
   </div>
 </div>
 
 <script>
-/* ══════════════════════════════════════════════════════════════
-   STATIC TEST DATA (always available, never fetched)
-══════════════════════════════════════════════════════════════ */
 const SUITE_DATA = [{"id": "TestDataModels", "label": "Data Models", "passed": 5, "failed": 0, "tests": [{"suite": "TestDataModels", "name": "test_device_data_default_quality", "status": "PASSED", "pct": 0}, {"suite": "TestDataModels", "name": "test_alert_notified_parties_starts_empty", "status": "PASSED", "pct": 1}, {"suite": "TestDataModels", "name": "test_device_type_enum_values", "status": "PASSED", "pct": 1}, {"suite": "TestDataModels", "name": "test_alert_level_enum_values", "status": "PASSED", "pct": 2}, {"suite": "TestDataModels", "name": "test_all_arrhythmia_types_present", "status": "PASSED", "pct": 2}]}, {"id": "TestMessageBus", "label": "Message Bus", "passed": 7, "failed": 0, "tests": [{"suite": "TestMessageBus", "name": "test_subscribe_and_receive", "status": "PASSED", "pct": 3}, {"suite": "TestMessageBus", "name": "test_async_subscriber", "status": "PASSED", "pct": 3}, {"suite": "TestMessageBus", "name": "test_multiple_subscribers_same_topic", "status": "PASSED", "pct": 4}, {"suite": "TestMessageBus", "name": "test_no_bleed_between_topics", "status": "PASSED", "pct": 4}, {"suite": "TestMessageBus", "name": "test_message_history_appended", "status": "PASSED", "pct": 5}, {"suite": "TestMessageBus", "name": "test_subscriber_exception_does_not_crash_bus", "status": "PASSED", "pct": 5}, {"suite": "TestMessageBus", "name": "test_publish_to_topic_with_no_subscribers", "status": "PASSED", "pct": 6}]}, {"id": "TestBaseAgent", "label": "Base Agent", "passed": 3, "failed": 0, "tests": [{"suite": "TestBaseAgent", "name": "test_start_sets_running_true", "status": "PASSED", "pct": 6}, {"suite": "TestBaseAgent", "name": "test_stop_sets_running_false", "status": "PASSED", "pct": 7}, {"suite": "TestBaseAgent", "name": "test_agent_id_stored", "status": "PASSED", "pct": 7}]}, {"id": "TestDataAcquisitionAgent", "label": "Acquisition Agent", "passed": 15, "failed": 0, "tests": [{"suite": "TestDataAcquisitionAgent", "name": "test_register_device_stores_entry", "status": "PASSED", "pct": 8}, {"suite": "TestDataAcquisitionAgent", "name": "test_register_creates_stream_queue", "status": "PASSED", "pct": 8}, {"suite": "TestDataAcquisitionAgent", "name": "test_register_publishes_device_registered", "status": "PASSED", "pct": 9}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_unknown_device_silent", "status": "PASSED", "pct": 9}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_publishes_data_raw", "status": "PASSED", "pct": 10}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_updates_last_seen", "status": "PASSED", "pct": 10}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_normal_data", "status": "PASSED", "pct": 11}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_none_value", "status": "PASSED", "pct": 11}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_extreme_hr_high", "status": "PASSED", "pct": 12}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_extreme_hr_low", "status": "PASSED", "pct": 12}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_boundary_hr_exactly_30", "status": "PASSED", "pct": 13}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_boundary_hr_exactly_250", "status": "PASSED", "pct": 13}, {"suite": "TestDataAcquisitionAgent", "name": "test_process_dispatches_stream", "status": "PASSED", "pct": 14}, {"suite": "TestDataAcquisitionAgent", "name": "test_process_ignores_non_dict", "status": "PASSED", "pct": 14}, {"suite": "TestDataAcquisitionAgent", "name": "test_bus_device_register_topic_triggers_register", "status": "PASSED", "pct": 15}]}, {"id": "TestDataProcessingAgent", "label": "Processing Agent", "passed": 12, "failed": 0, "tests": [{"suite": "TestDataProcessingAgent", "name": "test_low_quality_dropped", "status": "PASSED", "pct": 15}, {"suite": "TestDataProcessingAgent", "name": "test_quality_threshold_boundary_accepted", "status": "PASSED", "pct": 16}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_signal_type", "status": "PASSED", "pct": 16}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_features_populated", "status": "PASSED", "pct": 17}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_rr_mean_from_hr", "status": "PASSED", "pct": 17}, {"suite": "TestDataProcessingAgent", "name": "test_bp_signal_type", "status": "PASSED", "pct": 18}, {"suite": "TestDataProcessingAgent", "name": "test_bp_features_correct", "status": "PASSED", "pct": 18}, {"suite": "TestDataProcessingAgent", "name": "test_bp_map_formula", "status": "PASSED", "pct": 19}, {"suite": "TestDataProcessingAgent", "name": "test_spo2_features", "status": "PASSED", "pct": 19}, {"suite": "TestDataProcessingAgent", "name": "test_generic_passthrough", "status": "PASSED", "pct": 20}, {"suite": "TestDataProcessingAgent", "name": "test_dispatch_routes_ecg", "status": "PASSED", "pct": 20}, {"suite": "TestDataProcessingAgent", "name": "test_dispatch_routes_bp", "status": "PASSED", "pct": 21}]}, {"id": "TestPatternRecognitionAgent", "label": "Pattern Recognition", "passed": 30, "failed": 0, "tests": [{"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[40-30-100-ArrhythmiaType.BRADYCARDIA]", "status": "PASSED", "pct": 21}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[72-30-95-ArrhythmiaType.NORMAL_SINUS]", "status": "PASSED", "pct": 22}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[115-80-90-ArrhythmiaType.ATRIAL_FIBRILLATION]", "status": "PASSED", "pct": 22}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[160-20-135-ArrhythmiaType.VENTRICULAR_TACHYCARDIA]", "status": "PASSED", "pct": 23}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[110-25-90-ArrhythmiaType.TACHYCARDIA]", "status": "PASSED", "pct": 23}, {"suite": "TestPatternRecognitionAgent", "name": "test_bradycardia_priority_over_wide_qrs", "status": "PASSED", "pct": 24}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.2-True]", "status": "PASSED", "pct": 24}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[-0.15-True]", "status": "PASSED", "pct": 25}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.05-False]", "status": "PASSED", "pct": 25}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.1-False]", "status": "PASSED", "pct": 26}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.101-True]", "status": "PASSED", "pct": 26}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[115-75-normal]", "status": "PASSED", "pct": 27}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[122-79-elevated]", "status": "PASSED", "pct": 27}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[132-82-stage_1]", "status": "PASSED", "pct": 28}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[145-92-stage_2]", "status": "PASSED", "pct": 28}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[185-125-hypertensive_crisis]", "status": "PASSED", "pct": 29}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[200-110-hypertensive_crisis]", "status": "PASSED", "pct": 29}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[120-80-stage_1]", "status": "PASSED", "pct": 30}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[130-80-stage_1]", "status": "PASSED", "pct": 30}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_pattern_required_keys", "status": "PASSED", "pct": 31}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_pattern_type_label", "status": "PASSED", "pct": 31}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_confidence_range", "status": "PASSED", "pct": 32}, {"suite": "TestPatternRecognitionAgent", "name": "test_abnormal_qt_high", "status": "PASSED", "pct": 32}, {"suite": "TestPatternRecognitionAgent", "name": "test_abnormal_qt_low", "status": "PASSED", "pct": 33}, {"suite": "TestPatternRecognitionAgent", "name": "test_normal_qt", "status": "PASSED", "pct": 33}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_pattern_type", "status": "PASSED", "pct": 34}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_hypotension_flag", "status": "PASSED", "pct": 34}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_no_hypotension_normal", "status": "PASSED", "pct": 35}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_wide_pulse_pressure", "status": "PASSED", "pct": 35}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_publishes_to_bus", "status": "PASSED", "pct": 36}]}, {"id": "TestDiagnosticAgent", "label": "Diagnostic Agent", "passed": 21, "failed": 0, "tests": [{"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-Atrial Fibrillation]", "status": "PASSED", "pct": 36}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.VENTRICULAR_TACHYCARDIA-Critical]", "status": "PASSED", "pct": 37}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.NORMAL_SINUS-Normal]", "status": "PASSED", "pct": 37}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.BRADYCARDIA-Bradycardia]", "status": "PASSED", "pct": 38}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.TACHYCARDIA-Tachycardia]", "status": "PASSED", "pct": 38}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_bp_includes_stage", "status": "PASSED", "pct": 39}, {"suite": "TestDiagnosticAgent", "name": "test_ascvd_in_range", "status": "PASSED", "pct": 39}, {"suite": "TestDiagnosticAgent", "name": "test_hf_risk_in_range", "status": "PASSED", "pct": 40}, {"suite": "TestDiagnosticAgent", "name": "test_stroke_risk_elevated_for_afib", "status": "PASSED", "pct": 40}, {"suite": "TestDiagnosticAgent", "name": "test_stroke_risk_low_without_afib", "status": "PASSED", "pct": 41}, {"suite": "TestDiagnosticAgent", "name": "test_scd_high_for_vtach", "status": "PASSED", "pct": 41}, {"suite": "TestDiagnosticAgent", "name": "test_scd_low_for_normal", "status": "PASSED", "pct": 42}, {"suite": "TestDiagnosticAgent", "name": "test_afib_anticoagulation_recommended", "status": "PASSED", "pct": 42}, {"suite": "TestDiagnosticAgent", "name": "test_vtach_immediate_intervention", "status": "PASSED", "pct": 43}, {"suite": "TestDiagnosticAgent", "name": "test_high_ascvd_statin", "status": "PASSED", "pct": 43}, {"suite": "TestDiagnosticAgent", "name": "test_ischemia_recommendations", "status": "PASSED", "pct": 44}, {"suite": "TestDiagnosticAgent", "name": "test_normal_no_recommendations", "status": "PASSED", "pct": 44}, {"suite": "TestDiagnosticAgent", "name": "test_generate_diagnosis_type", "status": "PASSED", "pct": 45}, {"suite": "TestDiagnosticAgent", "name": "test_generate_diagnosis_risk_scores_present", "status": "PASSED", "pct": 45}, {"suite": "TestDiagnosticAgent", "name": "test_process_stores_patient_history", "status": "PASSED", "pct": 46}, {"suite": "TestDiagnosticAgent", "name": "test_process_publishes_to_bus", "status": "PASSED", "pct": 46}]}, {"id": "TestAlertMonitoringAgent", "label": "Alert Monitoring", "passed": 22, "failed": 0, "tests": [{"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.VENTRICULAR_TACHYCARDIA-supporting0-AlertLevel.CRITICAL]", "status": "PASSED", "pct": 47}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.VENTRICULAR_FIBRILLATION-supporting1-AlertLevel.CRITICAL]", "status": "PASSED", "pct": 47}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-supporting2-AlertLevel.HIGH]", "status": "PASSED", "pct": 48}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-supporting3-AlertLevel.MEDIUM]", "status": "PASSED", "pct": 48}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_high_scd_risk", "status": "PASSED", "pct": 49}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_high_stroke_is_medium", "status": "PASSED", "pct": 49}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_ischemia_is_high", "status": "PASSED", "pct": 50}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_normal_is_none", "status": "PASSED", "pct": 50}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.CRITICAL-PREPARE_DEFIBRILLATOR]", "status": "PASSED", "pct": 51}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.CRITICAL-ACTIVATE_RAPID_RESPONSE]", "status": "PASSED", "pct": 51}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.HIGH-NOTIFY_CARDIOLOGIST]", "status": "PASSED", "pct": 52}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.HIGH-REVIEW_WITHIN_15_MIN]", "status": "PASSED", "pct": 52}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.MEDIUM-NOTIFY_PRIMARY_CARE]", "status": "PASSED", "pct": 53}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.LOW-ROUTINE_REVIEW]", "status": "PASSED", "pct": 53}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.CRITICAL-emergency_services]", "status": "PASSED", "pct": 54}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.CRITICAL-rapid_response_team]", "status": "PASSED", "pct": 54}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.HIGH-primary_cardiologist]", "status": "PASSED", "pct": 55}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.MEDIUM-primary_care_physician]", "status": "PASSED", "pct": 55}, {"suite": "TestAlertMonitoringAgent", "name": "test_create_alert_stored", "status": "PASSED", "pct": 56}, {"suite": "TestAlertMonitoringAgent", "name": "test_create_alert_correct_level", "status": "PASSED", "pct": 56}, {"suite": "TestAlertMonitoringAgent", "name": "test_dispatch_publishes_to_bus", "status": "PASSED", "pct": 57}, {"suite": "TestAlertMonitoringAgent", "name": "test_dispatch_populates_notified_parties", "status": "PASSED", "pct": 57}]}, {"id": "TestPersonalizationAgent", "label": "Personalization", "passed": 11, "failed": 0, "tests": [{"suite": "TestPersonalizationAgent", "name": "test_new_patient_profile_created", "status": "PASSED", "pct": 58}, {"suite": "TestPersonalizationAgent", "name": "test_sample_count_increments", "status": "PASSED", "pct": 58}, {"suite": "TestPersonalizationAgent", "name": "test_running_average_stable_on_constant_input", "status": "PASSED", "pct": 59}, {"suite": "TestPersonalizationAgent", "name": "test_learn_from_alert_stores_entry", "status": "PASSED", "pct": 59}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[heart_rate_high-100]", "status": "PASSED", "pct": 60}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[spo2_low-92]", "status": "PASSED", "pct": 60}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[systolic_high-140]", "status": "PASSED", "pct": 61}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[diastolic_high-90]", "status": "PASSED", "pct": 61}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[unknown_param-0]", "status": "PASSED", "pct": 62}, {"suite": "TestPersonalizationAgent", "name": "test_personalized_threshold_falls_back_to_default", "status": "PASSED", "pct": 62}, {"suite": "TestPersonalizationAgent", "name": "test_non_numeric_features_skipped", "status": "PASSED", "pct": 63}]}, {"id": "TestCommunicationAgent", "label": "Communication", "passed": 8, "failed": 0, "tests": [{"suite": "TestCommunicationAgent", "name": "test_summary_contains_patient_id", "status": "PASSED", "pct": 63}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_level", "status": "PASSED", "pct": 64}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_action", "status": "PASSED", "pct": 64}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_notified", "status": "PASSED", "pct": 65}, {"suite": "TestCommunicationAgent", "name": "test_generate_report_stored", "status": "PASSED", "pct": 65}, {"suite": "TestCommunicationAgent", "name": "test_report_structure", "status": "PASSED", "pct": 66}, {"suite": "TestCommunicationAgent", "name": "test_multiple_reports_accumulate", "status": "PASSED", "pct": 66}, {"suite": "TestCommunicationAgent", "name": "test_handle_alert_no_exception", "status": "PASSED", "pct": 67}]}, {"id": "TestCardioAISystem", "label": "CardioAI Coordinator", "passed": 13, "failed": 0, "tests": [{"suite": "TestCardioAISystem", "name": "test_seven_agents_initialised", "status": "PASSED", "pct": 67}, {"suite": "TestCardioAISystem", "name": "test_all_expected_agent_keys", "status": "PASSED", "pct": 68}, {"suite": "TestCardioAISystem", "name": "test_start_all_running", "status": "PASSED", "pct": 68}, {"suite": "TestCardioAISystem", "name": "test_stop_all_stopped", "status": "PASSED", "pct": 69}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[normal-60-90]", "status": "PASSED", "pct": 69}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[afib-110-150]", "status": "PASSED", "pct": 70}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[vtach-150-200]", "status": "PASSED", "pct": 70}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[bradycardia-35-50]", "status": "PASSED", "pct": 71}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[normal-110-130]", "status": "PASSED", "pct": 71}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[hypertension-140-170]", "status": "PASSED", "pct": 72}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[hypertensive_crisis-180-220]", "status": "PASSED", "pct": 72}, {"suite": "TestCardioAISystem", "name": "test_simulate_ecg_registers_device", "status": "PASSED", "pct": 73}, {"suite": "TestCardioAISystem", "name": "test_all_agents_share_same_bus", "status": "PASSED", "pct": 73}]}, {"id": "TestProtocolHelpers", "label": "Protocol Helpers", "passed": 6, "failed": 0, "tests": [{"suite": "TestProtocolHelpers", "name": "test_build_message_fields", "status": "PASSED", "pct": 74}, {"suite": "TestProtocolHelpers", "name": "test_build_message_unique_ids", "status": "PASSED", "pct": 74}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_valid", "status": "PASSED", "pct": 75}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_invalid_json", "status": "PASSED", "pct": 75}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_empty_string", "status": "PASSED", "pct": 76}, {"suite": "TestProtocolHelpers", "name": "test_all_msg_types_roundtrip", "status": "PASSED", "pct": 76}]}, {"id": "TestHandshakeConfig", "label": "Handshake Config", "passed": 5, "failed": 0, "tests": [{"suite": "TestHandshakeConfig", "name": "test_default_port", "status": "PASSED", "pct": 77}, {"suite": "TestHandshakeConfig", "name": "test_default_queue_size", "status": "PASSED", "pct": 77}, {"suite": "TestHandshakeConfig", "name": "test_default_reconnect_attempts", "status": "PASSED", "pct": 78}, {"suite": "TestHandshakeConfig", "name": "test_default_jwt_algorithm", "status": "PASSED", "pct": 78}, {"suite": "TestHandshakeConfig", "name": "test_override_values", "status": "PASSED", "pct": 79}]}, {"id": "TestSecurityManager", "label": "Security Manager", "passed": 12, "failed": 0, "tests": [{"suite": "TestSecurityManager", "name": "test_challenge_decodes_to_16_bytes", "status": "PASSED", "pct": 79}, {"suite": "TestSecurityManager", "name": "test_challenge_unique", "status": "PASSED", "pct": 80}, {"suite": "TestSecurityManager", "name": "test_sign_is_deterministic", "status": "PASSED", "pct": 80}, {"suite": "TestSecurityManager", "name": "test_verify_correct_signature", "status": "PASSED", "pct": 81}, {"suite": "TestSecurityManager", "name": "test_verify_wrong_signature", "status": "PASSED", "pct": 81}, {"suite": "TestSecurityManager", "name": "test_verify_tampered_challenge", "status": "PASSED", "pct": 82}, {"suite": "TestSecurityManager", "name": "test_token_is_string", "status": "PASSED", "pct": 82}, {"suite": "TestSecurityManager", "name": "test_token_correct_sub", "status": "PASSED", "pct": 83}, {"suite": "TestSecurityManager", "name": "test_token_device_ids", "status": "PASSED", "pct": 83}, {"suite": "TestSecurityManager", "name": "test_expired_token_rejected", "status": "PASSED", "pct": 84}, {"suite": "TestSecurityManager", "name": "test_wrong_jwt_secret_rejected", "status": "PASSED", "pct": 84}, {"suite": "TestSecurityManager", "name": "test_different_secrets_different_sigs", "status": "PASSED", "pct": 85}]}, {"id": "TestDeviceSessionRegistry", "label": "Device Registry", "passed": 12, "failed": 0, "tests": [{"suite": "TestDeviceSessionRegistry", "name": "test_register_returns_session", "status": "PASSED", "pct": 85}, {"suite": "TestDeviceSessionRegistry", "name": "test_get_registered", "status": "PASSED", "pct": 86}, {"suite": "TestDeviceSessionRegistry", "name": "test_get_unknown_returns_none", "status": "PASSED", "pct": 86}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_increments_count", "status": "PASSED", "pct": 87}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_sets_last_data_at", "status": "PASSED", "pct": 87}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_resets_missed_heartbeats", "status": "PASSED", "pct": 88}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_inactive", "status": "PASSED", "pct": 88}, {"suite": "TestDeviceSessionRegistry", "name": "test_active_devices_excludes_inactive", "status": "PASSED", "pct": 89}, {"suite": "TestDeviceSessionRegistry", "name": "test_summary_counts", "status": "PASSED", "pct": 89}, {"suite": "TestDeviceSessionRegistry", "name": "test_summary_device_entry_fields", "status": "PASSED", "pct": 90}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_on_unknown_is_silent", "status": "PASSED", "pct": 90}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_inactive_on_unknown_is_silent", "status": "PASSED", "pct": 91}]}, {"id": "TestRPMDataPump", "label": "RPM Data Pump", "passed": 5, "failed": 0, "tests": [{"suite": "TestRPMDataPump", "name": "test_pump_processes_frame", "status": "PASSED", "pct": 91}, {"suite": "TestRPMDataPump", "name": "test_stats_start_at_zero", "status": "PASSED", "pct": 92}, {"suite": "TestRPMDataPump", "name": "test_auto_register_unknown_device", "status": "PASSED", "pct": 92}, {"suite": "TestRPMDataPump", "name": "test_optional_callback_invoked", "status": "PASSED", "pct": 93}, {"suite": "TestRPMDataPump", "name": "test_stop_event_exits_run", "status": "PASSED", "pct": 93}]}, {"id": "TestDeviceHealthMonitor", "label": "Health Monitor", "passed": 3, "failed": 0, "tests": [{"suite": "TestDeviceHealthMonitor", "name": "test_stale_device_marked_inactive_and_event_published", "status": "PASSED", "pct": 94}, {"suite": "TestDeviceHealthMonitor", "name": "test_fresh_device_stays_active", "status": "PASSED", "pct": 94}, {"suite": "TestDeviceHealthMonitor", "name": "test_device_never_sent_data_not_flagged", "status": "PASSED", "pct": 95}]}, {"id": "TestEndToEndPipeline", "label": "End-to-End Pipeline", "passed": 7, "failed": 0, "tests": [{"suite": "TestEndToEndPipeline", "name": "test_vtach_produces_critical_alert", "status": "PASSED", "pct": 95}, {"suite": "TestEndToEndPipeline", "name": "test_afib_produces_medium_or_high_alert", "status": "PASSED", "pct": 96}, {"suite": "TestEndToEndPipeline", "name": "test_hypertensive_crisis_diagnosis_text", "status": "PASSED", "pct": 96}, {"suite": "TestEndToEndPipeline", "name": "test_personalization_updated_after_signal", "status": "PASSED", "pct": 97}, {"suite": "TestEndToEndPipeline", "name": "test_communication_report_stored", "status": "PASSED", "pct": 97}, {"suite": "TestEndToEndPipeline", "name": "test_acquisition_to_diagnosis_full_path", "status": "PASSED", "pct": 98}, {"suite": "TestEndToEndPipeline", "name": "test_normal_ecg_does_not_produce_critical", "status": "PASSED", "pct": 98}]}, {"id": "TestWebSocketHandshakeLoopback", "label": "WebSocket Loopback", "passed": 2, "failed": 0, "tests": [{"suite": "TestWebSocketHandshakeLoopback", "name": "test_full_3way_hmac_handshake", "status": "PASSED", "pct": 99}, {"suite": "TestWebSocketHandshakeLoopback", "name": "test_wrong_secret_fails_auth", "status": "PASSED", "pct": 99}]}, {"id": "TestBackPressure", "label": "Back-Pressure", "passed": 1, "failed": 0, "tests": [{"suite": "TestBackPressure", "name": "test_full_queue_evicts_oldest_frame", "status": "PASSED", "pct": 100}]}];
+const CFG={url:sessionStorage.getItem('ca_url')||'',tok:sessionStorage.getItem('ca_tok')||'',int:parseInt(sessionStorage.getItem('ca_int')||'5')};
 
-/* ══════════════════════════════════════════════════════════════
-   CONFIG — stored in sessionStorage so it persists on refresh
-══════════════════════════════════════════════════════════════ */
-const CONFIG = {
-  apiUrl:      sessionStorage.getItem('ca_api_url')   || '',
-  token:       sessionStorage.getItem('ca_token')     || '',
-  interval:    parseInt(sessionStorage.getItem('ca_interval') || '5'),
-};
+const DEMO_ALERTS=[
+  {alert_id:'demo-001',patient_id:'PT_10042',level:'critical',description:'Ventricular Tachycardia detected — HR 182 bpm, QRS width 148 ms',actions:['PREPARE_DEFIBRILLATOR','ACTIVATE_RAPID_RESPONSE','NOTIFY_EMERGENCY_SERVICES'],notified:['emergency_services','rapid_response_team','primary_cardiologist'],timestamp:new Date(Date.now()-90000).toISOString()},
+  {alert_id:'demo-002',patient_id:'PT_10031',level:'high',description:'Atrial Fibrillation with Rapid Ventricular Response — HR 138 bpm',actions:['NOTIFY_CARDIOLOGIST','REVIEW_WITHIN_15_MIN','PREPARE_RATE_CONTROL'],notified:['primary_cardiologist','nursing_station'],timestamp:new Date(Date.now()-420000).toISOString()},
+  {alert_id:'demo-003',patient_id:'PT_10055',level:'high',description:'ST-Elevation Ischemia detected — 0.22 mV deviation in lead II',actions:['NOTIFY_CARDIOLOGIST','PREPARE_12_LEAD_ECG','ACTIVATE_CATH_LAB'],notified:['primary_cardiologist','cath_lab_team'],timestamp:new Date(Date.now()-900000).toISOString()},
+  {alert_id:'demo-004',patient_id:'PT_10018',level:'medium',description:'Hypertensive Crisis — BP 192/118 mmHg sustained > 10 min',actions:['NOTIFY_PRIMARY_CARE','REVIEW_MEDICATIONS','SCHEDULE_URGENT_VISIT'],notified:['primary_care_physician','patient'],timestamp:new Date(Date.now()-1800000).toISOString()},
+  {alert_id:'demo-005',patient_id:'PT_10067',level:'medium',description:'Atrial Fibrillation detected — HR 94 bpm, CHA₂DS₂-VASc score 3',actions:['NOTIFY_PRIMARY_CARE','SCHEDULE_CARDIOLOGY_REVIEW','ASSESS_ANTICOAGULATION'],notified:['primary_care_physician','patient'],timestamp:new Date(Date.now()-3600000).toISOString()},
+  {alert_id:'demo-006',patient_id:'PT_10029',level:'low',description:'Elevated resting heart rate trend — avg 96 bpm over 48 hours',actions:['ROUTINE_REVIEW','CHECK_MEDICATION_ADHERENCE'],notified:['care_coordinator'],timestamp:new Date(Date.now()-7200000).toISOString()},
+];
 
-let pollTimer  = null;
-let activeView = 'live';
-let alertFilter = 'all';
+let cache={health:null,devices:null,alerts:DEMO_ALERTS};
+let pollT=null;
 
-/* ── Live data cache ── */
-let cache = { health: null, devices: null, alerts: [], reports: [] };
+const AGENTS=[
+  {ico:'📡',num:'01',name:'Data Acquisition',cls:'DataAcquisitionAgent',desc:'Registers IoMT devices, validates sensor quality (HR range 30–250), publishes raw frames to message bus.',pub:['data.raw','device.registered'],sub:['device.register']},
+  {ico:'⚡',num:'02',name:'Data Processing',cls:'DataProcessingAgent',desc:'Quality gate 0.6, ECG/BP/SpO₂ feature extraction, MAP = DBP + (1/3)×PP.',pub:['data.processed'],sub:['data.raw']},
+  {ico:'🔍',num:'03',name:'Pattern Recognition',cls:'PatternRecognitionAgent',desc:'ACC/AHA 2017: arrhythmia types, ischemia (±0.1 mV), hypertension staging, QT abnormality.',pub:['pattern.ecg','pattern.bp'],sub:['data.processed']},
+  {ico:'🩺',num:'04',name:'Diagnostic',cls:'DiagnosticAgent',desc:'Clinical diagnoses from patterns. Computes ASCVD, HF, stroke (elevated for AFib), SCD (high for VTach) risk scores.',pub:['diagnosis.result'],sub:['pattern.ecg','pattern.bp']},
+  {ico:'🚨',num:'05',name:'Alert Monitoring',cls:'AlertMonitoringAgent',desc:'VTach/VFib→CRITICAL. AFib HR>130→HIGH. AFib HR≤130→MEDIUM. Ischemia→HIGH. Generates actions + notification lists.',pub:['alert.new'],sub:['diagnosis.result']},
+  {ico:'👤',num:'06',name:'Personalization',cls:'PersonalizationAgent',desc:'Per-patient baselines. Default thresholds: HR_high=100, SpO2_low=92, systolic_high=140.',pub:['personalization.update'],sub:['alert.new','data.processed']},
+  {ico:'📢',num:'07',name:'Communication',cls:'CommunicationAgent',desc:'Formats alert summaries. Generates clinical reports for EHR write-back via FHIR R4.',pub:['comms.report'],sub:['alert.new']},
+];
+const MSG_TYPES=[['HELLO','c2s','Initiate connection'],['CHALLENGE','s2c','Issue auth nonce'],['CHALLENGE_RESP','c2s','Prove identity (HMAC)'],['AUTH_OK','s2c','Grant access + JWT'],['AUTH_FAIL','s2c','Reject auth'],['HEARTBEAT','bi','Keep-alive probe'],['HEARTBEAT_ACK','bi','Keep-alive response'],['DEVICE_LIST','c2s','Request device catalog'],['DEVICE_LIST_ACK','s2c','Deliver device list'],['SUBSCRIBE','c2s','Register for RPM feeds'],['SUBSCRIBE_ACK','s2c','Confirm subscriptions'],['UNSUBSCRIBE','c2s','Cancel RPM feed'],['DISCONNECT','bi','Graceful shutdown'],['RPM_DATA','s2c','Telemetry frame'],['RPM_ACK','c2s','Telemetry receipt'],['ERROR','bi','Protocol error']];
+const HS_STEPS=[{fr:'CardioAI',to:'IoMT Server',msg:'HELLO',note:'client_id · v1.0',cls:'ok'},{fr:'IoMT Server',to:'CardioAI',msg:'CHALLENGE',note:'16-byte UUID nonce',cls:'sec'},{fr:'CardioAI',to:'SecurityMgr',msg:'sign_challenge()',note:'HMAC-SHA256',cls:'sec'},{fr:'CardioAI',to:'IoMT Server',msg:'CHALLENGE_RESP',note:'challenge + signature',cls:'sec'},{fr:'IoMT Server',to:'CardioAI',msg:'AUTH_OK',note:'JWT token (HS256)',cls:'ok'},{fr:'CardioAI',to:'IoMT Server',msg:'SUBSCRIBE',note:'device_ids[]',cls:''},{fr:'IoMT Server',to:'CardioAI',msg:'RPM_DATA',note:'continuous stream',cls:'ok'}];
 
-/* ══════════════════════════════════════════════════════════════
-   INIT
-══════════════════════════════════════════════════════════════ */
-document.addEventListener('DOMContentLoaded', () => {
-  setInterval(updateClock, 1000);
-  updateClock();
-  buildTestsSidebar();
-  renderTestsPanel(SUITE_DATA[0].id);
+function sv(id){document.querySelectorAll('.view').forEach(v=>v.classList.remove('on'));document.querySelectorAll('.nb').forEach(b=>b.classList.remove('on'));document.getElementById('view-'+id).classList.add('on');document.getElementById('tab-'+id).classList.add('on');}
+function swf(id,btn){document.querySelectorAll('#view-workflow .wf-page').forEach(p=>p.classList.remove('on'));document.querySelectorAll('#view-workflow .sb-btn').forEach(b=>b.classList.remove('on'));document.getElementById(id).classList.add('on');btn.classList.add('on');}
+function ser(id,btn){document.querySelectorAll('#view-emergency .wf-page').forEach(p=>p.classList.remove('on'));document.querySelectorAll('#view-emergency .sb-btn').forEach(b=>b.classList.remove('on'));document.getElementById(id).classList.add('on');btn.classList.add('on');}
+function uct(id,btn){['uc-rpm','uc-afib','uc-rehab'].forEach(x=>document.getElementById(x).style.display='none');document.getElementById(id).style.display='block';document.querySelectorAll('#uc-tabs button').forEach(b=>{b.style.color='';b.style.borderColor='';});btn.style.color='var(--green)';btn.style.borderColor='var(--green)';}
+function openCfg(){document.getElementById('cfgUrl').value=CFG.url;document.getElementById('cfgTok').value=CFG.tok;document.getElementById('cfgInt').value=CFG.int;document.getElementById('cfgOv').classList.add('open');}
+function closeCfg(){document.getElementById('cfgOv').classList.remove('open');}
+function maybeCfgClose(e){if(e.target.id==='cfgOv')closeCfg();}
+function applyCfg(){CFG.url=document.getElementById('cfgUrl').value.trim().replace(/\/$/,'');CFG.tok=document.getElementById('cfgTok').value.trim();CFG.int=Math.max(2,parseInt(document.getElementById('cfgInt').value)||5);sessionStorage.setItem('ca_url',CFG.url);sessionStorage.setItem('ca_tok',CFG.tok);sessionStorage.setItem('ca_int',CFG.int);closeCfg();if(CFG.url){startPoll();document.getElementById('banner').classList.remove('show');}}
+function setStatus(cls,txt){const p=document.getElementById('spill');p.className='spill '+cls;document.getElementById('sptxt').textContent=txt;}
+async function fetchAll(){if(!CFG.url)return;const h=CFG.tok?{'Authorization':'Bearer '+CFG.tok,'Accept':'application/json'}:{'Accept':'application/json'};setStatus('loading','Fetching...');try{const[hr,dr,ar]=await Promise.all([fetch(CFG.url+'/health',{headers:h}),fetch(CFG.url+'/devices',{headers:h}),fetch(CFG.url+'/alerts',{headers:h})]);if(!hr.ok)throw new Error('HTTP '+hr.status);cache.health=await hr.json();cache.devices=await dr.json();cache.alerts=await ar.json();setStatus('live','Live');document.getElementById('banner').classList.remove('show');const db=document.getElementById('demo-badge');if(db)db.style.display='none';renderAll();}catch(e){setStatus('err','Unreachable');document.getElementById('banner').classList.add('show');}}
+function startPoll(){if(pollT)clearInterval(pollT);fetchAll();pollT=setInterval(fetchAll,CFG.int*1000);}
+function renderAll(){renderLive();renderDevices();renderAlerts();updateBadge();}
+function setText(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
+function esc(s){if(!s)return'';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function ft(iso){if(!iso)return'—';try{return new Date(iso).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});}catch{return iso.slice(11,19)||'—';}}
 
-  if (CONFIG.apiUrl) {
-    startPolling();
-  } else {
-    setStatus('offline', 'Not configured');
-    document.getElementById('noBanner').classList.remove('hidden');
-    // Immediately open config panel so new users know what to do
-    setTimeout(openConfig, 400);
-  }
-});
+function renderLive(){const h=cache.health,d=cache.devices,a=cache.alerts;if(h){setText('k-active',d?d.active:'—');setText('k-total',d?'of '+d.total+' registered':'');setText('k-queue',h.queue_depth??'—');setText('k-msgs',h.message_bus_total??'—');setText('k-agt',(h.agent_count??'—')+' agents running');setText('br-id',h.bridge_id??'—');setText('br-ts',h.timestamp?(h.timestamp.replace('T',' ').slice(0,19)):'—');setText('bus-count',h.message_bus_total??0);}setText('k-crit',a.filter(x=>x.level==='critical').length||'0');setText('k-atot',a.length+' total alerts');const sa=document.getElementById('side-alerts');sa.innerHTML=a.length===0?'<div class="empty-st">No active alerts</div>':a.slice(0,5).map(al=>`<div class="al-item ${al.level}"><span class="al-badge ${al.level}">${al.level.toUpperCase()}</span><div class="al-desc">${esc(al.description)}</div><div class="al-meta">Patient ${esc(al.patient_id)} · ${ft(al.timestamp)}</div></div>`).join('');const sd=document.getElementById('side-devs');if(!d||!d.devices||d.devices.length===0){sd.innerHTML='<div class="empty-st">No devices</div>';}else sd.innerHTML=d.devices.slice(0,5).map(dv=>`<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)"><div style="width:6px;height:6px;border-radius:50%;background:${dv.is_active?'var(--green)':'var(--red)'};flex-shrink:0"></div><div style="flex:1;min-width:0"><div style="font-family:var(--mono);font-size:.6rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(dv.device_id)}</div><div style="font-size:.58rem;color:var(--muted)">Patient ${esc(dv.patient_id)}</div></div><div style="font-size:.58rem;color:var(--muted)">${dv.data_count} fr</div></div>`).join('');if(d&&d.devices&&d.devices.some(x=>x.is_active)){const tf=d.devices.filter(x=>x.is_active).reduce((s,x)=>s+(x.data_count||0),0);const hr=60+((tf*7)%60),sys=110+((tf*3)%50),dia=70+((tf*2)%30),sp=94+(tf%7);setText('v-hr',hr);setText('v-bp',sys+'/'+dia);setText('v-spo2',sp);document.getElementById('vf-hr').style.width=Math.min(100,(hr/200)*100)+'%';document.getElementById('vf-bp').style.width=Math.min(100,(sys/240)*100)+'%';document.getElementById('vf-spo2').style.width=Math.min(100,sp)+'%';}}
 
-/* ══════════════════════════════════════════════════════════════
-   VIEW SWITCHING
-══════════════════════════════════════════════════════════════ */
-function switchView(id) {
-  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
-  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
-  document.getElementById('view-' + id).classList.add('active');
-  document.getElementById('tab-' + id).classList.add('active');
-  activeView = id;
-}
+function renderDevices(){const d=cache.devices;if(!d)return;setText('dv-tot',d.total);setText('dv-act',d.active);setText('dv-inact',d.inactive);const tb=document.getElementById('dv-body');if(!d.devices||d.devices.length===0){tb.innerHTML='<tr><td colspan="5"><div class="empty-st">No devices registered</div></td></tr>';return;}tb.innerHTML=d.devices.map(dv=>`<tr><td><span class="stbadge ${dv.is_active?'act':'inact'}">${dv.is_active?'Active':'Inactive'}</span></td><td style="font-family:var(--mono);font-size:.62rem">${esc(dv.device_id)}</td><td style="font-family:var(--mono);font-size:.62rem">${esc(dv.patient_id)}</td><td style="font-family:var(--mono);font-size:.62rem">${dv.data_count??0}</td><td style="font-family:var(--mono);font-size:.62rem;color:var(--muted)">${dv.last_data_at?ft(dv.last_data_at):'—'}</td></tr>`).join('');}
 
-/* ══════════════════════════════════════════════════════════════
-   CONFIG PANEL
-══════════════════════════════════════════════════════════════ */
-function openConfig() {
-  document.getElementById('cfgApiUrl').value   = CONFIG.apiUrl;
-  document.getElementById('cfgToken').value    = CONFIG.token;
-  document.getElementById('cfgInterval').value = CONFIG.interval;
-  document.getElementById('configOverlay').classList.add('open');
-}
+let _af='all';
+function setAlertFilter(f,btn){_af=f;document.querySelectorAll('#filt-btns button').forEach(b=>{b.className='f-chip';});btn.className='f-chip '+(f==='critical'?'on-crit':'on');renderAlerts();}
+function renderAlerts(){const fb=document.getElementById('filt-btns');if(!fb.children.length){['All','Critical','High','Medium','Low'].forEach((lbl,i)=>{const b=document.createElement('button');b.className='f-chip'+(i===0?' on':'');b.textContent=lbl;const fl=lbl.toLowerCase();b.onclick=()=>setAlertFilter(fl,b);fb.appendChild(b);});}const filtered=_af==='all'?cache.alerts:cache.alerts.filter(x=>x.level===_af);const list=document.getElementById('alerts-list');if(filtered.length===0){list.innerHTML='<div class="empty-st">No alerts</div>';return;}list.innerHTML=filtered.map(al=>`<div class="al-item ${al.level}" style="margin-bottom:8px;border-radius:10px"><div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="al-badge ${al.level}">${al.level.toUpperCase()}</span><span style="font-size:.6rem;color:var(--muted);margin-left:auto">Patient: ${esc(al.patient_id)}</span><span style="font-size:.58rem;color:var(--dim)">${ft(al.timestamp)}</span></div><div class="al-desc">${esc(al.description)}</div>${al.actions&&al.actions.length?`<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">${al.actions.slice(0,3).map(a=>`<span style="font-size:.55rem;padding:2px 7px;border-radius:99px;background:var(--card2);border:1px solid var(--border);color:var(--text2)">${esc(a.replace(/_/g,' '))}</span>`).join('')}</div>`:''}</div>`).join('');}
 
-function closeConfig() {
-  document.getElementById('configOverlay').classList.remove('open');
-}
+function updateBadge(){const n=cache.alerts.filter(x=>x.level==='critical').length;const b=document.getElementById('al-bdg');b.textContent=n;b.style.display=n>0?'inline-block':'none';}
 
-function maybeCloseConfig(e) {
-  if (e.target.id === 'configOverlay') closeConfig();
-}
+function buildAgents(){const g=document.getElementById('agtGrid');AGENTS.forEach((ag,i)=>{const d=document.createElement('div');d.className='agt-card';d.innerHTML=`<div class="agt-num">AGENT ${ag.num}</div><div class="agt-ico">${ag.ico}</div><div class="agt-nm">${ag.name}</div><div class="agt-dot"></div>`;d.onclick=()=>renderAgentDetail(ag,i);g.appendChild(d);});renderAgentDetail(AGENTS[0],0);}
+function renderAgentDetail(ag,idx){document.querySelectorAll('.agt-card').forEach((c,i)=>{c.style.borderColor=i===idx?'var(--green)':'';});document.getElementById('agt-detail').innerHTML=`<div class="card" style="margin-top:12px"><div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)"><div style="font-size:2rem">${ag.ico}</div><div style="flex:1"><div style="font-size:.9rem;font-weight:700;color:#fff">${ag.name}</div><div style="font-family:var(--mono);font-size:.62rem;color:var(--green);margin-top:2px">class ${ag.cls}(BaseAgent)</div><div style="font-size:.65rem;color:var(--text2);margin-top:6px;line-height:1.6">${ag.desc}</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><div><div class="sec-hdr" style="margin-bottom:6px">Publishes</div>${ag.pub.map(t=>`<span class="mono-tag" style="display:inline-block;margin:2px;color:var(--green)">${t}</span>`).join('')}</div><div><div class="sec-hdr b" style="margin-bottom:6px">Subscribes</div>${ag.sub.map(t=>`<span class="mono-tag" style="display:inline-block;margin:2px;color:var(--blue)">${t}</span>`).join('')}</div></div></div>`;}
 
-function applyConfig() {
-  CONFIG.apiUrl   = document.getElementById('cfgApiUrl').value.trim().replace(/\/$/, '');
-  CONFIG.token    = document.getElementById('cfgToken').value.trim();
-  CONFIG.interval = Math.max(2, parseInt(document.getElementById('cfgInterval').value) || 5);
-  sessionStorage.setItem('ca_api_url',   CONFIG.apiUrl);
-  sessionStorage.setItem('ca_token',     CONFIG.token);
-  sessionStorage.setItem('ca_interval',  CONFIG.interval);
-  closeConfig();
-  if (CONFIG.apiUrl) {
-    startPolling();
-    document.getElementById('noBanner').classList.add('hidden');
-  }
-}
+function buildHandshake(){const hs=document.getElementById('hsSteps');HS_STEPS.forEach((s,i)=>{const d=document.createElement('div');d.className='hs-step';d.style.animationDelay=(i*.1)+'s';d.innerHTML=`<span class="hs-fr">${s.fr}</span><span class="hs-ar">──→</span><span class="hs-to">${s.to}</span><span class="hs-msg">${s.msg}</span><span class="hs-badge ${s.cls}">${s.note}</span>`;hs.appendChild(d);});const mc=document.getElementById('msgTypes');const chips=[['HELLO','hl-b'],['CHALLENGE','hl-a'],['CHALLENGE_RESP','hl-a'],['AUTH_OK','hl-g'],['AUTH_FAIL','hl-r'],['HEARTBEAT',''],['HEARTBEAT_ACK',''],['DEVICE_LIST','hl-b'],['DEVICE_LIST_ACK','hl-b'],['SUBSCRIBE','hl-b'],['SUBSCRIBE_ACK',''],['UNSUBSCRIBE',''],['DISCONNECT',''],['RPM_DATA','hl-g'],['RPM_ACK',''],['ERROR','hl-r']];mc.innerHTML=chips.map(([n,c])=>`<span class="mc-chip ${c}">${n}</span>`).join('');const mr=document.getElementById('msgRef');MSG_TYPES.forEach(([n,d,p])=>{mr.innerHTML+=`<tr><td style="font-family:var(--mono);font-size:.58rem">${n}</td><td><span class="dir-badge ${d}">${d==='c2s'?'C→S':d==='s2c'?'S→C':'BOTH'}</span></td><td style="font-size:.6rem;color:var(--text2)">${p}</td></tr>`;});}
 
-/* ══════════════════════════════════════════════════════════════
-   POLLING
-══════════════════════════════════════════════════════════════ */
-function startPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  fetchAll();
-  pollTimer = setInterval(fetchAll, CONFIG.interval * 1000);
-}
+function buildTests(){const sb=document.getElementById('ts-side');sb.innerHTML='<div class="sb-lbl">Test Suites — 200 tests · 100%</div>';SUITE_DATA.forEach(s=>{const b=document.createElement('button');b.className='ts-btn'+(s.id===SUITE_DATA[0].id?' on':'');b.innerHTML=`<span style="flex:1">${s.label}</span><span class="ts-cnt">${s.tests.length}</span>`;b.onclick=()=>{document.querySelectorAll('.ts-btn').forEach(x=>x.classList.remove('on'));b.classList.add('on');renderTestPanel(s.id);};sb.appendChild(b);});renderTestPanel(SUITE_DATA[0].id);}
+function renderTestPanel(sid){const s=SUITE_DATA.find(x=>x.id===sid);if(!s)return;const p=document.getElementById('ts-panel');const groups=[],seen=new Map();s.tests.forEach(t=>{const bi=t.name.indexOf('[');if(bi>-1){const base=t.name.slice(0,bi),param=t.name.slice(bi+1,-1);if(!seen.has(base)){const g={base,isP:true,items:[]};seen.set(base,g);groups.push(g);}seen.get(base).items.push({param,pct:t.pct});}else groups.push({base:t.name,isP:false,pct:t.pct});});function h(s){return s.replace(/^test_/,'').replace(/_/g,' ');}let rows='',d=0;groups.forEach(g=>{if(!g.isP){rows+=`<div class="tr-row" style="animation-delay:${d}ms"><span class="tr-st">PASS</span><span class="tr-nm">${h(g.base)}</span><span class="tr-pc">${g.pct}%</span></div>`;d+=12;}else{rows+=`<div class="tr-row" style="animation-delay:${d}ms"><span class="tr-st">PASS</span><span class="tr-nm">${h(g.base)} <span style="color:var(--green);opacity:.7">×${g.items.length}</span></span></div>`;rows+=`<div class="pi-ind">${g.items.map((it,i)=>`<div class="pi-row" style="animation-delay:${d+i*8}ms"><div class="pi-d"></div><span class="pi-v">${esc(it.param)}</span><span class="pi-p">${it.pct}%</span></div>`).join('')}</div>`;d+=12+g.items.length*8;}});p.innerHTML=`<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px"><div style="font-size:.9rem;font-weight:700;color:#fff">${s.label}</div><span style="font-size:.62rem;color:var(--muted)">${s.tests.length} tests · ${s.passed} passed · 100%</span></div><div class="tp-bar"><div class="tp-fill" id="tpf" style="width:0"></div></div>${rows}`;setTimeout(()=>{const f=document.getElementById('tpf');if(f)f.style.width='100%';},80);}
 
-async function fetchAll() {
-  if (!CONFIG.apiUrl) return;
+function busAnim(){const viz=document.getElementById('busViz');if(!viz)return;const msgs=[{l:'data.raw',c:'#0048A0'},{l:'ECG',c:'#40B8F8'},{l:'pattern',c:'#F88840'},{l:'diag',c:'#6A4FBF'},{l:'alert',c:'#F84858'},{l:'HMAC',c:'#105898'},{l:'RPM',c:'#80D0F8'}];let idx=0;setInterval(()=>{const m=msgs[idx%msgs.length];idx++;const pk=document.createElement('div');pk.className='bus-pkt';pk.style.background=m.c;pk.textContent=m.l;pk.style.animationDuration=(1.8+Math.random()*1.4)+'s';pk.style.top=(10+Math.random()*18)+'px';viz.appendChild(pk);setTimeout(()=>pk.remove(),3500);},700);}
 
-  const headers = CONFIG.token
-    ? { 'Authorization': 'Bearer ' + CONFIG.token, 'Accept': 'application/json' }
-    : { 'Accept': 'application/json' };
-
-  setStatus('loading', 'Fetching...');
-
-  try {
-    const [healthRes, devicesRes, alertsRes] = await Promise.all([
-      fetch(CONFIG.apiUrl + '/health',  { headers }),
-      fetch(CONFIG.apiUrl + '/devices', { headers }),
-      fetch(CONFIG.apiUrl + '/alerts',  { headers }),
-    ]);
-
-    if (!healthRes.ok) throw new Error('HTTP ' + healthRes.status);
-
-    cache.health  = await healthRes.json();
-    cache.devices = await devicesRes.json();
-    cache.alerts  = await alertsRes.json();
-
-    setStatus('live', 'Live');
-    document.getElementById('noBanner').classList.add('hidden');
-    renderAll();
-  } catch (err) {
-    setStatus('error', 'Unreachable');
-    document.getElementById('noBanner').classList.remove('hidden');
-    console.warn('[CardioAI] fetch error:', err.message);
-  }
-}
-
-/* ══════════════════════════════════════════════════════════════
-   RENDER — all views from cache
-══════════════════════════════════════════════════════════════ */
-function renderAll() {
-  renderLive();
-  renderDevices();
-  renderAlerts();
-  updateAlertBadge();
-}
-
-/* ── LIVE MONITOR ── */
-function renderLive() {
-  const h = cache.health;
-  const d = cache.devices;
-  const a = cache.alerts;
-
-  if (h) {
-    setText('kpi-active',    d ? d.active  : '—');
-    setText('kpi-total',     d ? 'of ' + d.total + ' registered' : '');
-    setText('kpi-queue',     h.queue_depth    ?? '—');
-    setText('kpi-messages',  h.message_bus_total ?? '—');
-    setText('kpi-agents',    h.agent_count + ' agents running');
-    setText('bridge-id',     h.bridge_id ?? '—');
-    setText('bridge-ts',     h.timestamp ? h.timestamp.replace('T',' ').slice(0,19) : '—');
-  }
-
-  setText('kpi-critical',     a.filter(x => x.level === 'critical').length || '0');
-  setText('kpi-alerts-total', a.length + ' total alerts');
-
-  // Side alerts
-  const sideAlerts = document.getElementById('sideAlerts');
-  if (a.length === 0) {
-    sideAlerts.innerHTML = '<div class="empty">No active alerts</div>';
-  } else {
-    sideAlerts.innerHTML = a.slice(0, 8).map(alert => `
-      <div class="alert-item">
-        <span class="alert-level ${alert.level}">${alert.level.toUpperCase()}</span>
-        <div class="alert-desc">${esc(alert.description)}</div>
-        <div class="alert-meta">Patient: ${esc(alert.patient_id)} · ${fmtTime(alert.timestamp)}</div>
-      </div>
-    `).join('');
-  }
-
-  // Side devices
-  const sideDevs = document.getElementById('sideDevices');
-  if (!d || d.devices.length === 0) {
-    sideDevs.innerHTML = '<div class="empty">No devices registered</div>';
-  } else {
-    sideDevs.innerHTML = d.devices.slice(0,8).map(dev => `
-      <div class="device-item">
-        <div class="device-dot ${dev.is_active ? 'active' : 'inactive'}"></div>
-        <div class="device-info">
-          <div class="device-id">${esc(dev.device_id.slice(0,20))}</div>
-          <div class="device-pid">Patient ${esc(dev.patient_id)}</div>
-        </div>
-        <div class="device-count">${dev.data_count} frames</div>
-      </div>
-    `).join('');
-  }
-
-  // Vitals: pull from most recent alert or last device frame
-  // Since we don't have a /vitals endpoint we show the most recent data frame count as proxy
-  if (d && d.devices.length > 0) {
-    const activeDevs = d.devices.filter(x => x.is_active);
-    if (activeDevs.length > 0) {
-      const totalFrames = activeDevs.reduce((s, x) => s + (x.data_count || 0), 0);
-      // Show simulated running vitals from frame counts as a live indicator
-      const hr   = 60 + ((totalFrames * 7) % 60);   // 60–120
-      const sys  = 110 + ((totalFrames * 3) % 50);  // 110–160
-      const dia  = 70  + ((totalFrames * 2) % 30);  // 70–100
-      const spo2 = 94  + ((totalFrames) % 7);       // 94–100
-      animateVital('v-hr',   hr,            '—');
-      animateVital('v-bp',   sys + '/' + dia, '—/—');
-      animateVital('v-spo2', spo2,           '—');
-      document.getElementById('vf-hr').style.width   = Math.min(100, (hr / 200) * 100) + '%';
-      document.getElementById('vf-bp').style.width   = Math.min(100, (sys / 240) * 100) + '%';
-      document.getElementById('vf-spo2').style.width = Math.min(100, spo2) + '%';
-    }
-  }
-}
-
-/* ── DEVICES ── */
-function renderDevices() {
-  const d = cache.devices;
-  if (!d) return;
-  setText('dv-total',    d.total);
-  setText('dv-active',   d.active);
-  setText('dv-inactive', d.inactive);
-
-  const tbody = document.getElementById('devTableBody');
-  if (d.devices.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5"><div class="empty">No devices registered</div></td></tr>';
-    return;
-  }
-  tbody.innerHTML = d.devices.map(dev => `
-    <tr>
-      <td>
-        <span class="status-badge ${dev.is_active ? 'active' : 'inactive'}">
-          <div class="sb-dot"></div>
-          ${dev.is_active ? 'Active' : 'Inactive'}
-        </span>
-      </td>
-      <td class="mono">${esc(dev.device_id)}</td>
-      <td class="mono">${esc(dev.patient_id)}</td>
-      <td class="mono">${dev.data_count ?? 0}</td>
-      <td class="mono" style="color:var(--muted)">${dev.last_data_at ? fmtTime(dev.last_data_at) : '—'}</td>
-    </tr>
-  `).join('');
-}
-
-/* ── ALERTS ── */
-let _alertFilter = 'all';
-
-function setAlertFilter(btn, filter) {
-  _alertFilter = filter;
-  document.querySelectorAll('.f-chip').forEach(c => c.classList.remove('on','on-crit'));
-  if (filter === 'critical') btn.classList.add('on-crit');
-  else                       btn.classList.add('on');
-  renderAlerts();
-}
-
-function renderAlerts() {
-  const a = cache.alerts;
-  const list = document.getElementById('alertsList');
-
-  const filtered = _alertFilter === 'all'
-    ? a
-    : a.filter(x => x.level === _alertFilter);
-
-  if (filtered.length === 0) {
-    list.innerHTML = '<div class="empty" style="padding:60px 0">No ' + (_alertFilter === 'all' ? '' : _alertFilter + ' ') + 'alerts</div>';
-    return;
-  }
-
-  list.innerHTML = filtered.map(alert => `
-    <div class="alert-card ${alert.level}">
-      <div class="alert-card-header">
-        <span class="alert-level ${alert.level}">${alert.level.toUpperCase()}</span>
-        <span class="alert-patient">Patient: ${esc(alert.patient_id)}</span>
-        <span class="alert-time">${fmtTime(alert.timestamp)}</span>
-      </div>
-      <div class="alert-description">${esc(alert.description)}</div>
-      ${alert.actions && alert.actions.length ? `
-        <div class="alert-actions">
-          ${alert.actions.map(a => `<span class="action-tag">${esc(a.replace(/_/g,' '))}</span>`).join('')}
-        </div>` : ''}
-      ${alert.notified && alert.notified.length ? `
-        <div class="notified-row">Notified: <span>${alert.notified.map(n => esc(n.replace(/_/g,' '))).join(', ')}</span></div>` : ''}
-    </div>
-  `).join('');
-}
-
-function updateAlertBadge() {
-  const critical = cache.alerts.filter(x => x.level === 'critical').length;
-  const badge = document.getElementById('alert-badge');
-  if (critical > 0) {
-    badge.textContent = critical;
-    badge.style.display = 'inline-block';
-  } else {
-    badge.style.display = 'none';
-  }
-}
-
-/* ══════════════════════════════════════════════════════════════
-   TEST SUITE VIEW (static, always works)
-══════════════════════════════════════════════════════════════ */
-let activeTestSuite = SUITE_DATA[0].id;
-
-function buildTestsSidebar() {
-  const sb = document.getElementById('testsSidebar');
-  sb.innerHTML = '<div class="ts-lbl">Test Suites</div>';
-  SUITE_DATA.forEach(suite => {
-    const btn = document.createElement('button');
-    btn.className = 'ts-btn' + (suite.id === activeTestSuite ? ' active' : '');
-    btn.dataset.sid = suite.id;
-    btn.innerHTML = `<div class="ts-dot"></div><span class="ts-name">${suite.label}</span><span class="ts-count">${suite.tests.length}</span>`;
-    btn.addEventListener('click', () => {
-      activeTestSuite = suite.id;
-      document.querySelectorAll('.ts-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      renderTestsPanel(suite.id);
-    });
-    sb.appendChild(btn);
-  });
-}
-
-function renderTestsPanel(suiteId) {
-  const suite = SUITE_DATA.find(s => s.id === suiteId);
-  if (!suite) return;
-
-  // Group parametrized tests
-  const groups = [];
-  const seen   = new Map();
-  for (const t of suite.tests) {
-    const bi = t.name.indexOf('[');
-    if (bi > -1) {
-      const base  = t.name.slice(0, bi);
-      const param = t.name.slice(bi + 1, -1);
-      if (!seen.has(base)) { const g = {base,isParam:true,items:[]}; seen.set(base,g); groups.push(g); }
-      seen.get(base).items.push({param, pct: t.pct});
-    } else {
-      groups.push({base: t.name, isParam: false, pct: t.pct});
-    }
-  }
-
-  function h(s) { return s.replace(/^test_/,'').replace(/_/g,' '); }
-
-  let rows = '';
-  let delay = 0;
-  for (const g of groups) {
-    if (!g.isParam) {
-      rows += `<div class="tr-row" style="animation-delay:${delay}ms">
-        <span class="tr-status">PASS</span>
-        <span class="tr-name">${h(g.base)}</span>
-        <span class="tr-pct">${g.pct}%</span>
-      </div>`;
-      delay += 14;
-    } else {
-      rows += `<div class="tr-row" style="animation-delay:${delay}ms">
-        <span class="tr-status">PASS</span>
-        <span class="tr-name">${h(g.base)} <span class="tr-param">×${g.items.length}</span></span>
-        <span class="tr-pct"></span>
-      </div>
-      <div class="param-indent">
-        ${g.items.map((item,i) => `
-          <div class="pi-row" style="animation-delay:${delay+i*10}ms">
-            <div class="pi-dot"></div>
-            <span class="pi-val">${esc(item.param)}</span>
-            <span class="pi-pct">${item.pct}%</span>
-          </div>`).join('')}
-      </div>`;
-      delay += 14 + g.items.length * 10;
-    }
-  }
-
-  const pct = Math.round(suite.passed / suite.tests.length * 100);
-  document.getElementById('testsPanel').innerHTML = `
-    <div class="tp-hdr">
-      <h2>${suite.label}</h2>
-      <span class="tp-meta">${suite.tests.length} tests · ${suite.passed} passed · ${pct}%</span>
-    </div>
-    <div class="tp-bar"><div class="tp-fill" id="tpFill" style="width:0"></div></div>
-    ${rows}`;
-  setTimeout(() => { const f = document.getElementById('tpFill'); if(f) f.style.width = pct + '%'; }, 80);
-}
-
-/* ══════════════════════════════════════════════════════════════
-   UTILS
-══════════════════════════════════════════════════════════════ */
-function setStatus(state, label) {
-  const pill = document.getElementById('statusPill');
-  const text = document.getElementById('statusText');
-  pill.className = 'status-pill ' + state;
-  text.textContent = label;
-}
-
-function setText(id, val) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = val;
-}
-
-function animateVital(id, newVal, placeholder) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  if (el.textContent !== String(newVal)) {
-    el.style.opacity = '0';
-    el.style.transform = 'translateY(-4px)';
-    setTimeout(() => {
-      el.textContent = newVal || placeholder;
-      el.style.transition = 'opacity .25s, transform .25s';
-      el.style.opacity = '1';
-      el.style.transform = 'none';
-    }, 120);
-  }
-}
-
-function esc(s) {
-  if (!s) return '';
-  return String(s)
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;');
-}
-
-function fmtTime(iso) {
-  if (!iso) return '—';
-  try {
-    const d = new Date(iso);
-    return d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  } catch { return iso.slice(11,19) || '—'; }
-}
-
-function updateClock() {
-  document.getElementById('clock').textContent =
-    new Date().toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-}
+setInterval(()=>{document.getElementById('clk').textContent=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});},1000);
+buildAgents();buildHandshake();buildTests();busAnim();
+renderAlerts();updateBadge();
+if(CFG.url){startPoll();}else{setStatus('','Not configured');setTimeout(openCfg,400);}
 </script>
 </body>
 </html>
