@@ -2304,6 +2304,31 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             {"message": "Signed out successfully", "tokens_revoked": revoked}
         )
 
+    # ── GET / ─────────────────────────────────────────────────────────────
+    #
+    # Friendly landing page for the bare root path. Unauthenticated — this
+    # is just a directory listing so visiting the deploy URL in a browser
+    # shows something useful instead of a 404. Contains no patient data.
+
+    async def root(request: _web.Request) -> _web.Response:
+        return _web.json_response({
+            "service":     "IoMT CardioAI Backend",
+            "status":      "running",
+            "bridge_id":   cfg.cardioai_backend_id,
+            "endpoints": {
+                "GET  /health":           "Liveness probe (no auth)",
+                "GET  /status":           "Full bridge status (auth required)",
+                "POST /auth/apple":       "Sign in with Apple (iOS)",
+                "POST /auth/login":       "Email + password login",
+                "POST /auth/refresh":     "Rotate refresh token",
+                "POST /auth/logout":      "Revoke session",
+                "POST /devices/register": "Register a paired BLE device (auth required)",
+                "GET  /devices":          "Device registry (auth required)",
+                "GET  /alerts":           "Active alerts (auth required)",
+                "GET  /reports":          "Clinical reports (auth required)",
+            },
+        })
+
     # ── GET /health ───────────────────────────────────────────────────────
     #
     # Deliberately UNAUTHENTICATED. This is an infrastructure liveness probe
@@ -2711,6 +2736,7 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
     # ── Register routes ───────────────────────────────────────────────────
 
+    app.router.add_get( "/",                  root)
     app.router.add_post("/auth/apple",        apple_signin)
     app.router.add_post("/auth/login",        login)
     app.router.add_post("/auth/refresh",      refresh)
