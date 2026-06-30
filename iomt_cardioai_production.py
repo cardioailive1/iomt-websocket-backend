@@ -74,11 +74,13 @@ Python dependencies
 -------------------
   pip install websockets aiohttp pyjwt numpy bcrypt
 
-External module dependencies (ship alongside this file)
--------------------------------------------------------
-  IoMT_implementation.py    — low-level device drivers, sensor I/O
-  IoMT_clinical_workflow.py — CDSS rules, care-pathway routing, EHR
-  IoMT_gcp_compduide.py     — Pub/Sub, BigQuery, Cloud Healthcare, GCS
+Self-contained build
+---------------------
+  This file has no external module dependencies beyond the pip packages
+  above. Everything — device registry, 7-agent pipeline, HMAC handshake,
+  HTTP API — is defined in this single file. There is no separate
+  IoMT_implementation.py / IoMT_clinical_workflow.py / IoMT_gcp_compduide.py
+  to ship alongside it.
 """
 
 from __future__ import annotations
@@ -147,29 +149,18 @@ from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 # ============================================================================
 # Internal IoMT Module Imports
 # ============================================================================
-
-from IoMT_implementation import (       # low-level device / transport layer
-    IoMTDeviceDriver,
-    SensorTransportEncoder,
-    DeviceCapabilityRegistry,
-    FirmwareAbstractionLayer,
-    RawSensorFrame,
-)
-from IoMT_clinical_workflow import (    # clinical decision support + EHR
-    ClinicalDecisionEngine,
-    CarePathwayRouter,
-    EHRConnector,
-    CDSSAlert,
-    ClinicalWorkflowConfig,
-)
-from IoMT_gcp_compduide import (        # GCP managed-services integration
-    GCPPubSubPublisher,
-    BigQueryEventWriter,
-    CloudHealthcareAPIClient,
-    GCSArchiver,
-    HealthcareDatasetClient,
-    GCPConfig,
-)
+#
+# NOTE: This production build is fully self-contained. Earlier design
+# iterations referenced three companion modules (IoMT_implementation,
+# IoMT_clinical_workflow, IoMT_gcp_compduide) for low-level device drivers,
+# CDSS/EHR routing, and GCP managed-services write-back respectively.
+#
+# None of those modules' classes are actually instantiated or called anywhere
+# in this file's runtime logic — the imports were vestigial. If you want to
+# add real EHR/FHIR write-back or GCP Pub/Sub forwarding, implement those
+# integrations directly in CommunicationAgent (EHR) and RPMDataPump's
+# on_rpm_frame hook (GCP), or re-introduce the companion modules and restore
+# imports here once they exist in this repository.
 
 # ============================================================================
 # Logging
@@ -1113,8 +1104,9 @@ class PersonalizationAgent(BaseAgent):
 class CommunicationAgent(BaseAgent):
     """
     Formats alert summaries and generates structured clinical reports.
-    Reports accumulate in-memory for status queries; in production they are
-    also written to EHR via FHIR R4 (IoMT_clinical_workflow.EHRConnector).
+    Reports accumulate in-memory for status queries. To write these to a
+    real EHR via FHIR R4, implement an EHRConnector in this file and call
+    it from process() below.
     """
 
     def __init__(self, agent_id: str, message_bus: MessageBus) -> None:
@@ -1664,11 +1656,12 @@ class IoMTCardioAIBridge:
     - DeviceHealthMonitor    : dropout detection
     - DeviceSessionRegistry  : session state
 
-    GCP write-back (via IoMT_gcp_compduide)
-    -----------------------------------------
-    The *on_rpm_frame* hook passed to RPMDataPump forwards each frame to
-    GCPPubSubPublisher.  Diagnostic events are written to BigQuery via the
-    'diagnosis.result' topic subscription set up at startup.
+    Optional cloud write-back
+    --------------------------
+    RPMDataPump accepts an on_rpm_frame hook (see its constructor) that you
+    can use to forward every frame to Pub/Sub, BigQuery, or any other sink.
+    None is wired up by default — add your own integration and pass it in
+    when constructing RPMDataPump if you need cloud write-back.
     """
 
     def __init__(
