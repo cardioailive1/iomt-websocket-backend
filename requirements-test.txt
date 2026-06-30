@@ -6,7 +6,13 @@ websockets>=12.0
 aiohttp>=3.9
 pyjwt>=2.8
 numpy>=1.26
-bcrypt>=4.1
+
+# Pinned exact version — bcrypt ships prebuilt wheels (manylinux) for this
+# version across Python 3.8–3.12. Using >=4.1 can resolve to a newer release
+# that lacks a prebuilt wheel for Render's build image, forcing a from-source
+# build that requires a Rust toolchain Render does not have installed —
+# causing "error: can't find Rust compiler" / build failures.
+bcrypt==4.1.2
 
 # Optional — only required if APPLE_VERIFY_TOKENS=true (production Apple Sign In)
 python-jose[cryptography]>=3.3
