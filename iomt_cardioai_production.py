@@ -2699,8 +2699,26 @@ async def main() -> None:
     """
     Production entry point.
 
-    Reads all configuration from environment variables, starts the bridge,
-    and runs until SIGINT / SIGTERM is received.
+    Reads all configuration from environment variables, starts the bridge
+    and/or HTTP API depending on CARDIOAI_RUN_MODE, and runs until
+    SIGINT / SIGTERM is received.
+
+    CARDIOAI_RUN_MODE values
+    -------------------------
+    all   (default) — HTTP API + outbound IoMT bridge connector in one process.
+                       Use this for a single-server deployment (Docker, VM,
+                       systemd). Requires only CARDIOAI_API_PORT to be public.
+    api             — HTTP API only. No outbound connection to the IoMT
+                       hardware server is attempted. Use this on platforms
+                       like Render.com that expose exactly one public port
+                       per service — deploy this as your public-facing
+                       'cardioai-api' service.
+    bridge          — Outbound IoMT connector only (no public HTTP port).
+                       Connects out to IOMT_SERVER_WS_URL, runs the 7-agent
+                       pipeline, and exposes no listener of its own. Deploy
+                       this as a private background worker (Render
+                       'cardioai-bridge', or a systemd service with no
+                       public ingress).
 
     Usage
     -----
@@ -2708,9 +2726,19 @@ async def main() -> None:
     export CARDIOAI_BACKEND_ID="cardioai-prod-01"
     export IOMT_SHARED_SECRET="<32+ char secret from Vault>"
     export IOMT_JWT_SECRET="<32+ char secret from Vault>"
+    export CARDIOAI_RUN_MODE="all"        # or "api" / "bridge"
     python iomt_cardioai_production.py
     """
     logger.info("[Startup] IoMT CardioAI Production Service initialising ...")
+
+    run_mode = _optional_env("CARDIOAI_RUN_MODE", "all").lower()
+    if run_mode not in ("all", "api", "bridge"):
+        logger.critical(
+            "[Startup] invalid CARDIOAI_RUN_MODE=%r — must be 'all', 'api', or 'bridge'",
+            run_mode,
+        )
+        sys.exit(1)
+    logger.info("[Startup] run mode: %s", run_mode)
 
     try:
         cfg = HandshakeConfig.from_env()
@@ -2740,26 +2768,44 @@ async def main() -> None:
             # Windows does not support loop.add_signal_handler
             pass
 
-    # Start HTTP API (auth + dashboard data endpoints)
-    api_runner = await start_http_api(
-        bridge,
-        host = cfg.api_host,
-        port = cfg.api_port,
-    )
+    api_runner = None
 
-    await bridge.start()
-    logger.info("[Startup] bridge running — awaiting shutdown signal")
-    logger.info(
-        "[Startup] HTTP API: http://%s:%d  |  WebSocket: ws://%s:%d",
-        cfg.api_host, cfg.api_port,
-        cfg.cardioai_ws_host, cfg.cardioai_ws_port,
-    )
+    # ── Start HTTP API (auth + dashboard data endpoints) ───────────────────────
+    # Render.com note: this binds to $PORT via CARDIOAI_API_PORT — see render.yaml
+    if run_mode in ("all", "api"):
+        api_runner = await start_http_api(
+            bridge,
+            host = cfg.api_host,
+            port = cfg.api_port,
+        )
+        logger.info(
+            "[Startup] HTTP API listening on http://%s:%d",
+            cfg.api_host, cfg.api_port,
+        )
 
+    # ── Start the 7-agent pipeline + outbound IoMT connector ───────────────────
+    # This makes an OUTBOUND connection to IOMT_SERVER_WS_URL — it does not
+    # itself listen on a public port, so it has no $PORT requirement.
+    if run_mode in ("all", "bridge"):
+        await bridge.start()
+        logger.info(
+            "[Startup] bridge running — outbound connection to %s",
+            cfg.iomt_server_ws_url,
+        )
+    else:
+        logger.info(
+            "[Startup] run_mode=api — skipping outbound IoMT bridge connector. "
+            "Deploy a separate 'bridge' mode service to handle device data."
+        )
+
+    logger.info("[Startup] awaiting shutdown signal")
     await shutdown_event.wait()
 
     logger.info("[Shutdown] stopping services ...")
-    await bridge.stop()
-    await api_runner.cleanup()
+    if run_mode in ("all", "bridge"):
+        await bridge.stop()
+    if api_runner is not None:
+        await api_runner.cleanup()
 
     # Final status snapshot
     logger.info("[Shutdown] final status: %s", json.dumps(bridge.status(), default=str))
