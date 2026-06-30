@@ -147,6 +147,14 @@ except ImportError as _bcrypt_err:
 from aiohttp import web as _web
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 
+# Real PostgreSQL-backed user/token/audit store — replaces the in-memory
+# stub dict. See db.py and migrations/001_create_users.sql.
+from db import Database, HospitalUser, UserRole as DBUserRole, LargeDevice  # noqa: E402
+from kafka_bus import (  # noqa: E402
+    KafkaEventProducer, KafkaEventConsumer,
+    TOPIC_VENDOR_RAW, TOPIC_VENDOR_DEADLETTER,
+)
+
 # ============================================================================
 # Internal IoMT Module Imports
 # ============================================================================
@@ -1770,148 +1778,56 @@ from functools import wraps as _wraps
 
 # ── User roles ────────────────────────────────────────────────────────────────
 
-class UserRole(str, Enum):
-    PATIENT       = "patient"
-    NURSE         = "nurse"
-    CARDIOLOGIST  = "cardiologist"
-    ADMIN         = "admin"
+# UserRole is defined in db.py and imported above as DBUserRole, then
+# re-exported here under the plain name "UserRole" so existing code in this
+# file (and the rest of build_http_app) doesn't need to change.
+UserRole = DBUserRole
 
 
 # ── User model ────────────────────────────────────────────────────────────────
+#
+# HospitalUser now lives in db.py and is backed by a real PostgreSQL `users`
+# table. It is imported above as `HospitalUser`. The class is re-exported
+# here under the same name for backward compatibility with any code below
+# that still references `HospitalUser` directly.
 
-@dataclass
-class HospitalUser:
-    """Represents an authenticated user.  Passwords are never stored in plain text."""
+# ── Database-backed user store ─────────────────────────────────────────────────
+#
+# Replaces the old in-memory _STUB_USERS dict entirely. `_db` is a single
+# asyncpg connection pool shared across every request — connected once in
+# main() at startup, disconnected on shutdown.
 
-    id:           str
-    email:        str
-    name:         str
-    role:         UserRole
-    patient_id:   Optional[str]        # set for patient role only
-    # bcrypt hash — loaded from DB / LDAP, never logged
-    password_hash: str = field(repr=False)
-    is_active:    bool  = True
-    mfa_secret:   Optional[str] = field(default=None, repr=False)
+_db = Database()
 
-    def verify_password(self, plain: str) -> bool:
-        """Constant-time bcrypt verification."""
-        try:
-            return bcrypt.checkpw(
-                plain.encode("utf-8"),
-                self.password_hash.encode("utf-8"),
-            )
-        except Exception:
-            return False
+# ── Kafka — large/implanted device vendor event pipeline ──────────────────────
+#
+# Completely separate from the BLE patient-pairing flow and from the
+# outbound IoMT hardware connector above. This producer is used ONLY by
+# POST /vendor-gateway/ingest to publish normalized vendor events; the
+# consumer (started in main()) drains them into the SAME 7-agent pipeline
+# that BLE devices feed, via DataAcquisitionAgent.register_device() /
+# stream_data() — see _consume_vendor_event() below.
 
-
-# ── In-memory user store (replace with LDAP / DB in production) ───────────────
-# Passwords hashed with bcrypt cost 12.
-# To generate a hash: python3 -c "import bcrypt; print(bcrypt.hashpw(b'yourpassword', bcrypt.gensalt(12)).decode())"
-
-def _make_stub_users() -> Dict[str, HospitalUser]:
-    """
-    Stub user directory for development.
-    In production replace _load_user_by_email() with an LDAP or DB query.
-    Passwords below are bcrypt hashes of 'changeme_in_prod' (cost 12).
-    """
-    stub_hash = bcrypt.hashpw(b"changeme_in_prod", bcrypt.gensalt(12)).decode()
-    return {
-        "patient@hospital.local": HospitalUser(
-            id="USR-001", email="patient@hospital.local",
-            name="John Anderson", role=UserRole.PATIENT,
-            patient_id="PT_12345", password_hash=stub_hash,
-        ),
-        "nurse@hospital.local": HospitalUser(
-            id="USR-002", email="nurse@hospital.local",
-            name="Sarah Chen", role=UserRole.NURSE,
-            patient_id=None, password_hash=stub_hash,
-        ),
-        "cardio@hospital.local": HospitalUser(
-            id="USR-003", email="cardio@hospital.local",
-            name="Dr. James Okafor", role=UserRole.CARDIOLOGIST,
-            patient_id=None, password_hash=stub_hash,
-        ),
-    }
+_kafka_producer = KafkaEventProducer()
 
 
-_STUB_USERS: Dict[str, HospitalUser] = {}
+async def _load_user_by_email(email: str) -> Optional[HospitalUser]:
+    """Look up a user by email address from PostgreSQL."""
+    return await _db.get_user_by_email(email)
 
 
-def _load_user_by_email(email: str) -> Optional[HospitalUser]:
-    """
-    Look up a user by email address.
-
-    Production replacement
-    ----------------------
-    Replace this function body with an async LDAP query or DB lookup:
-
-        async with ldap3.Connection(server, ...) as conn:
-            conn.search("ou=users,dc=hospital,dc=local",
-                        f"(mail={email})", attributes=["*"])
-            entry = conn.entries[0]
-            return HospitalUser(id=str(entry.uid), ...)
-
-    Or a SQLAlchemy query:
-        user = await db.execute(select(User).where(User.email == email))
-        return user.scalar_one_or_none()
-    """
-    return _STUB_USERS.get(email.lower().strip())
+async def _load_user_by_id(user_id: str) -> Optional[HospitalUser]:
+    """Look up a user by UUID from PostgreSQL."""
+    return await _db.get_user_by_id(user_id)
 
 
-# ── Refresh token store (replace with Redis / DB in production) ───────────────
-
-class RefreshTokenStore:
-    """
-    In-memory refresh token store.
-
-    Production replacement
-    ----------------------
-    Replace with Redis:
-        await redis.setex(f"refresh:{token_id}", ttl_seconds, user_id)
-        user_id = await redis.get(f"refresh:{token_id}")
-        await redis.delete(f"refresh:{token_id}")
-    """
-
-    def __init__(self) -> None:
-        # token_id → (user_id, expires_at_unix)
-        self._store: Dict[str, tuple[str, float]] = {}
-
-    def issue(self, user_id: str, ttl_seconds: int) -> str:
-        token_id = secrets.token_urlsafe(48)
-        self._store[token_id] = (user_id, _time.time() + ttl_seconds)
-        return token_id
-
-    def consume(self, token_id: str) -> Optional[str]:
-        """
-        Validate and rotate — one-time use, returns user_id or None.
-        Rotation means each refresh issues a brand-new token ID,
-        so a stolen token can only be used once before being invalidated.
-        """
-        entry = self._store.pop(token_id, None)
-        if entry is None:
-            return None
-        user_id, expires_at = entry
-        if _time.time() > expires_at:
-            return None
-        return user_id
-
-    def revoke_all_for_user(self, user_id: str) -> int:
-        """Revoke all sessions for a user (sign-out everywhere)."""
-        before = len(self._store)
-        self._store = {
-            k: v for k, v in self._store.items() if v[0] != user_id
-        }
-        return before - len(self._store)
-
-    def purge_expired(self) -> int:
-        """Remove expired tokens — call periodically."""
-        now    = _time.time()
-        before = len(self._store)
-        self._store = {k: v for k, v in self._store.items() if v[1] > now}
-        return before - len(self._store)
-
-
-_REFRESH_STORE = RefreshTokenStore()
+# ── Refresh tokens — now backed by the `refresh_tokens` Postgres table ────────
+#
+# The old in-memory RefreshTokenStore class has been removed. All refresh
+# token operations go through _db.issue_refresh_token() / consume_refresh_token()
+# / revoke_all_refresh_tokens() directly, which persist to Postgres and
+# survive process restarts and multi-instance deployments — unlike the old
+# in-memory dict, which lost all sessions on every redeploy.
 
 
 # ── Rate limiter ───────────────────────────────────────────────────────────────
@@ -2037,6 +1953,235 @@ def _require_auth(cfg: "HandshakeConfig"):
     return decorator
 
 
+def require_role(*allowed_roles: "UserRole"):
+    """
+    RBAC decorator — stacks ON TOP of @_require_auth(cfg), which must run
+    first so request["user"] is already populated.
+
+    Usage
+    -----
+        @_require_auth(cfg)
+        @require_role(UserRole.ADMIN)
+        async def some_admin_only_handler(request): ...
+
+        @_require_auth(cfg)
+        @require_role(UserRole.NURSE, UserRole.CARDIOLOGIST, UserRole.ADMIN)
+        async def clinical_staff_only_handler(request): ...
+
+    Returns 403 forbidden_role if the authenticated user's role is not in
+    allowed_roles. This is a separate, composable layer on top of auth —
+    @_require_auth confirms WHO the caller is, @require_role confirms
+    whether that role is ALLOWED to call this specific endpoint.
+    """
+    allowed_values = {r.value for r in allowed_roles}
+
+    def decorator(handler):
+        @_wraps(handler)
+        async def wrapper(request: _web.Request) -> _web.Response:
+            user = request.get("user")
+            if user is None:
+                # require_role used without _require_auth above it — programmer error
+                raise _web.HTTPUnauthorized(reason="Authentication required")
+            role = user.get("role")
+            if role not in allowed_values:
+                logger.warning(
+                    "[RBAC] forbidden: user_id=%s role=%s attempted endpoint requiring %s",
+                    user.get("sub"), role, sorted(allowed_values),
+                )
+                raise _web.HTTPForbidden(
+                    reason=f"This action requires one of: {', '.join(sorted(allowed_values))}"
+                )
+            return await handler(request)
+        return wrapper
+    return decorator
+
+
+# ── Vendor gateway authentication ──────────────────────────────────────────────
+#
+# Large/implanted device vendor gateways (Medtronic CareLink, Abbott
+# Merlin.net, Boston Scientific LATITUDE, etc.) authenticate with a
+# per-vendor API key in the X-Vendor-Api-Key header — NOT a patient/
+# clinician JWT. This is a machine-to-machine credential issued once per
+# vendor integration via POST /admin/vendor-keys.
+
+def _require_vendor_api_key(handler):
+    """
+    Decorator for POST /vendor-gateway/ingest. Verifies the X-Vendor-Api-Key
+    header against the vendor_api_keys table and attaches the resolved
+    vendor name to request["vendor"] for the handler to use.
+    """
+    @_wraps(handler)
+    async def wrapper(request: _web.Request) -> _web.Response:
+        api_key = request.headers.get("X-Vendor-Api-Key", "").strip()
+        if not api_key:
+            raise _web.HTTPUnauthorized(reason="Missing X-Vendor-Api-Key header")
+        vendor = await _db.verify_vendor_api_key(api_key)
+        if vendor is None:
+            logger.warning("[VendorGateway] invalid or inactive API key presented")
+            raise _web.HTTPUnauthorized(reason="Invalid or inactive vendor API key")
+        request["vendor"] = vendor
+        return await handler(request)
+    return wrapper
+
+
+# ── Vendor payload normalization ───────────────────────────────────────────────
+#
+# Each implant vendor has its own JSON shape. These functions translate a
+# vendor's raw payload into the SAME normalized frame shape that BLE devices
+# produce, so both paths feed identical data into DataAcquisitionAgent.
+#
+# Add a new function here (and a branch in normalize_vendor_payload) for
+# each additional vendor you integrate. Until a real vendor contract exists,
+# these implement a reasonable best-guess shape based on each vendor's
+# publicly documented data export formats — verify field names against the
+# actual gateway contract once you have one, and adjust here.
+
+def _normalize_medtronic_payload(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Best-guess normalizer for Medtronic CareLink-style exports.
+    Expected raw shape (adjust once you have a real CareLink contract):
+        {
+          "deviceSerialNumber": "...",
+          "heartRateBpm": 72,
+          "episodeType": "AF" | "VT" | "normal" | ...,
+          "recordedAt": "2026-01-01T00:00:00Z"
+        }
+    """
+    device_id = raw.get("deviceSerialNumber")
+    if not device_id:
+        return None
+    return {
+        "vendor_device_id": device_id,
+        "timestamp":        raw.get("recordedAt", _utcnow_iso()),
+        "data": {
+            "heart_rate": raw.get("heartRateBpm"),
+            "systolic":   raw.get("systolicBp"),
+            "diastolic":  raw.get("diastolicBp"),
+            "spo2":       raw.get("spo2Pct"),
+        },
+        "vendor_episode_type": raw.get("episodeType"),
+    }
+
+
+def _normalize_abbott_payload(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Best-guess normalizer for Abbott Merlin.net-style exports.
+    Expected raw shape (adjust once you have a real Merlin.net contract):
+        {
+          "implantId": "...",
+          "vitals": {"hr": 72, "spo2": 97},
+          "alertCode": "ATRIAL_FIB" | null,
+          "timestamp": "2026-01-01T00:00:00Z"
+        }
+    """
+    device_id = raw.get("implantId")
+    if not device_id:
+        return None
+    vitals = raw.get("vitals", {})
+    return {
+        "vendor_device_id": device_id,
+        "timestamp":        raw.get("timestamp", _utcnow_iso()),
+        "data": {
+            "heart_rate": vitals.get("hr"),
+            "systolic":   vitals.get("systolic"),
+            "diastolic":  vitals.get("diastolic"),
+            "spo2":       vitals.get("spo2"),
+        },
+        "vendor_episode_type": raw.get("alertCode"),
+    }
+
+
+def _normalize_boston_scientific_payload(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Best-guess normalizer for Boston Scientific LATITUDE-style exports.
+    Expected raw shape (adjust once you have a real LATITUDE contract):
+        {
+          "device_id": "...",
+          "measurements": {"heart_rate_bpm": 72, "spo2_percent": 97},
+          "event": "normal" | "vt_detected" | ...,
+          "event_time": "2026-01-01T00:00:00Z"
+        }
+    """
+    device_id = raw.get("device_id")
+    if not device_id:
+        return None
+    m = raw.get("measurements", {})
+    return {
+        "vendor_device_id": device_id,
+        "timestamp":        raw.get("event_time", _utcnow_iso()),
+        "data": {
+            "heart_rate": m.get("heart_rate_bpm"),
+            "systolic":   m.get("systolic_bp"),
+            "diastolic":  m.get("diastolic_bp"),
+            "spo2":       m.get("spo2_percent"),
+        },
+        "vendor_episode_type": raw.get("event"),
+    }
+
+
+_VENDOR_NORMALIZERS: Dict[str, Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = {
+    "medtronic":         _normalize_medtronic_payload,
+    "abbott":             _normalize_abbott_payload,
+    "boston_scientific":  _normalize_boston_scientific_payload,
+}
+
+
+def normalize_vendor_payload(vendor: str, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Dispatch to the correct per-vendor normalizer. Returns None if the
+    vendor is unrecognized or the payload is missing its device identifier
+    — callers should treat None as "send to dead-letter, do not crash".
+    """
+    normalizer = _VENDOR_NORMALIZERS.get(vendor)
+    if normalizer is None:
+        logger.warning("[VendorGateway] no normalizer registered for vendor=%s", vendor)
+        return None
+    try:
+        return normalizer(raw)
+    except Exception as exc:
+        logger.error("[VendorGateway] normalization error for vendor=%s: %s", vendor, exc)
+        return None
+
+
+async def _consume_vendor_event(bridge: "IoMTCardioAIBridge", event: Dict[str, Any]) -> None:
+    """
+    Kafka consumer callback — receives a NORMALIZED vendor event and feeds
+    it into the exact same 7-agent pipeline entry points that BLE devices
+    use (DataAcquisitionAgent.register_device / stream_data), so pattern
+    recognition, diagnosis, and alerting work identically regardless of
+    which path the data arrived through.
+    """
+    vendor_device_id = event.get("vendor_device_id")
+    if not vendor_device_id:
+        return
+
+    large_device = await _db.get_large_device_by_vendor_id(vendor_device_id)
+    if large_device is None or not large_device.is_active:
+        logger.warning(
+            "[VendorGateway] event for unregistered/inactive device=%s — dropped",
+            vendor_device_id,
+        )
+        return
+
+    acq_agent = bridge.system.agents["acquisition"]
+
+    # Register (idempotent — re-registering an already-known device_id is
+    # harmless, register_device() just overwrites its own entry)
+    await acq_agent.register_device(
+        device_id   = vendor_device_id,
+        device_type = large_device.device_type,
+        patient_id  = large_device.patient_id,
+    )
+
+    await acq_agent.stream_data(vendor_device_id, {
+        "device_id":  vendor_device_id,
+        "patient_id": large_device.patient_id,
+        "data":       event.get("data", {}),
+    })
+
+    await _db.touch_large_device_last_event(vendor_device_id)
+
+
 # ── HTTP API factory ───────────────────────────────────────────────────────────
 
 def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
@@ -2138,10 +2283,12 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             )
 
         # ── Load user ─────────────────────────────────────────────────────
-        user = _load_user_by_email(email)
+        user = await _load_user_by_email(email)
         if user is None:
             # Return the same error as wrong password — prevents user enumeration
             logger.warning("[Auth] unknown email=%s IP=%s", email, client_ip)
+            await _db.log_event("login_failed", ip_address=client_ip,
+                                detail=f"unknown email: {email}")
             return _web.json_response(
                 {"error": "invalid_credentials",
                  "message": "Email or password is incorrect"},
@@ -2151,6 +2298,8 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         # ── Account active check ──────────────────────────────────────────
         if not user.is_active:
             logger.warning("[Auth] disabled account email=%s", email)
+            await _db.log_event("login_failed", user_id=user.id, ip_address=client_ip,
+                                detail="account disabled")
             return _web.json_response(
                 {"error": "account_disabled",
                  "message": "Your account has been disabled. Contact your administrator."},
@@ -2160,6 +2309,8 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         # ── Password verification (bcrypt, constant-time) ─────────────────
         if not user.verify_password(password):
             logger.warning("[Auth] wrong password email=%s IP=%s", email, client_ip)
+            await _db.log_event("login_failed", user_id=user.id, ip_address=client_ip,
+                                detail="wrong password")
             return _web.json_response(
                 {"error": "invalid_credentials",
                  "message": "Email or password is incorrect"},
@@ -2187,7 +2338,9 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         # ── Issue tokens ──────────────────────────────────────────────────
         _AUTH_RATE_LIMITER.reset(client_ip)   # successful login resets counter
         access_token  = _issue_access_token(user, cfg)
-        refresh_token = _REFRESH_STORE.issue(user.id, cfg.refresh_token_ttl)
+        refresh_token = await _db.issue_refresh_token(user.id, cfg.refresh_token_ttl)
+        await _db.update_last_login(user.id)
+        await _db.log_event("login_success", user_id=user.id, ip_address=client_ip)
 
         logger.info(
             "[Auth] login successful email=%s role=%s IP=%s",
@@ -2253,8 +2406,8 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
                 status=400,
             )
 
-        # consume() validates, removes the token, and returns user_id
-        user_id = _REFRESH_STORE.consume(token_id)
+        # consume() validates, deletes the token row, and returns user_id
+        user_id = await _db.consume_refresh_token(token_id)
 
         if user_id is None:
             logger.warning("[Auth] invalid or expired refresh token")
@@ -2265,10 +2418,7 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             )
 
         # Re-load the user to pick up any role/status changes since last login
-        user = next(
-            (u for u in _STUB_USERS.values() if u.id == user_id),
-            None,
-        )
+        user = await _load_user_by_id(user_id)
         if user is None or not user.is_active:
             return _web.json_response(
                 {"error": "user_not_found",
@@ -2278,7 +2428,7 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
         # Issue rotated tokens
         new_access  = _issue_access_token(user, cfg)
-        new_refresh = _REFRESH_STORE.issue(user.id, cfg.refresh_token_ttl)
+        new_refresh = await _db.issue_refresh_token(user.id, cfg.refresh_token_ttl)
 
         logger.info("[Auth] token refreshed user_id=%s", user_id)
 
@@ -2298,7 +2448,7 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         The client is responsible for discarding the access token locally.
         """
         user_payload = request["user"]
-        revoked = _REFRESH_STORE.revoke_all_for_user(user_payload["sub"])
+        revoked = await _db.revoke_all_refresh_tokens(user_payload["sub"])
         logger.info("[Auth] logout user_id=%s revoked=%d", user_payload["sub"], revoked)
         return _web.json_response(
             {"message": "Signed out successfully", "tokens_revoked": revoked}
@@ -2415,6 +2565,174 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             store = [r for r in store if r.get("patient_id") == pid]
 
         return _web.json_response(store[-50:])  # last 50 reports
+
+    # ── GET /admin/users ─────────────────────────────────────────────────
+    #
+    # Admin-only: list all user accounts. Supports ?role=nurse filtering
+    # and ?limit=N&offset=N pagination.
+
+    @_require_auth(cfg)
+    @require_role(UserRole.ADMIN)
+    async def admin_list_users(request: _web.Request) -> _web.Response:
+        role_filter = request.query.get("role")
+        limit  = min(int(request.query.get("limit",  "100")), 500)
+        offset = max(int(request.query.get("offset", "0")), 0)
+
+        role_enum = None
+        if role_filter:
+            try:
+                role_enum = UserRole(role_filter)
+            except ValueError:
+                return _web.json_response(
+                    {"error": "invalid_role",
+                     "message": f"'{role_filter}' is not a valid role"},
+                    status=400,
+                )
+
+        users = await _db.list_users(role=role_enum, limit=limit, offset=offset)
+        return _web.json_response([
+            {
+                "id":         u.id,
+                "email":      u.email,
+                "name":       u.name,
+                "role":       u.role.value,
+                "patient_id": u.patient_id,
+                "is_active":  u.is_active,
+            }
+            for u in users
+        ])
+
+    # ── POST /admin/users ────────────────────────────────────────────────
+    #
+    # Admin-only: create a new nurse / cardiologist / admin account.
+    # Patient accounts are never created here — they are auto-provisioned
+    # via /auth/apple on first sign-in.
+
+    @_require_auth(cfg)
+    @require_role(UserRole.ADMIN)
+    async def admin_create_user(request: _web.Request) -> _web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        email    = (body.get("email")    or "").strip().lower()
+        name     = (body.get("name")     or "").strip()
+        password = (body.get("password") or "").strip()
+        role_str = (body.get("role")     or "").strip()
+
+        if not email or not name or not password or not role_str:
+            return _web.json_response(
+                {"error": "missing_fields",
+                 "message": "email, name, password, and role are all required"},
+                status=400,
+            )
+
+        try:
+            role = UserRole(role_str)
+        except ValueError:
+            return _web.json_response(
+                {"error": "invalid_role",
+                 "message": f"'{role_str}' must be one of: nurse, cardiologist, admin"},
+                status=400,
+            )
+
+        if role == UserRole.PATIENT:
+            return _web.json_response(
+                {"error": "invalid_role",
+                 "message": "Patient accounts are created via Sign in with Apple, not this endpoint"},
+                status=400,
+            )
+
+        if len(password) < 8:
+            return _web.json_response(
+                {"error": "weak_password",
+                 "message": "Password must be at least 8 characters"},
+                status=400,
+            )
+
+        existing = await _load_user_by_email(email)
+        if existing:
+            return _web.json_response(
+                {"error": "email_taken",
+                 "message": "An account with this email already exists"},
+                status=409,
+            )
+
+        password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(12)).decode()
+        new_user = await _db.create_staff_user(
+            email=email, name=name, role=role, password_hash=password_hash,
+        )
+
+        admin_user = request["user"]
+        await _db.log_event(
+            "user_created", user_id=admin_user.get("sub"),
+            detail=f"created {role.value} account: {email}",
+        )
+        logger.info("[Admin] user_id=%s created new %s account: %s",
+                    admin_user.get("sub"), role.value, email)
+
+        return _web.json_response({
+            "id": new_user.id, "email": new_user.email,
+            "name": new_user.name, "role": new_user.role.value,
+        }, status=201)
+
+    # ── PATCH /admin/users/{user_id} ─────────────────────────────────────
+    #
+    # Admin-only: enable/disable an account and/or change its role.
+    # Body: { "is_active": false } and/or { "role": "cardiologist" }
+
+    @_require_auth(cfg)
+    @require_role(UserRole.ADMIN)
+    async def admin_update_user(request: _web.Request) -> _web.Response:
+        target_user_id = request.match_info.get("user_id", "")
+
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        target = await _load_user_by_id(target_user_id)
+        if target is None:
+            return _web.json_response(
+                {"error": "user_not_found"}, status=404,
+            )
+
+        admin_user = request["user"]
+
+        if "is_active" in body:
+            new_active = bool(body["is_active"])
+            await _db.set_user_active(target_user_id, new_active)
+            await _db.log_event(
+                "account_disabled" if not new_active else "account_enabled",
+                user_id=admin_user.get("sub"),
+                detail=f"target={target.email}",
+            )
+            if not new_active:
+                # Disabling an account immediately revokes all of its sessions
+                await _db.revoke_all_refresh_tokens(target_user_id)
+
+        if "role" in body:
+            try:
+                new_role = UserRole(body["role"])
+            except ValueError:
+                return _web.json_response(
+                    {"error": "invalid_role"}, status=400,
+                )
+            await _db.set_user_role(target_user_id, new_role)
+            await _db.log_event(
+                "role_change", user_id=admin_user.get("sub"),
+                detail=f"target={target.email} new_role={new_role.value}",
+            )
+            logger.info("[Admin] user_id=%s changed role of %s to %s",
+                        admin_user.get("sub"), target.email, new_role.value)
+
+        updated = await _load_user_by_id(target_user_id)
+        return _web.json_response({
+            "id": updated.id, "email": updated.email,
+            "name": updated.name, "role": updated.role.value,
+            "is_active": updated.is_active,
+        })
 
 
     # ── POST /auth/apple ──────────────────────────────────────────────────
@@ -2581,10 +2899,10 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             display_name = apple_email.split("@")[0].replace(".", " ").title()
 
         # ── Load or create patient record ──────────────────────────────────
-        # First: try to find an existing user by Apple user ID or email
+        # First: try to find an existing user by Apple user ID, then by email
         existing_user = (
-            next((u for u in _STUB_USERS.values() if u.id == apple_user_id), None)
-            or _load_user_by_email(apple_email)
+            await _db.get_user_by_apple_id(apple_user_id)
+            or await _load_user_by_email(apple_email)
         )
 
         if existing_user:
@@ -2596,20 +2914,12 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
                     status=403,
                 )
         else:
-            # First-ever sign-in — auto-provision a patient account
-            user = HospitalUser(
-                id            = apple_user_id,
+            # First-ever sign-in — auto-provision a patient account in Postgres
+            user = await _db.create_patient_from_apple(
+                apple_user_id = apple_user_id,
                 email         = apple_email,
                 name          = display_name,
-                role          = UserRole.PATIENT,
-                patient_id    = apple_user_id,   # use Apple user ID as patient ID
-                password_hash = "",              # no password — auth is via Apple
-                is_active     = True,
-                mfa_secret    = None,
             )
-            # Register in the stub store so future requests find this user
-            # In production: INSERT INTO users (...) or upsert via LDAP
-            _STUB_USERS[apple_email] = user
             logger.info(
                 "[AppleAuth] auto-provisioned patient apple_id=%s email=%s",
                 apple_user_id[:12], apple_email,
@@ -2618,7 +2928,10 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         # ── Issue tokens ───────────────────────────────────────────────────
         _AUTH_RATE_LIMITER.reset(client_ip)
         access_token  = _issue_access_token(user, cfg)
-        refresh_token = _REFRESH_STORE.issue(user.id, cfg.refresh_token_ttl)
+        refresh_token = await _db.issue_refresh_token(user.id, cfg.refresh_token_ttl)
+        await _db.update_last_login(user.id)
+        await _db.log_event("login_success", user_id=user.id, ip_address=client_ip,
+                            detail="apple_signin")
 
         logger.info(
             "[AppleAuth] sign-in successful apple_id=%s role=%s IP=%s",
@@ -2734,6 +3047,277 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             "status":     "registered",
         })
 
+    # ── POST /clinical/devices/register-implant ─────────────────────────
+    #
+    # Clinical staff ONLY — registers a pacemaker/ICD/other large implanted
+    # device against a patient. This is a SEPARATE path from BLE pairing
+    # above: implants are placed and registered by clinicians (at the
+    # hospital, or during a home follow-up visit), never self-paired by
+    # the patient. A patient can have BOTH a registered implant here AND
+    # a self-paired BLE wearable from the endpoint above — the two are
+    # independent and both stay active simultaneously.
+
+    @_require_auth(cfg)
+    @require_role(UserRole.NURSE, UserRole.CARDIOLOGIST, UserRole.ADMIN)
+    async def register_implant(request: _web.Request) -> _web.Response:
+        """
+        Register an implanted/large device against a patient.
+
+        Request body (JSON)
+        -------------------
+        {
+          "vendor_device_id": "MDT-SN-00123456",   # required — vendor's serial/ID
+          "vendor":            "medtronic",          # required — medtronic | abbott |
+                                                       #   boston_scientific | biotronik | other
+          "device_type":        "pacemaker",          # required — pacemaker | icd | crt_d |
+                                                       #   crt_p | implantable_loop_recorder | other
+          "patient_id":         "PT_12345",           # required
+          "model_number":       "Azure XT DR MRI",    # optional
+          "implanted_at":       "2026-01-15",         # optional, YYYY-MM-DD
+          "notes":              "Implanted post-MI"   # optional
+        }
+
+        Success (201)
+        -------------
+        {
+          "id": "<uuid>", "vendor_device_id": "...", "vendor": "...",
+          "device_type": "...", "patient_id": "...", "is_active": true
+        }
+
+        Errors
+        ------
+        400  missing_fields | invalid_vendor | invalid_device_type
+        409  already_registered  (vendor_device_id already in use)
+        """
+        user = request["user"]
+
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        vendor_device_id = (body.get("vendor_device_id") or "").strip()
+        vendor            = (body.get("vendor")            or "").strip().lower()
+        device_type       = (body.get("device_type")       or "").strip().lower()
+        patient_id        = (body.get("patient_id")        or "").strip()
+        model_number      = (body.get("model_number")      or "").strip() or None
+        implanted_at      = (body.get("implanted_at")       or "").strip() or None
+        notes             = (body.get("notes")              or "").strip() or None
+
+        if not vendor_device_id or not vendor or not device_type or not patient_id:
+            return _web.json_response(
+                {"error": "missing_fields",
+                 "message": "vendor_device_id, vendor, device_type, and patient_id are all required"},
+                status=400,
+            )
+
+        valid_vendors = {"medtronic", "abbott", "boston_scientific", "biotronik", "other"}
+        if vendor not in valid_vendors:
+            return _web.json_response(
+                {"error": "invalid_vendor",
+                 "message": f"vendor must be one of: {', '.join(sorted(valid_vendors))}"},
+                status=400,
+            )
+
+        valid_types = {"pacemaker", "icd", "crt_d", "crt_p",
+                       "implantable_loop_recorder", "other"}
+        if device_type not in valid_types:
+            return _web.json_response(
+                {"error": "invalid_device_type",
+                 "message": f"device_type must be one of: {', '.join(sorted(valid_types))}"},
+                status=400,
+            )
+
+        existing = await _db.get_large_device_by_vendor_id(vendor_device_id)
+        if existing is not None and existing.is_active:
+            return _web.json_response(
+                {"error": "already_registered",
+                 "message": f"Device {vendor_device_id} is already registered"},
+                status=409,
+            )
+
+        large_device = await _db.register_large_device(
+            vendor_device_id        = vendor_device_id,
+            vendor                   = vendor,
+            device_type              = device_type,
+            patient_id                = patient_id,
+            model_number              = model_number,
+            implanted_at               = implanted_at,
+            implanting_clinician_id    = user.get("sub"),
+            registered_by_user_id      = user.get("sub"),
+            notes                       = notes,
+        )
+
+        await _db.log_event(
+            "implant_registered", user_id=user.get("sub"),
+            detail=f"vendor={vendor} device={vendor_device_id} patient={patient_id}",
+        )
+        logger.info(
+            "[Implant] clinician=%s registered %s device=%s for patient=%s",
+            user.get("sub"), vendor, vendor_device_id, patient_id,
+        )
+
+        return _web.json_response({
+            "id":               large_device.id,
+            "vendor_device_id": large_device.vendor_device_id,
+            "vendor":           large_device.vendor,
+            "device_type":      large_device.device_type,
+            "patient_id":       large_device.patient_id,
+            "is_active":        large_device.is_active,
+        }, status=201)
+
+    # ── GET /clinical/devices/implants ───────────────────────────────────
+    #
+    # Clinical staff: list registered implants, optionally filtered by
+    # patient. Patients can also call this to see their OWN implants only.
+
+    @_require_auth(cfg)
+    async def list_implants(request: _web.Request) -> _web.Response:
+        user       = request["user"]
+        patient_id = request.query.get("patient_id")
+        vendor      = request.query.get("vendor")
+
+        # Patients may only see their own implants
+        if user.get("role") == UserRole.PATIENT.value:
+            patient_id = user.get("patient_id") or user.get("sub")
+
+        devices = await _db.list_large_devices(patient_id=patient_id, vendor=vendor)
+        return _web.json_response([
+            {
+                "id":               d.id,
+                "vendor_device_id": d.vendor_device_id,
+                "vendor":           d.vendor,
+                "device_type":      d.device_type,
+                "model_number":     d.model_number,
+                "patient_id":       d.patient_id,
+                "implanted_at":     d.implanted_at,
+                "is_active":        d.is_active,
+                "last_event_at":    d.last_event_at,
+            }
+            for d in devices
+        ])
+
+    # ── POST /vendor-gateway/ingest ──────────────────────────────────────
+    #
+    # Called by a vendor's cloud gateway (Medtronic CareLink, Abbott
+    # Merlin.net, Boston Scientific LATITUDE, etc.) — NOT by the iOS app,
+    # NOT by a clinician. Authenticated via X-Vendor-Api-Key, not a JWT.
+    #
+    # Every raw payload is logged to vendor_events_raw regardless of
+    # outcome, normalized into the same frame shape BLE devices use, then
+    # published to Kafka topic "iomt.vendor.raw" for the consumer to pick
+    # up and feed into the 7-agent pipeline asynchronously. This endpoint
+    # returns immediately after publishing — it does NOT wait for pipeline
+    # processing, so a vendor pushing thousands of events per minute never
+    # gets backpressure from clinical AI processing time.
+
+    @_require_vendor_api_key
+    async def vendor_gateway_ingest(request: _web.Request) -> _web.Response:
+        vendor = request["vendor"]
+
+        try:
+            raw_payload = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        normalized = normalize_vendor_payload(vendor, raw_payload)
+        vendor_device_id = normalized.get("vendor_device_id") if normalized else \
+                           raw_payload.get("deviceSerialNumber") or \
+                           raw_payload.get("implantId") or \
+                           raw_payload.get("device_id")
+
+        large_device = None
+        if vendor_device_id:
+            large_device = await _db.get_large_device_by_vendor_id(vendor_device_id)
+
+        matched = large_device is not None and large_device.is_active
+
+        await _db.log_vendor_event(
+            vendor            = vendor,
+            raw_payload        = raw_payload,
+            vendor_device_id   = vendor_device_id,
+            large_device_id    = large_device.id if large_device else None,
+            matched             = matched,
+            kafka_published     = bool(normalized and matched),
+        )
+
+        if normalized is None:
+            logger.warning("[VendorGateway] vendor=%s payload failed normalization", vendor)
+            await _kafka_producer.publish(
+                TOPIC_VENDOR_DEADLETTER, key=vendor_device_id or "unknown",
+                value={"vendor": vendor, "raw": raw_payload, "reason": "normalization_failed"},
+            )
+            return _web.json_response(
+                {"error": "normalization_failed",
+                 "message": "Payload could not be normalized for this vendor"},
+                status=422,
+            )
+
+        if not matched:
+            logger.warning(
+                "[VendorGateway] vendor=%s device=%s not registered or inactive — dead-lettered",
+                vendor, vendor_device_id,
+            )
+            await _kafka_producer.publish(
+                TOPIC_VENDOR_DEADLETTER, key=vendor_device_id or "unknown",
+                value={"vendor": vendor, "raw": raw_payload, "reason": "device_not_registered"},
+            )
+            return _web.json_response(
+                {"error": "device_not_registered",
+                 "message": f"Device {vendor_device_id} is not registered or is inactive. "
+                            "A clinician must register it via POST /clinical/devices/register-implant first."},
+                status=404,
+            )
+
+        await _kafka_producer.publish(
+            TOPIC_VENDOR_RAW, key=vendor_device_id, value=normalized,
+        )
+
+        return _web.json_response({"status": "accepted"}, status=202)
+
+    # ── POST /admin/vendor-keys ───────────────────────────────────────────
+    #
+    # Admin-only: generate a new vendor API key. The raw key is returned
+    # EXACTLY ONCE in this response — it is never recoverable afterward,
+    # only its hash is stored. Hand this value to the vendor's integration
+    # team to configure in their gateway.
+
+    @_require_auth(cfg)
+    @require_role(UserRole.ADMIN)
+    async def admin_create_vendor_key(request: _web.Request) -> _web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        vendor = (body.get("vendor") or "").strip().lower()
+        label  = (body.get("label")  or "").strip()
+
+        valid_vendors = {"medtronic", "abbott", "boston_scientific", "biotronik", "other"}
+        if vendor not in valid_vendors:
+            return _web.json_response(
+                {"error": "invalid_vendor",
+                 "message": f"vendor must be one of: {', '.join(sorted(valid_vendors))}"},
+                status=400,
+            )
+
+        raw_key, key_id = await _db.create_vendor_api_key(vendor=vendor, label=label)
+
+        admin_user = request["user"]
+        await _db.log_event(
+            "vendor_key_created", user_id=admin_user.get("sub"),
+            detail=f"vendor={vendor} key_id={key_id}",
+        )
+        logger.info("[Admin] user_id=%s created vendor API key for vendor=%s",
+                    admin_user.get("sub"), vendor)
+
+        return _web.json_response({
+            "key_id":  key_id,
+            "vendor":  vendor,
+            "api_key": raw_key,
+            "warning": "This key is shown only once and cannot be recovered. Store it securely now.",
+        }, status=201)
+
     # ── Register routes ───────────────────────────────────────────────────
 
     app.router.add_get( "/",                  root)
@@ -2742,11 +3326,18 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     app.router.add_post("/auth/refresh",      refresh)
     app.router.add_post("/auth/logout",       logout)
     app.router.add_post("/devices/register",  device_register)
+    app.router.add_post("/clinical/devices/register-implant", register_implant)
+    app.router.add_get( "/clinical/devices/implants",          list_implants)
+    app.router.add_post("/vendor-gateway/ingest",               vendor_gateway_ingest)
     app.router.add_get( "/health",            health)
     app.router.add_get( "/status",            full_status)
     app.router.add_get( "/devices",           devices)
     app.router.add_get( "/alerts",            alerts)
     app.router.add_get( "/reports",           reports)
+    app.router.add_get( "/admin/users",            admin_list_users)
+    app.router.add_post("/admin/users",            admin_create_user)
+    app.router.add_patch("/admin/users/{user_id}", admin_update_user)
+    app.router.add_post("/admin/vendor-keys",       admin_create_vendor_key)
 
     return app
 
@@ -2755,13 +3346,33 @@ async def start_http_api(
     bridge: "IoMTCardioAIBridge",
     host:   str = "0.0.0.0",
     port:   int = 8080,
-) -> "_web.AppRunner":
+) -> Tuple["_web.AppRunner", "KafkaEventConsumer"]:
     """
-    Start the HTTP API server and return the runner (call runner.cleanup() on shutdown).
+    Start the HTTP API server, the database pool, and the Kafka vendor-event
+    pipeline. Returns (runner, kafka_consumer) — pass both to stop_http_api()
+    on shutdown.
+
+    Connects to PostgreSQL before accepting any requests. If DATABASE_URL is
+    not set or the database is unreachable, this raises and the process exits
+    — auth cannot function without a real user store, so failing fast here
+    is preferable to silently falling back to an empty/broken state.
+
+    Kafka is optional: if KAFKA_BOOTSTRAP_SERVERS is not set, the producer
+    and consumer both fall back to an in-memory queue automatically (see
+    kafka_bus.py) so large-device ingestion still works end-to-end in local
+    development without a live Kafka cluster.
     """
-    # Initialise stub users (replace with DB/LDAP bootstrap in production)
-    global _STUB_USERS
-    _STUB_USERS = _make_stub_users()
+    await _db.connect()
+    logger.info("[API] PostgreSQL connection pool established")
+
+    await _kafka_producer.start()
+
+    kafka_consumer = KafkaEventConsumer(
+        producer = _kafka_producer,
+        on_event = lambda event: _consume_vendor_event(bridge, event),
+    )
+    await kafka_consumer.start()
+    logger.info("[API] Kafka vendor-event consumer started")
 
     app    = build_http_app(bridge)
     runner = _web.AppRunner(app)
@@ -2770,10 +3381,26 @@ async def start_http_api(
     await site.start()
     logger.info("[API] HTTP server listening on http://%s:%d", host, port)
     logger.info(
-        "[API] Routes: POST /auth/login  POST /auth/refresh  "
-        "POST /auth/logout  GET /health  GET /status  GET /devices  GET /alerts  GET /reports"
+        "[API] Routes: GET / POST /auth/apple POST /auth/login  POST /auth/refresh  "
+        "POST /auth/logout  GET /health  GET /status  GET /devices  GET /alerts  "
+        "GET /reports  POST /devices/register  POST /clinical/devices/register-implant  "
+        "GET /clinical/devices/implants  POST /vendor-gateway/ingest  "
+        "GET /admin/users  POST /admin/users  PATCH /admin/users/{id}  "
+        "POST /admin/vendor-keys"
     )
-    return runner
+    return runner, kafka_consumer
+
+
+async def stop_http_api(
+    runner:         "_web.AppRunner",
+    kafka_consumer: Optional["KafkaEventConsumer"] = None,
+) -> None:
+    """Clean up the HTTP API, Kafka, and the database pool."""
+    if kafka_consumer is not None:
+        await kafka_consumer.stop()
+    await _kafka_producer.stop()
+    await runner.cleanup()
+    await _db.disconnect()
 
 
 # ============================================================================
@@ -2853,12 +3480,13 @@ async def main() -> None:
             # Windows does not support loop.add_signal_handler
             pass
 
-    api_runner = None
+    api_runner     = None
+    kafka_consumer = None
 
     # ── Start HTTP API (auth + dashboard data endpoints) ───────────────────────
     # Render.com note: this binds to $PORT via CARDIOAI_API_PORT — see render.yaml
     if run_mode in ("all", "api"):
-        api_runner = await start_http_api(
+        api_runner, kafka_consumer = await start_http_api(
             bridge,
             host = cfg.api_host,
             port = cfg.api_port,
@@ -2890,7 +3518,7 @@ async def main() -> None:
     if run_mode in ("all", "bridge"):
         await bridge.stop()
     if api_runner is not None:
-        await api_runner.cleanup()
+        await stop_http_api(api_runner, kafka_consumer)
 
     # Final status snapshot
     logger.info("[Shutdown] final status: %s", json.dumps(bridge.status(), default=str))
