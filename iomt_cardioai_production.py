@@ -24,7 +24,8 @@ Architecture
                               ├── POST /auth/refresh  ← token refresh
                               ├── POST /auth/logout   ← revoke session
                               ├── POST /devices/register ← register BLE device
-                              ├── GET  /health        ← bridge status
+                              ├── GET  /health        ← liveness probe (no auth)
+                              ├── GET  /status        ← full bridge status (auth)
                               ├── GET  /devices       ← device registry
                               ├── GET  /alerts        ← active alerts
                               └── GET  /reports       ← clinical reports
@@ -2049,7 +2050,8 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     POST /auth/refresh      — rotate refresh token, issue new access token
     POST /auth/logout       — revoke all refresh tokens for user
     POST /devices/register  — register a paired BLE device (requires Bearer)
-    GET  /health            — bridge status (requires Bearer)
+    GET  /health            — liveness probe, NO auth required (for Render/LB checks)
+    GET  /status            — full bridge status (requires Bearer)
     GET  /devices           — device registry (requires Bearer)
     GET  /alerts            — active alerts   (requires Bearer)
     GET  /reports           — clinical reports (requires Bearer)
@@ -2303,9 +2305,34 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         )
 
     # ── GET /health ───────────────────────────────────────────────────────
+    #
+    # Deliberately UNAUTHENTICATED. This is an infrastructure liveness probe
+    # used by Render.com (and any other platform) to confirm the process is
+    # up and the event loop is responsive — it contains no patient data.
+    # Render's health checker cannot send a Bearer token, so requiring auth
+    # here causes every health check to fail with 401, which prevents the
+    # deploy from ever being marked "Live".
+    #
+    # If you want to restrict what this endpoint reveals in production,
+    # trim the fields returned below rather than adding @_require_auth.
+
+    async def health(request: _web.Request) -> _web.Response:
+        status = bridge.status()
+        return _web.json_response({
+            "status":     "ok",
+            "bridge_id":  status.get("bridge_id"),
+            "timestamp":  status.get("timestamp"),
+            "agent_count": status.get("agent_count"),
+        })
+
+    # ── GET /status ───────────────────────────────────────────────────────
+    #
+    # Full bridge status (queue depth, device registry, message bus count).
+    # This DOES require auth, since it reveals operational details about
+    # connected devices. Use this from the dashboard instead of /health.
 
     @_require_auth(cfg)
-    async def health(request: _web.Request) -> _web.Response:
+    async def full_status(request: _web.Request) -> _web.Response:
         return _web.json_response(bridge.status())
 
     # ── GET /devices ──────────────────────────────────────────────────────
@@ -2690,6 +2717,7 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     app.router.add_post("/auth/logout",       logout)
     app.router.add_post("/devices/register",  device_register)
     app.router.add_get( "/health",            health)
+    app.router.add_get( "/status",            full_status)
     app.router.add_get( "/devices",           devices)
     app.router.add_get( "/alerts",            alerts)
     app.router.add_get( "/reports",           reports)
@@ -2717,7 +2745,7 @@ async def start_http_api(
     logger.info("[API] HTTP server listening on http://%s:%d", host, port)
     logger.info(
         "[API] Routes: POST /auth/login  POST /auth/refresh  "
-        "POST /auth/logout  GET /health  GET /devices  GET /alerts  GET /reports"
+        "POST /auth/logout  GET /health  GET /status  GET /devices  GET /alerts  GET /reports"
     )
     return runner
 
