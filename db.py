@@ -65,6 +65,7 @@ class HospitalUser:
     role:          UserRole
     patient_id:    Optional[str]
     password_hash: str = field(repr=False)
+    organization:  str = ""
     apple_user_id: Optional[str] = None
     is_active:     bool = True
     mfa_secret:    Optional[str] = field(default=None, repr=False)
@@ -90,6 +91,7 @@ class HospitalUser:
             role          = UserRole(row["role"]),
             patient_id    = row["patient_id"],
             password_hash = row["password_hash"] or "",
+            organization  = row["organization"] if "organization" in row.keys() else "",
             apple_user_id = row["apple_user_id"],
             is_active     = row["is_active"],
             mfa_secret    = row["mfa_secret"],
@@ -236,16 +238,25 @@ class Database:
         name:          str,
         role:          UserRole,
         password_hash: str,
+        organization:  str = "",
+        is_active:     bool = True,
     ) -> HospitalUser:
-        """Admin-only: create a new nurse/cardiologist/admin account."""
+        """
+        Create a new nurse/cardiologist/admin account.
+
+        is_active=True  — admin-created accounts (POST /admin/users), active immediately.
+        is_active=False — self-registered accounts (POST /auth/signup), pending admin
+                          approval before they can sign in. An admin must call
+                          PATCH /admin/users/{id} with {"is_active": true} to activate.
+        """
         pool = self._require_pool()
         row = await pool.fetchrow(
             """
-            INSERT INTO users (email, name, role, password_hash, is_active)
-            VALUES ($1, $2, $3, $4, true)
+            INSERT INTO users (email, name, organization, role, password_hash, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *
             """,
-            email.lower().strip(), name, role.value, password_hash,
+            email.lower().strip(), name, organization, role.value, password_hash, is_active,
         )
         return HospitalUser.from_row(row)
 
