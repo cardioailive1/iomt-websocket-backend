@@ -50,11 +50,20 @@ services:
     plan: starter
     region: oregon
     branch: main
-    buildCommand: pip install -r requirements.txt
+    buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
     startCommand: python iomt_cardioai_production.py
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      # -- Python runtime version --------------------------------------------------
+      # Pinned to 3.11 — bcrypt==4.1.2 has guaranteed prebuilt manylinux wheels
+      # for this version. Render defaults to the latest available Python
+      # unless told otherwise, which may be newer than bcrypt has wheels for,
+      # forcing a from-source build (requires Rust) that fails on Render's
+      # default build image.
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
       # -- Run mode --------------------------------------------------------------
       # "all" = HTTP API + outbound bridge connector in one process (recommended
       # for a single Render service). Use "api" instead if you split the bridge
@@ -78,14 +87,12 @@ services:
       - key: IOMT_SERVER_ID
         value: iomt-hw-server-001
 
-      # -- HTTP API binding -- Render injects PORT, app reads CARDIOAI_API_PORT --
+      # -- HTTP API binding --------------------------------------------------------
+      # Render automatically injects a PORT environment variable into every
+      # web service — the app reads it directly (see api_port property in
+      # iomt_cardioai_production.py). No explicit CARDIOAI_API_PORT needed here.
       - key: CARDIOAI_API_HOST
         value: 0.0.0.0
-      - key: CARDIOAI_API_PORT
-        fromService:
-          type: web
-          name: cardioai-api
-          envVarKey: PORT
 
       # -- JWT / token configuration -----------------------------------------------
       - key: JWT_ALGORITHM
@@ -138,7 +145,7 @@ services:
   #   plan: starter
   #   region: oregon
   #   branch: main
-  #   buildCommand: pip install -r requirements.txt
+  #   buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
   #   startCommand: python iomt_cardioai_production.py
   #   autoDeploy: true
   #   envVars:
