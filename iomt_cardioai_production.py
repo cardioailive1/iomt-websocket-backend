@@ -149,7 +149,41 @@ from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 
 # Real PostgreSQL-backed user/token/audit store — replaces the in-memory
 # stub dict. See db.py and migrations/001_create_users.sql.
-from db import Database, HospitalUser, UserRole as DBUserRole, LargeDevice  # noqa: E402
+try:
+    from db import Database, HospitalUser, UserRole as DBUserRole, LargeDevice  # noqa: E402
+except ImportError as _db_import_err:
+    import subprocess as _subprocess
+    print("=" * 78, file=sys.stderr)
+    print("FATAL: 'from db import ...' failed at startup.", file=sys.stderr)
+    print(f"Original error: {_db_import_err}", file=sys.stderr)
+    print("-" * 78, file=sys.stderr)
+    print(f"sys.executable : {sys.executable}", file=sys.stderr)
+    print(f"sys.version    : {sys.version}", file=sys.stderr)
+    print(f"sys.path       :", file=sys.stderr)
+    for _p in sys.path:
+        print(f"    {_p}", file=sys.stderr)
+    print("-" * 78, file=sys.stderr)
+    try:
+        _freeze = _subprocess.run(
+            [sys.executable, "-m", "pip", "list"],
+            capture_output=True, text=True, timeout=15,
+        )
+        print("Installed packages (pip list):", file=sys.stderr)
+        print(_freeze.stdout, file=sys.stderr)
+        if _freeze.stderr:
+            print("pip list stderr:", _freeze.stderr, file=sys.stderr)
+    except Exception as _diag_err:
+        print(f"Could not run pip list: {_diag_err}", file=sys.stderr)
+    print("-" * 78, file=sys.stderr)
+    try:
+        import os as _os
+        cwd = _os.getcwd()
+        print(f"Current working directory: {cwd}", file=sys.stderr)
+        print(f"Files in cwd: {sorted(_os.listdir(cwd))}", file=sys.stderr)
+    except Exception as _diag_err:
+        print(f"Could not list cwd: {_diag_err}", file=sys.stderr)
+    print("=" * 78, file=sys.stderr)
+    raise
 from kafka_bus import (  # noqa: E402
     KafkaEventProducer, KafkaEventConsumer,
     TOPIC_VENDOR_RAW, TOPIC_VENDOR_DEADLETTER,
