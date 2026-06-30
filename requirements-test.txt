@@ -1,6 +1,13 @@
-pytest>=8.0
-pytest-asyncio>=0.23
+# requirements.txt
+# IoMT CardioAI Production Backend — Python dependencies
+# Install: pip install -r requirements.txt
+
 websockets>=12.0
-aiohttp>=3.9.0
-PyJWT>=2.8.0
-numpy>=1.26.0
+aiohttp>=3.9
+pyjwt>=2.8
+numpy>=1.26
+bcrypt>=4.1
+
+# Optional — only required if APPLE_VERIFY_TOKENS=true (production Apple Sign In)
+python-jose[cryptography]>=3.3
+httpx>=0.27
