@@ -7,6 +7,17 @@ aiohttp>=3.9
 pyjwt>=2.8
 numpy>=1.26
 
+# PostgreSQL async driver — backs the real users / refresh_tokens / audit_log
+# tables in db.py. Replaces the old in-memory stub user store.
+asyncpg>=0.29
+
+# Kafka client for the large/implanted device vendor gateway pipeline
+# (kafka_bus.py). The import is lazy — if KAFKA_BOOTSTRAP_SERVERS is unset,
+# aiokafka is never actually imported and the app uses an in-memory
+# fallback queue instead. Still listed here as a hard dependency since any
+# real production deployment with real vendor integrations needs it.
+aiokafka>=0.10
+
 # Pinned exact version — bcrypt ships prebuilt wheels (manylinux) for this
 # version across Python 3.8–3.12. Using >=4.1 can resolve to a newer release
 # that lacks a prebuilt wheel for Render's build image, forcing a from-source
