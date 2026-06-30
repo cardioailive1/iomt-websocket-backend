@@ -20,6 +20,8 @@
 }
 html,body{height:100%;overflow:hidden}
 body{font-family:var(--font);background:var(--bg);color:var(--text)}
+#appShell{display:none;flex-direction:column;height:100vh;width:100%}
+#appShell.unlocked{display:flex}
 body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(64,184,248,.006) 3px,rgba(64,184,248,.006) 4px);pointer-events:none;z-index:9999}
 .topbar{flex-shrink:0;height:52px;background:var(--bg1);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 20px;gap:0;position:relative;z-index:100}
 .logo{font-size:.95rem;font-weight:700;color:#C8DCF0;letter-spacing:-.02em;white-space:nowrap;margin-right:28px}
@@ -198,7 +200,7 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
 .bus-lbl{position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:.55rem;color:var(--muted);z-index:2}
 .bus-pkt{position:absolute;height:18px;min-width:36px;border-radius:2px;top:50%;transform:translateY(-50%);font-size:.5rem;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:500;animation:busf 2.5s linear infinite}
 @keyframes busf{from{left:-60px}to{left:110%}}
-.cfg-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center}
+.cfg-ov{display:none;position:fixed;inset:0;background:rgba(10,22,40,.82);z-index:1000;align-items:center;justify-content:center}
 .cfg-ov.open{display:flex}
 .cfg-box{background:var(--bg2);border:1px solid var(--border2);border-radius:12px;padding:28px;width:400px;max-width:calc(100vw - 40px)}
 .cfg-box h3{font-size:.95rem;font-weight:700;color:#fff;margin-bottom:4px}
@@ -221,6 +223,18 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
 </style>
 </head>
 <body style="display:flex;flex-direction:column;height:100vh">
+
+<!-- ============================================================
+     APP SHELL — the entire live dashboard (topbar, all tabs,
+     all data views). Hidden by default via CSS (#appShell{display:none}
+     defined in <style> above) — NOT just covered by an overlay.
+     JavaScript only ever sets this to display:flex after a real,
+     backend-verified successful sign-in. Nothing inside here is
+     reachable by scrolling, DOM inspection of layout, or any other
+     means while signed out, because the browser never lays it out
+     at all until this container's display is changed.
+     ============================================================ -->
+<div id="appShell">
 
 <div class="topbar">
   <div class="logo">IoMT <span>CardioAI</span></div>
@@ -554,21 +568,77 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
   <div class="g-main" id="ts-panel"></div>
 </div>
 
+</div> <!-- /#appShell -->
+
+<!-- LOGIN / SIGNUP OVERLAY -->
+<div class="cfg-ov" id="loginOv">
+  <div class="cfg-box" id="loginBox">
+
+    <!-- SIGN IN VIEW -->
+    <div id="signinView">
+      <h3>Sign in to CardioAI</h3>
+      <p class="cfg-sub">Sign in with your hospital email and password to access the live dashboard.</p>
+      <div class="cfg-f"><label class="cfg-lbl">Backend URL</label><input class="cfg-input" id="loginUrl" placeholder="https://cardioai-api-lmy5.onrender.com" /></div>
+      <div class="cfg-f"><label class="cfg-lbl">Email</label><input class="cfg-input" id="loginEmail" placeholder="cardio@hospital.local" /></div>
+      <div class="cfg-f"><label class="cfg-lbl">Password</label><input class="cfg-input" id="loginPass" type="password" placeholder="••••••••" /></div>
+      <div id="loginError" style="display:none;color:var(--red);font-size:.65rem;margin-bottom:8px"></div>
+      <div class="cfg-row"><button class="cfg-p" id="loginBtn" onclick="doLogin()">Sign In</button></div>
+      <p class="cfg-sub" style="margin-top:14px;margin-bottom:0;text-align:center">
+        No account yet? <a href="#" onclick="showSignup();return false;" style="color:var(--green)">Create one</a>
+      </p>
+    </div>
+
+    <!-- SIGN UP VIEW -->
+    <div id="signupView" style="display:none">
+      <h3>Request a clinical staff account</h3>
+      <p class="cfg-sub">New accounts require administrator approval before you can sign in. You'll be notified once approved.</p>
+      <div class="cfg-f"><label class="cfg-lbl">Backend URL</label><input class="cfg-input" id="signupUrl" placeholder="https://cardioai-api-lmy5.onrender.com" /></div>
+      <div class="cfg-f"><label class="cfg-lbl">Full Name</label><input class="cfg-input" id="signupName" placeholder="Dr. Jane Smith" /></div>
+      <div class="cfg-f"><label class="cfg-lbl">Organization / Hospital Name</label><input class="cfg-input" id="signupOrg" placeholder="St. Mary's Medical Center" /></div>
+      <div class="cfg-f"><label class="cfg-lbl">Hospital Email</label><input class="cfg-input" id="signupEmail" placeholder="jane.smith@hospital.local" /></div>
+      <div class="cfg-f"><label class="cfg-lbl">Password (min 8 characters)</label><input class="cfg-input" id="signupPass" type="password" placeholder="••••••••" /></div>
+      <div class="cfg-f">
+        <label class="cfg-lbl">Role</label>
+        <select class="cfg-input" id="signupRole" style="font-family:var(--font)">
+          <option value="nurse">Nurse</option>
+          <option value="cardiologist">Cardiologist</option>
+          <option value="admin">Administrator</option>
+        </select>
+      </div>
+      <div id="signupError" style="display:none;color:var(--red);font-size:.65rem;margin-bottom:8px"></div>
+      <div id="signupSuccess" style="display:none;color:var(--green);font-size:.65rem;margin-bottom:8px"></div>
+      <div class="cfg-row"><button class="cfg-p" id="signupBtn" onclick="doSignup()">Request Account</button></div>
+      <p class="cfg-sub" style="margin-top:14px;margin-bottom:0;text-align:center">
+        Already have an account? <a href="#" onclick="showSignin();return false;" style="color:var(--green)">Sign in</a>
+      </p>
+    </div>
+
+  </div>
+</div>
+
 <!-- CONFIG OVERLAY -->
 <div class="cfg-ov" id="cfgOv" onclick="maybeCfgClose(event)">
   <div class="cfg-box">
     <h3>Backend configuration</h3>
-    <p class="cfg-sub">Connect to your live CardioAI backend. Polls /status, /devices, /alerts every 5 s.</p>
-    <div class="cfg-f"><label class="cfg-lbl">API Base URL</label><input class="cfg-input" id="cfgUrl" placeholder="https://cardioai.hospital.local/api" /></div>
-    <div class="cfg-f"><label class="cfg-lbl">Bearer token (from /auth/login)</label><input class="cfg-input" id="cfgTok" type="password" placeholder="eyJhbGciOiJIUzI1NiIs..." /></div>
+    <p class="cfg-sub">Polls /status, /devices, /alerts every 5 s. Sign out and back in to change accounts.</p>
+    <div class="cfg-f"><label class="cfg-lbl">API Base URL</label><input class="cfg-input" id="cfgUrl" placeholder="https://cardioai-api-lmy5.onrender.com" disabled /></div>
     <div class="cfg-f"><label class="cfg-lbl">Poll interval (seconds)</label><input class="cfg-input" id="cfgInt" type="number" min="2" max="60" value="5" /></div>
-    <div class="cfg-row"><button class="cfg-p" onclick="applyCfg()">Connect</button><button class="cfg-s" onclick="closeCfg()">Cancel</button></div>
+    <div class="cfg-row"><button class="cfg-p" onclick="applyCfg()">Save</button><button class="cfg-s" onclick="closeCfg()">Cancel</button></div>
+    <div class="cfg-row"><button class="cfg-s" style="color:var(--red)" onclick="doLogout()">Sign Out</button></div>
   </div>
 </div>
 
 <script>
 const SUITE_DATA = [{"id": "TestDataModels", "label": "Data Models", "passed": 5, "failed": 0, "tests": [{"suite": "TestDataModels", "name": "test_device_data_default_quality", "status": "PASSED", "pct": 0}, {"suite": "TestDataModels", "name": "test_alert_notified_parties_starts_empty", "status": "PASSED", "pct": 1}, {"suite": "TestDataModels", "name": "test_device_type_enum_values", "status": "PASSED", "pct": 1}, {"suite": "TestDataModels", "name": "test_alert_level_enum_values", "status": "PASSED", "pct": 2}, {"suite": "TestDataModels", "name": "test_all_arrhythmia_types_present", "status": "PASSED", "pct": 2}]}, {"id": "TestMessageBus", "label": "Message Bus", "passed": 7, "failed": 0, "tests": [{"suite": "TestMessageBus", "name": "test_subscribe_and_receive", "status": "PASSED", "pct": 3}, {"suite": "TestMessageBus", "name": "test_async_subscriber", "status": "PASSED", "pct": 3}, {"suite": "TestMessageBus", "name": "test_multiple_subscribers_same_topic", "status": "PASSED", "pct": 4}, {"suite": "TestMessageBus", "name": "test_no_bleed_between_topics", "status": "PASSED", "pct": 4}, {"suite": "TestMessageBus", "name": "test_message_history_appended", "status": "PASSED", "pct": 5}, {"suite": "TestMessageBus", "name": "test_subscriber_exception_does_not_crash_bus", "status": "PASSED", "pct": 5}, {"suite": "TestMessageBus", "name": "test_publish_to_topic_with_no_subscribers", "status": "PASSED", "pct": 6}]}, {"id": "TestBaseAgent", "label": "Base Agent", "passed": 3, "failed": 0, "tests": [{"suite": "TestBaseAgent", "name": "test_start_sets_running_true", "status": "PASSED", "pct": 6}, {"suite": "TestBaseAgent", "name": "test_stop_sets_running_false", "status": "PASSED", "pct": 7}, {"suite": "TestBaseAgent", "name": "test_agent_id_stored", "status": "PASSED", "pct": 7}]}, {"id": "TestDataAcquisitionAgent", "label": "Acquisition Agent", "passed": 15, "failed": 0, "tests": [{"suite": "TestDataAcquisitionAgent", "name": "test_register_device_stores_entry", "status": "PASSED", "pct": 8}, {"suite": "TestDataAcquisitionAgent", "name": "test_register_creates_stream_queue", "status": "PASSED", "pct": 8}, {"suite": "TestDataAcquisitionAgent", "name": "test_register_publishes_device_registered", "status": "PASSED", "pct": 9}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_unknown_device_silent", "status": "PASSED", "pct": 9}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_publishes_data_raw", "status": "PASSED", "pct": 10}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_updates_last_seen", "status": "PASSED", "pct": 10}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_normal_data", "status": "PASSED", "pct": 11}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_none_value", "status": "PASSED", "pct": 11}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_extreme_hr_high", "status": "PASSED", "pct": 12}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_extreme_hr_low", "status": "PASSED", "pct": 12}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_boundary_hr_exactly_30", "status": "PASSED", "pct": 13}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_boundary_hr_exactly_250", "status": "PASSED", "pct": 13}, {"suite": "TestDataAcquisitionAgent", "name": "test_process_dispatches_stream", "status": "PASSED", "pct": 14}, {"suite": "TestDataAcquisitionAgent", "name": "test_process_ignores_non_dict", "status": "PASSED", "pct": 14}, {"suite": "TestDataAcquisitionAgent", "name": "test_bus_device_register_topic_triggers_register", "status": "PASSED", "pct": 15}]}, {"id": "TestDataProcessingAgent", "label": "Processing Agent", "passed": 12, "failed": 0, "tests": [{"suite": "TestDataProcessingAgent", "name": "test_low_quality_dropped", "status": "PASSED", "pct": 15}, {"suite": "TestDataProcessingAgent", "name": "test_quality_threshold_boundary_accepted", "status": "PASSED", "pct": 16}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_signal_type", "status": "PASSED", "pct": 16}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_features_populated", "status": "PASSED", "pct": 17}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_rr_mean_from_hr", "status": "PASSED", "pct": 17}, {"suite": "TestDataProcessingAgent", "name": "test_bp_signal_type", "status": "PASSED", "pct": 18}, {"suite": "TestDataProcessingAgent", "name": "test_bp_features_correct", "status": "PASSED", "pct": 18}, {"suite": "TestDataProcessingAgent", "name": "test_bp_map_formula", "status": "PASSED", "pct": 19}, {"suite": "TestDataProcessingAgent", "name": "test_spo2_features", "status": "PASSED", "pct": 19}, {"suite": "TestDataProcessingAgent", "name": "test_generic_passthrough", "status": "PASSED", "pct": 20}, {"suite": "TestDataProcessingAgent", "name": "test_dispatch_routes_ecg", "status": "PASSED", "pct": 20}, {"suite": "TestDataProcessingAgent", "name": "test_dispatch_routes_bp", "status": "PASSED", "pct": 21}]}, {"id": "TestPatternRecognitionAgent", "label": "Pattern Recognition", "passed": 30, "failed": 0, "tests": [{"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[40-30-100-ArrhythmiaType.BRADYCARDIA]", "status": "PASSED", "pct": 21}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[72-30-95-ArrhythmiaType.NORMAL_SINUS]", "status": "PASSED", "pct": 22}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[115-80-90-ArrhythmiaType.ATRIAL_FIBRILLATION]", "status": "PASSED", "pct": 22}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[160-20-135-ArrhythmiaType.VENTRICULAR_TACHYCARDIA]", "status": "PASSED", "pct": 23}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[110-25-90-ArrhythmiaType.TACHYCARDIA]", "status": "PASSED", "pct": 23}, {"suite": "TestPatternRecognitionAgent", "name": "test_bradycardia_priority_over_wide_qrs", "status": "PASSED", "pct": 24}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.2-True]", "status": "PASSED", "pct": 24}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[-0.15-True]", "status": "PASSED", "pct": 25}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.05-False]", "status": "PASSED", "pct": 25}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.1-False]", "status": "PASSED", "pct": 26}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.101-True]", "status": "PASSED", "pct": 26}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[115-75-normal]", "status": "PASSED", "pct": 27}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[122-79-elevated]", "status": "PASSED", "pct": 27}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[132-82-stage_1]", "status": "PASSED", "pct": 28}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[145-92-stage_2]", "status": "PASSED", "pct": 28}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[185-125-hypertensive_crisis]", "status": "PASSED", "pct": 29}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[200-110-hypertensive_crisis]", "status": "PASSED", "pct": 29}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[120-80-stage_1]", "status": "PASSED", "pct": 30}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[130-80-stage_1]", "status": "PASSED", "pct": 30}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_pattern_required_keys", "status": "PASSED", "pct": 31}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_pattern_type_label", "status": "PASSED", "pct": 31}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_confidence_range", "status": "PASSED", "pct": 32}, {"suite": "TestPatternRecognitionAgent", "name": "test_abnormal_qt_high", "status": "PASSED", "pct": 32}, {"suite": "TestPatternRecognitionAgent", "name": "test_abnormal_qt_low", "status": "PASSED", "pct": 33}, {"suite": "TestPatternRecognitionAgent", "name": "test_normal_qt", "status": "PASSED", "pct": 33}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_pattern_type", "status": "PASSED", "pct": 34}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_hypotension_flag", "status": "PASSED", "pct": 34}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_no_hypotension_normal", "status": "PASSED", "pct": 35}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_wide_pulse_pressure", "status": "PASSED", "pct": 35}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_publishes_to_bus", "status": "PASSED", "pct": 36}]}, {"id": "TestDiagnosticAgent", "label": "Diagnostic Agent", "passed": 21, "failed": 0, "tests": [{"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-Atrial Fibrillation]", "status": "PASSED", "pct": 36}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.VENTRICULAR_TACHYCARDIA-Critical]", "status": "PASSED", "pct": 37}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.NORMAL_SINUS-Normal]", "status": "PASSED", "pct": 37}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.BRADYCARDIA-Bradycardia]", "status": "PASSED", "pct": 38}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.TACHYCARDIA-Tachycardia]", "status": "PASSED", "pct": 38}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_bp_includes_stage", "status": "PASSED", "pct": 39}, {"suite": "TestDiagnosticAgent", "name": "test_ascvd_in_range", "status": "PASSED", "pct": 39}, {"suite": "TestDiagnosticAgent", "name": "test_hf_risk_in_range", "status": "PASSED", "pct": 40}, {"suite": "TestDiagnosticAgent", "name": "test_stroke_risk_elevated_for_afib", "status": "PASSED", "pct": 40}, {"suite": "TestDiagnosticAgent", "name": "test_stroke_risk_low_without_afib", "status": "PASSED", "pct": 41}, {"suite": "TestDiagnosticAgent", "name": "test_scd_high_for_vtach", "status": "PASSED", "pct": 41}, {"suite": "TestDiagnosticAgent", "name": "test_scd_low_for_normal", "status": "PASSED", "pct": 42}, {"suite": "TestDiagnosticAgent", "name": "test_afib_anticoagulation_recommended", "status": "PASSED", "pct": 42}, {"suite": "TestDiagnosticAgent", "name": "test_vtach_immediate_intervention", "status": "PASSED", "pct": 43}, {"suite": "TestDiagnosticAgent", "name": "test_high_ascvd_statin", "status": "PASSED", "pct": 43}, {"suite": "TestDiagnosticAgent", "name": "test_ischemia_recommendations", "status": "PASSED", "pct": 44}, {"suite": "TestDiagnosticAgent", "name": "test_normal_no_recommendations", "status": "PASSED", "pct": 44}, {"suite": "TestDiagnosticAgent", "name": "test_generate_diagnosis_type", "status": "PASSED", "pct": 45}, {"suite": "TestDiagnosticAgent", "name": "test_generate_diagnosis_risk_scores_present", "status": "PASSED", "pct": 45}, {"suite": "TestDiagnosticAgent", "name": "test_process_stores_patient_history", "status": "PASSED", "pct": 46}, {"suite": "TestDiagnosticAgent", "name": "test_process_publishes_to_bus", "status": "PASSED", "pct": 46}]}, {"id": "TestAlertMonitoringAgent", "label": "Alert Monitoring", "passed": 22, "failed": 0, "tests": [{"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.VENTRICULAR_TACHYCARDIA-supporting0-AlertLevel.CRITICAL]", "status": "PASSED", "pct": 47}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.VENTRICULAR_FIBRILLATION-supporting1-AlertLevel.CRITICAL]", "status": "PASSED", "pct": 47}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-supporting2-AlertLevel.HIGH]", "status": "PASSED", "pct": 48}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-supporting3-AlertLevel.MEDIUM]", "status": "PASSED", "pct": 48}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_high_scd_risk", "status": "PASSED", "pct": 49}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_high_stroke_is_medium", "status": "PASSED", "pct": 49}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_ischemia_is_high", "status": "PASSED", "pct": 50}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_normal_is_none", "status": "PASSED", "pct": 50}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.CRITICAL-PREPARE_DEFIBRILLATOR]", "status": "PASSED", "pct": 51}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.CRITICAL-ACTIVATE_RAPID_RESPONSE]", "status": "PASSED", "pct": 51}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.HIGH-NOTIFY_CARDIOLOGIST]", "status": "PASSED", "pct": 52}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.HIGH-REVIEW_WITHIN_15_MIN]", "status": "PASSED", "pct": 52}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.MEDIUM-NOTIFY_PRIMARY_CARE]", "status": "PASSED", "pct": 53}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.LOW-ROUTINE_REVIEW]", "status": "PASSED", "pct": 53}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.CRITICAL-emergency_services]", "status": "PASSED", "pct": 54}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.CRITICAL-rapid_response_team]", "status": "PASSED", "pct": 54}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.HIGH-primary_cardiologist]", "status": "PASSED", "pct": 55}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.MEDIUM-primary_care_physician]", "status": "PASSED", "pct": 55}, {"suite": "TestAlertMonitoringAgent", "name": "test_create_alert_stored", "status": "PASSED", "pct": 56}, {"suite": "TestAlertMonitoringAgent", "name": "test_create_alert_correct_level", "status": "PASSED", "pct": 56}, {"suite": "TestAlertMonitoringAgent", "name": "test_dispatch_publishes_to_bus", "status": "PASSED", "pct": 57}, {"suite": "TestAlertMonitoringAgent", "name": "test_dispatch_populates_notified_parties", "status": "PASSED", "pct": 57}]}, {"id": "TestPersonalizationAgent", "label": "Personalization", "passed": 11, "failed": 0, "tests": [{"suite": "TestPersonalizationAgent", "name": "test_new_patient_profile_created", "status": "PASSED", "pct": 58}, {"suite": "TestPersonalizationAgent", "name": "test_sample_count_increments", "status": "PASSED", "pct": 58}, {"suite": "TestPersonalizationAgent", "name": "test_running_average_stable_on_constant_input", "status": "PASSED", "pct": 59}, {"suite": "TestPersonalizationAgent", "name": "test_learn_from_alert_stores_entry", "status": "PASSED", "pct": 59}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[heart_rate_high-100]", "status": "PASSED", "pct": 60}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[spo2_low-92]", "status": "PASSED", "pct": 60}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[systolic_high-140]", "status": "PASSED", "pct": 61}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[diastolic_high-90]", "status": "PASSED", "pct": 61}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[unknown_param-0]", "status": "PASSED", "pct": 62}, {"suite": "TestPersonalizationAgent", "name": "test_personalized_threshold_falls_back_to_default", "status": "PASSED", "pct": 62}, {"suite": "TestPersonalizationAgent", "name": "test_non_numeric_features_skipped", "status": "PASSED", "pct": 63}]}, {"id": "TestCommunicationAgent", "label": "Communication", "passed": 8, "failed": 0, "tests": [{"suite": "TestCommunicationAgent", "name": "test_summary_contains_patient_id", "status": "PASSED", "pct": 63}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_level", "status": "PASSED", "pct": 64}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_action", "status": "PASSED", "pct": 64}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_notified", "status": "PASSED", "pct": 65}, {"suite": "TestCommunicationAgent", "name": "test_generate_report_stored", "status": "PASSED", "pct": 65}, {"suite": "TestCommunicationAgent", "name": "test_report_structure", "status": "PASSED", "pct": 66}, {"suite": "TestCommunicationAgent", "name": "test_multiple_reports_accumulate", "status": "PASSED", "pct": 66}, {"suite": "TestCommunicationAgent", "name": "test_handle_alert_no_exception", "status": "PASSED", "pct": 67}]}, {"id": "TestCardioAISystem", "label": "CardioAI Coordinator", "passed": 13, "failed": 0, "tests": [{"suite": "TestCardioAISystem", "name": "test_seven_agents_initialised", "status": "PASSED", "pct": 67}, {"suite": "TestCardioAISystem", "name": "test_all_expected_agent_keys", "status": "PASSED", "pct": 68}, {"suite": "TestCardioAISystem", "name": "test_start_all_running", "status": "PASSED", "pct": 68}, {"suite": "TestCardioAISystem", "name": "test_stop_all_stopped", "status": "PASSED", "pct": 69}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[normal-60-90]", "status": "PASSED", "pct": 69}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[afib-110-150]", "status": "PASSED", "pct": 70}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[vtach-150-200]", "status": "PASSED", "pct": 70}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[bradycardia-35-50]", "status": "PASSED", "pct": 71}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[normal-110-130]", "status": "PASSED", "pct": 71}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[hypertension-140-170]", "status": "PASSED", "pct": 72}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[hypertensive_crisis-180-220]", "status": "PASSED", "pct": 72}, {"suite": "TestCardioAISystem", "name": "test_simulate_ecg_registers_device", "status": "PASSED", "pct": 73}, {"suite": "TestCardioAISystem", "name": "test_all_agents_share_same_bus", "status": "PASSED", "pct": 73}]}, {"id": "TestProtocolHelpers", "label": "Protocol Helpers", "passed": 6, "failed": 0, "tests": [{"suite": "TestProtocolHelpers", "name": "test_build_message_fields", "status": "PASSED", "pct": 74}, {"suite": "TestProtocolHelpers", "name": "test_build_message_unique_ids", "status": "PASSED", "pct": 74}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_valid", "status": "PASSED", "pct": 75}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_invalid_json", "status": "PASSED", "pct": 75}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_empty_string", "status": "PASSED", "pct": 76}, {"suite": "TestProtocolHelpers", "name": "test_all_msg_types_roundtrip", "status": "PASSED", "pct": 76}]}, {"id": "TestHandshakeConfig", "label": "Handshake Config", "passed": 5, "failed": 0, "tests": [{"suite": "TestHandshakeConfig", "name": "test_default_port", "status": "PASSED", "pct": 77}, {"suite": "TestHandshakeConfig", "name": "test_default_queue_size", "status": "PASSED", "pct": 77}, {"suite": "TestHandshakeConfig", "name": "test_default_reconnect_attempts", "status": "PASSED", "pct": 78}, {"suite": "TestHandshakeConfig", "name": "test_default_jwt_algorithm", "status": "PASSED", "pct": 78}, {"suite": "TestHandshakeConfig", "name": "test_override_values", "status": "PASSED", "pct": 79}]}, {"id": "TestSecurityManager", "label": "Security Manager", "passed": 12, "failed": 0, "tests": [{"suite": "TestSecurityManager", "name": "test_challenge_decodes_to_16_bytes", "status": "PASSED", "pct": 79}, {"suite": "TestSecurityManager", "name": "test_challenge_unique", "status": "PASSED", "pct": 80}, {"suite": "TestSecurityManager", "name": "test_sign_is_deterministic", "status": "PASSED", "pct": 80}, {"suite": "TestSecurityManager", "name": "test_verify_correct_signature", "status": "PASSED", "pct": 81}, {"suite": "TestSecurityManager", "name": "test_verify_wrong_signature", "status": "PASSED", "pct": 81}, {"suite": "TestSecurityManager", "name": "test_verify_tampered_challenge", "status": "PASSED", "pct": 82}, {"suite": "TestSecurityManager", "name": "test_token_is_string", "status": "PASSED", "pct": 82}, {"suite": "TestSecurityManager", "name": "test_token_correct_sub", "status": "PASSED", "pct": 83}, {"suite": "TestSecurityManager", "name": "test_token_device_ids", "status": "PASSED", "pct": 83}, {"suite": "TestSecurityManager", "name": "test_expired_token_rejected", "status": "PASSED", "pct": 84}, {"suite": "TestSecurityManager", "name": "test_wrong_jwt_secret_rejected", "status": "PASSED", "pct": 84}, {"suite": "TestSecurityManager", "name": "test_different_secrets_different_sigs", "status": "PASSED", "pct": 85}]}, {"id": "TestDeviceSessionRegistry", "label": "Device Registry", "passed": 12, "failed": 0, "tests": [{"suite": "TestDeviceSessionRegistry", "name": "test_register_returns_session", "status": "PASSED", "pct": 85}, {"suite": "TestDeviceSessionRegistry", "name": "test_get_registered", "status": "PASSED", "pct": 86}, {"suite": "TestDeviceSessionRegistry", "name": "test_get_unknown_returns_none", "status": "PASSED", "pct": 86}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_increments_count", "status": "PASSED", "pct": 87}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_sets_last_data_at", "status": "PASSED", "pct": 87}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_resets_missed_heartbeats", "status": "PASSED", "pct": 88}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_inactive", "status": "PASSED", "pct": 88}, {"suite": "TestDeviceSessionRegistry", "name": "test_active_devices_excludes_inactive", "status": "PASSED", "pct": 89}, {"suite": "TestDeviceSessionRegistry", "name": "test_summary_counts", "status": "PASSED", "pct": 89}, {"suite": "TestDeviceSessionRegistry", "name": "test_summary_device_entry_fields", "status": "PASSED", "pct": 90}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_on_unknown_is_silent", "status": "PASSED", "pct": 90}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_inactive_on_unknown_is_silent", "status": "PASSED", "pct": 91}]}, {"id": "TestRPMDataPump", "label": "RPM Data Pump", "passed": 5, "failed": 0, "tests": [{"suite": "TestRPMDataPump", "name": "test_pump_processes_frame", "status": "PASSED", "pct": 91}, {"suite": "TestRPMDataPump", "name": "test_stats_start_at_zero", "status": "PASSED", "pct": 92}, {"suite": "TestRPMDataPump", "name": "test_auto_register_unknown_device", "status": "PASSED", "pct": 92}, {"suite": "TestRPMDataPump", "name": "test_optional_callback_invoked", "status": "PASSED", "pct": 93}, {"suite": "TestRPMDataPump", "name": "test_stop_event_exits_run", "status": "PASSED", "pct": 93}]}, {"id": "TestDeviceHealthMonitor", "label": "Health Monitor", "passed": 3, "failed": 0, "tests": [{"suite": "TestDeviceHealthMonitor", "name": "test_stale_device_marked_inactive_and_event_published", "status": "PASSED", "pct": 94}, {"suite": "TestDeviceHealthMonitor", "name": "test_fresh_device_stays_active", "status": "PASSED", "pct": 94}, {"suite": "TestDeviceHealthMonitor", "name": "test_device_never_sent_data_not_flagged", "status": "PASSED", "pct": 95}]}, {"id": "TestEndToEndPipeline", "label": "End-to-End Pipeline", "passed": 7, "failed": 0, "tests": [{"suite": "TestEndToEndPipeline", "name": "test_vtach_produces_critical_alert", "status": "PASSED", "pct": 95}, {"suite": "TestEndToEndPipeline", "name": "test_afib_produces_medium_or_high_alert", "status": "PASSED", "pct": 96}, {"suite": "TestEndToEndPipeline", "name": "test_hypertensive_crisis_diagnosis_text", "status": "PASSED", "pct": 96}, {"suite": "TestEndToEndPipeline", "name": "test_personalization_updated_after_signal", "status": "PASSED", "pct": 97}, {"suite": "TestEndToEndPipeline", "name": "test_communication_report_stored", "status": "PASSED", "pct": 97}, {"suite": "TestEndToEndPipeline", "name": "test_acquisition_to_diagnosis_full_path", "status": "PASSED", "pct": 98}, {"suite": "TestEndToEndPipeline", "name": "test_normal_ecg_does_not_produce_critical", "status": "PASSED", "pct": 98}]}, {"id": "TestWebSocketHandshakeLoopback", "label": "WebSocket Loopback", "passed": 2, "failed": 0, "tests": [{"suite": "TestWebSocketHandshakeLoopback", "name": "test_full_3way_hmac_handshake", "status": "PASSED", "pct": 99}, {"suite": "TestWebSocketHandshakeLoopback", "name": "test_wrong_secret_fails_auth", "status": "PASSED", "pct": 99}]}, {"id": "TestBackPressure", "label": "Back-Pressure", "passed": 1, "failed": 0, "tests": [{"suite": "TestBackPressure", "name": "test_full_queue_evicts_oldest_frame", "status": "PASSED", "pct": 100}]}];
-const CFG={url:sessionStorage.getItem('ca_url')||'',tok:sessionStorage.getItem('ca_tok')||'',int:parseInt(sessionStorage.getItem('ca_int')||'5')};
+const CFG={
+  url:sessionStorage.getItem('ca_url')||'',
+  tok:sessionStorage.getItem('ca_tok')||'',
+  refreshTok:sessionStorage.getItem('ca_refresh')||'',
+  int:parseInt(sessionStorage.getItem('ca_int')||'5'),
+  userEmail:sessionStorage.getItem('ca_email')||'',
+  userName:sessionStorage.getItem('ca_name')||'',
+  userRole:sessionStorage.getItem('ca_role')||'',
+};
 
 const DEMO_ALERTS=[
   {alert_id:'demo-001',patient_id:'PT_10042',level:'critical',description:'Ventricular Tachycardia detected — HR 182 bpm, QRS width 148 ms',actions:['PREPARE_DEFIBRILLATOR','ACTIVATE_RAPID_RESPONSE','NOTIFY_EMERGENCY_SERVICES'],notified:['emergency_services','rapid_response_team','primary_cardiologist'],timestamp:new Date(Date.now()-90000).toISOString()},
@@ -598,12 +668,161 @@ function sv(id){document.querySelectorAll('.view').forEach(v=>v.classList.remove
 function swf(id,btn){document.querySelectorAll('#view-workflow .wf-page').forEach(p=>p.classList.remove('on'));document.querySelectorAll('#view-workflow .sb-btn').forEach(b=>b.classList.remove('on'));document.getElementById(id).classList.add('on');btn.classList.add('on');}
 function ser(id,btn){document.querySelectorAll('#view-emergency .wf-page').forEach(p=>p.classList.remove('on'));document.querySelectorAll('#view-emergency .sb-btn').forEach(b=>b.classList.remove('on'));document.getElementById(id).classList.add('on');btn.classList.add('on');}
 function uct(id,btn){['uc-rpm','uc-afib','uc-rehab'].forEach(x=>document.getElementById(x).style.display='none');document.getElementById(id).style.display='block';document.querySelectorAll('#uc-tabs button').forEach(b=>{b.style.color='';b.style.borderColor='';});btn.style.color='var(--green)';btn.style.borderColor='var(--green)';}
-function openCfg(){document.getElementById('cfgUrl').value=CFG.url;document.getElementById('cfgTok').value=CFG.tok;document.getElementById('cfgInt').value=CFG.int;document.getElementById('cfgOv').classList.add('open');}
+function openCfg(){document.getElementById('cfgUrl').value=CFG.url;document.getElementById('cfgInt').value=CFG.int;document.getElementById('cfgOv').classList.add('open');}
 function closeCfg(){document.getElementById('cfgOv').classList.remove('open');}
 function maybeCfgClose(e){if(e.target.id==='cfgOv')closeCfg();}
-function applyCfg(){CFG.url=document.getElementById('cfgUrl').value.trim().replace(/\/$/,'');CFG.tok=document.getElementById('cfgTok').value.trim();CFG.int=Math.max(2,parseInt(document.getElementById('cfgInt').value)||5);sessionStorage.setItem('ca_url',CFG.url);sessionStorage.setItem('ca_tok',CFG.tok);sessionStorage.setItem('ca_int',CFG.int);closeCfg();if(CFG.url){startPoll();document.getElementById('banner').classList.remove('show');}}
+function applyCfg(){CFG.int=Math.max(2,parseInt(document.getElementById('cfgInt').value)||5);sessionStorage.setItem('ca_int',CFG.int);closeCfg();if(CFG.url&&CFG.tok){startPoll();}}
+
+function showLoginError(msg){const e=document.getElementById('loginError');e.textContent=msg;e.style.display='block';}
+function hideLoginError(){document.getElementById('loginError').style.display='none';}
+
+function showSignup(){
+  document.getElementById('signinView').style.display='none';
+  document.getElementById('signupView').style.display='block';
+  document.getElementById('signupUrl').value = document.getElementById('loginUrl').value || 'https://cardioai-api-lmy5.onrender.com';
+  hideLoginError();
+}
+function showSignin(){
+  document.getElementById('signupView').style.display='none';
+  document.getElementById('signinView').style.display='block';
+  document.getElementById('signupError').style.display='none';
+  document.getElementById('signupSuccess').style.display='none';
+}
+
+function showSignupError(msg){
+  document.getElementById('signupSuccess').style.display='none';
+  const e=document.getElementById('signupError');e.textContent=msg;e.style.display='block';
+}
+function showSignupSuccess(msg){
+  document.getElementById('signupError').style.display='none';
+  const e=document.getElementById('signupSuccess');e.textContent=msg;e.style.display='block';
+}
+
+async function doSignup(){
+  document.getElementById('signupError').style.display='none';
+  document.getElementById('signupSuccess').style.display='none';
+
+  const url   = document.getElementById('signupUrl').value.trim().replace(/\/$/,'');
+  const name  = document.getElementById('signupName').value.trim();
+  const org   = document.getElementById('signupOrg').value.trim();
+  const email = document.getElementById('signupEmail').value.trim();
+  const pass  = document.getElementById('signupPass').value;
+  const role  = document.getElementById('signupRole').value;
+
+  if(!url||!name||!org||!email||!pass){showSignupError('All fields are required.');return;}
+  if(pass.length<8){showSignupError('Password must be at least 8 characters.');return;}
+
+  const btn = document.getElementById('signupBtn');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+
+  try{
+    const resp = await fetch(url+'/auth/signup',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:name,organization:org,email:email,password:pass,role:role})
+    });
+    const data = await resp.json();
+    if(!resp.ok){
+      showSignupError(data.message || data.error || ('Signup failed (HTTP '+resp.status+')'));
+    }else{
+      showSignupSuccess(data.message || 'Account created — waiting for administrator approval.');
+      document.getElementById('signupName').value='';
+      document.getElementById('signupOrg').value='';
+      document.getElementById('signupEmail').value='';
+      document.getElementById('signupPass').value='';
+    }
+  }catch(e){
+    showSignupError('Could not reach the backend. Check the URL and your connection.');
+  }
+  btn.disabled = false; btn.textContent = 'Request Account';
+}
+
+async function doLogin(){
+  hideLoginError();
+  const url   = document.getElementById('loginUrl').value.trim().replace(/\/$/,'');
+  const email = document.getElementById('loginEmail').value.trim();
+  const pass  = document.getElementById('loginPass').value;
+  if(!url||!email||!pass){showLoginError('All fields are required.');return;}
+
+  const btn = document.getElementById('loginBtn');
+  btn.disabled = true; btn.textContent = 'Signing in…';
+
+  try{
+    const resp = await fetch(url+'/auth/login',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:email,password:pass})
+    });
+    const data = await resp.json();
+    if(!resp.ok){
+      showLoginError(data.message || data.error || ('Sign in failed (HTTP '+resp.status+')'));
+      btn.disabled = false; btn.textContent = 'Sign In';
+      return;
+    }
+    CFG.url = url;
+    CFG.tok = data.access_token;
+    CFG.refreshTok = data.refresh_token;
+    CFG.userEmail = email;
+    CFG.userName  = (data.user && data.user.name) || email;
+    CFG.userRole  = (data.user && data.user.role) || '';
+    sessionStorage.setItem('ca_url', CFG.url);
+    sessionStorage.setItem('ca_tok', CFG.tok);
+    sessionStorage.setItem('ca_refresh', CFG.refreshTok || '');
+    sessionStorage.setItem('ca_email', CFG.userEmail);
+    sessionStorage.setItem('ca_name', CFG.userName);
+    sessionStorage.setItem('ca_role', CFG.userRole);
+    unlockApp();
+    initDashboard();
+  }catch(e){
+    showLoginError('Could not reach the backend. Check the URL and your connection.');
+  }
+  btn.disabled = false; btn.textContent = 'Sign In';
+}
+
+// unlockApp / lockApp — the single source of truth for whether the real
+// dashboard is shown. The dashboard's HTML is never laid out in the
+// browser at all until unlockApp() runs (#appShell{display:none} in CSS),
+// so there is nothing to scroll to, inspect, or stumble into while signed
+// out — this is a structural guarantee, not just a JS state check.
+function unlockApp(){
+  document.getElementById('appShell').classList.add('unlocked');
+  document.getElementById('loginOv').classList.remove('open');
+  document.getElementById('loginOv').style.display = 'none';
+  document.getElementById('banner').classList.remove('show');
+}
+function lockApp(){
+  document.getElementById('appShell').classList.remove('unlocked');
+  document.getElementById('loginOv').style.display = 'flex';
+  document.getElementById('loginOv').classList.add('open');
+}
+
+function doLogout(){
+  if(CFG.tok && CFG.url){
+    fetch(CFG.url+'/auth/logout',{method:'POST',headers:{'Authorization':'Bearer '+CFG.tok}}).catch(()=>{});
+  }
+  sessionStorage.clear();
+  CFG.tok=''; CFG.refreshTok=''; CFG.userEmail=''; CFG.userName=''; CFG.userRole='';
+  if(pollT) clearInterval(pollT);
+  closeCfg();
+  const badge = document.getElementById('userBadge');
+  if(badge) badge.textContent = '';
+  document.getElementById('loginEmail').value='';
+  document.getElementById('loginPass').value='';
+  lockApp();
+}
+
+function updateUserBadge(){
+  let badge = document.getElementById('userBadge');
+  if(!badge){
+    badge = document.createElement('div');
+    badge.id = 'userBadge';
+    badge.style.cssText = 'font-size:.6rem;color:var(--text2);margin-right:8px;white-space:nowrap';
+    document.querySelector('.tb-right').prepend(badge);
+  }
+  badge.textContent = CFG.userName ? (CFG.userName+' · '+CFG.userRole) : '';
+}
 function setStatus(cls,txt){const p=document.getElementById('spill');p.className='spill '+cls;document.getElementById('sptxt').textContent=txt;}
-async function fetchAll(){if(!CFG.url)return;const h=CFG.tok?{'Authorization':'Bearer '+CFG.tok,'Accept':'application/json'}:{'Accept':'application/json'};setStatus('loading','Fetching...');try{const[hr,dr,ar]=await Promise.all([fetch(CFG.url+'/status',{headers:h}),fetch(CFG.url+'/devices',{headers:h}),fetch(CFG.url+'/alerts',{headers:h})]);if(!hr.ok)throw new Error('HTTP '+hr.status);cache.health=await hr.json();cache.devices=await dr.json();cache.alerts=await ar.json();setStatus('live','Live');document.getElementById('banner').classList.remove('show');const db=document.getElementById('demo-badge');if(db)db.style.display='none';renderAll();}catch(e){setStatus('err','Unreachable');document.getElementById('banner').classList.add('show');}}
+async function fetchAll(){if(!CFG.url||!CFG.tok)return;const h={'Authorization':'Bearer '+CFG.tok,'Accept':'application/json'};setStatus('loading','Fetching...');try{const[hr,dr,ar]=await Promise.all([fetch(CFG.url+'/status',{headers:h}),fetch(CFG.url+'/devices',{headers:h}),fetch(CFG.url+'/alerts',{headers:h})]);if(!hr.ok)throw new Error('HTTP '+hr.status);cache.health=await hr.json();cache.devices=await dr.json();cache.alerts=await ar.json();setStatus('live','Live');document.getElementById('banner').classList.remove('show');const db=document.getElementById('demo-badge');if(db)db.style.display='none';renderAll();}catch(e){setStatus('err','Unreachable');document.getElementById('banner').classList.add('show');}}
 function startPoll(){if(pollT)clearInterval(pollT);fetchAll();pollT=setInterval(fetchAll,CFG.int*1000);}
 function renderAll(){renderLive();renderDevices();renderAlerts();updateBadge();}
 function setText(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
@@ -631,9 +850,79 @@ function renderTestPanel(sid){const s=SUITE_DATA.find(x=>x.id===sid);if(!s)retur
 function busAnim(){const viz=document.getElementById('busViz');if(!viz)return;const msgs=[{l:'data.raw',c:'#0048A0'},{l:'ECG',c:'#40B8F8'},{l:'pattern',c:'#F88840'},{l:'diag',c:'#6A4FBF'},{l:'alert',c:'#F84858'},{l:'HMAC',c:'#105898'},{l:'RPM',c:'#80D0F8'}];let idx=0;setInterval(()=>{const m=msgs[idx%msgs.length];idx++;const pk=document.createElement('div');pk.className='bus-pkt';pk.style.background=m.c;pk.textContent=m.l;pk.style.animationDuration=(1.8+Math.random()*1.4)+'s';pk.style.top=(10+Math.random()*18)+'px';viz.appendChild(pk);setTimeout(()=>pk.remove(),3500);},700);}
 
 setInterval(()=>{document.getElementById('clk').textContent=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});},1000);
-buildAgents();buildHandshake();buildTests();busAnim();
-renderAlerts();updateBadge();
-if(CFG.url){startPoll();}else{setStatus('','Not configured');setTimeout(openCfg,400);}
+
+let _staticContentBuilt = false;
+
+function initDashboard(){
+  // Static, content that never depends on which user is signed in —
+  // build it exactly once per page load, regardless of how many times
+  // someone signs in/out within the same browser tab.
+  if(!_staticContentBuilt){
+    _staticContentBuilt = true;
+    buildAgents();
+    buildHandshake();
+    buildTests();
+    busAnim();
+  }
+  // Per-session content — must re-run on every successful login,
+  // including a fresh login after a logout, since the previous user's
+  // poll timer was stopped and badge cleared at that point.
+  renderAlerts();
+  updateBadge();
+  updateUserBadge();
+  startPoll();
+}
+
+// Clock runs immediately (harmless, no patient data, just a wall clock).
+// Everything else stays fully blocked behind the login wall below —
+// buildAgents/buildHandshake/buildTests/busAnim/renderAlerts/updateBadge/
+// startPoll only ever run from inside initDashboard(), which only ever
+// runs after a successful doLogin() or a verified existing session.
+
+if(CFG.url && CFG.tok){
+  // Existing session from a previous visit (sessionStorage) — but don't
+  // trust it blindly. Verify the token still works against the real
+  // backend before unlocking the dashboard; an expired/revoked token
+  // must send the user back to the sign-in screen, not a half-working UI.
+  lockApp();
+  document.getElementById('signinView').style.display='none';
+  document.getElementById('signupView').style.display='none';
+  const verifying = document.createElement('div');
+  verifying.id = 'verifyingView';
+  verifying.style.cssText = 'text-align:center;padding:20px 0';
+  verifying.innerHTML = '<p class="cfg-sub">Restoring your session…</p>';
+  document.getElementById('loginBox').appendChild(verifying);
+
+  fetch(CFG.url+'/status',{headers:{'Authorization':'Bearer '+CFG.tok}})
+    .then(r=>{
+      verifying.remove();
+      if(r.ok){
+        unlockApp();
+        initDashboard();
+      }else{
+        // Token expired/revoked — clear it and show sign-in fresh
+        sessionStorage.clear();
+        CFG.tok=''; CFG.refreshTok='';
+        document.getElementById('signinView').style.display='block';
+        document.getElementById('loginUrl').value = CFG.url;
+        setStatus('','Session expired — please sign in again');
+      }
+    })
+    .catch(()=>{
+      verifying.remove();
+      sessionStorage.clear();
+      CFG.tok=''; CFG.refreshTok='';
+      document.getElementById('signinView').style.display='block';
+      document.getElementById('loginUrl').value = CFG.url;
+      setStatus('err','Could not reach backend — please sign in again');
+    });
+}else{
+  // No existing session at all — show sign-in immediately, nothing else
+  // in the dashboard has been built, fetched, or even laid out yet.
+  setStatus('','Not signed in');
+  document.getElementById('loginUrl').value = CFG.url || 'https://cardioai-api-lmy5.onrender.com';
+  lockApp();
+}
 </script>
 </body>
 </html>
