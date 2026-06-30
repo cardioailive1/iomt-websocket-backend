@@ -2331,12 +2331,15 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
         # ── Account active check ──────────────────────────────────────────
         if not user.is_active:
-            logger.warning("[Auth] disabled account email=%s", email)
+            logger.warning("[Auth] inactive account login attempt email=%s", email)
             await _db.log_event("login_failed", user_id=user.id, ip_address=client_ip,
-                                detail="account disabled")
+                                detail="account inactive")
             return _web.json_response(
-                {"error": "account_disabled",
-                 "message": "Your account has been disabled. Contact your administrator."},
+                {"error": "account_inactive",
+                 "message": "Your account is not yet active. If you just signed up, "
+                            "an administrator needs to approve your account first. "
+                            "If your account was previously active, contact your "
+                            "administrator to find out why it was disabled."},
                 status=403,
             )
 
@@ -2393,6 +2396,142 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
                 "patient_id": user.patient_id,
             },
         })
+
+    # ── POST /auth/signup ────────────────────────────────────────────────────
+    #
+    # Self-registration for clinical staff (nurse / cardiologist / admin).
+    # Unauthenticated — anyone with a hospital email can request an account,
+    # but NEW ACCOUNTS START INACTIVE (is_active=False). They cannot sign in
+    # until an existing admin approves them via:
+    #     PATCH /admin/users/{id}  body: {"is_active": true}
+    #
+    # This prevents arbitrary self-registration from granting immediate
+    # access to patient data, while still letting clinicians request an
+    # account without needing IT to create it for them first.
+    #
+    # Patient accounts are NEVER created here — patients authenticate via
+    # Sign in with Apple (POST /auth/apple), which auto-provisions on first
+    # sign-in. This endpoint only accepts nurse / cardiologist / admin.
+    #
+    # The very first admin account for a fresh deployment has no admin yet
+    # to approve it — see the "bootstrap admin" note in the README for how
+    # to activate the first account directly via SQL.
+
+    async def signup(request: _web.Request) -> _web.Response:
+        """
+        Request a new clinical staff account. Account is created INACTIVE
+        and requires admin approval before it can sign in.
+
+        Request body (JSON)
+        -------------------
+        {
+          "email":        "newdoctor@hospital.local",
+          "name":         "Dr. Smith",
+          "organization": "St. Mary's Medical Center",
+          "password":     "SecurePass123",
+          "role":         "nurse" | "cardiologist" | "admin"
+        }
+
+        Success (201)
+        -------------
+        {
+          "id": "<uuid>", "email": "...", "name": "...",
+          "organization": "...", "role": "...", "is_active": false,
+          "message": "Account created. An administrator must approve it before you can sign in."
+        }
+
+        Errors
+        ------
+        400  missing_fields | invalid_role | weak_password
+        409  email_taken
+        429  rate_limited
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        email        = (body.get("email")        or "").strip().lower()
+        name         = (body.get("name")         or "").strip()
+        organization = (body.get("organization") or "").strip()
+        password     = (body.get("password")     or "").strip()
+        role_str     = (body.get("role")         or "").strip()
+
+        if not email or not name or not organization or not password or not role_str:
+            return _web.json_response(
+                {"error": "missing_fields",
+                 "message": "email, name, organization, password, and role are all required"},
+                status=400,
+            )
+
+        if not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+            return _web.json_response(
+                {"error": "invalid_email", "message": "Invalid email format"},
+                status=400,
+            )
+
+        client_ip = request.remote or "unknown"
+        if not _AUTH_RATE_LIMITER.is_allowed(client_ip):
+            logger.warning("[Signup] rate limited IP=%s email=%s", client_ip, email)
+            return _web.json_response(
+                {"error": "rate_limited",
+                 "message": "Too many signup attempts. Try again in 5 minutes."},
+                status=429,
+            )
+
+        try:
+            role = UserRole(role_str)
+        except ValueError:
+            return _web.json_response(
+                {"error": "invalid_role",
+                 "message": f"'{role_str}' must be one of: nurse, cardiologist, admin"},
+                status=400,
+            )
+
+        if role == UserRole.PATIENT:
+            return _web.json_response(
+                {"error": "invalid_role",
+                 "message": "Patients sign in with Apple — this endpoint is for clinical staff only"},
+                status=400,
+            )
+
+        if len(password) < 8:
+            return _web.json_response(
+                {"error": "weak_password",
+                 "message": "Password must be at least 8 characters"},
+                status=400,
+            )
+
+        existing = await _load_user_by_email(email)
+        if existing:
+            return _web.json_response(
+                {"error": "email_taken",
+                 "message": "An account with this email already exists"},
+                status=409,
+            )
+
+        password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(12)).decode()
+        new_user = await _db.create_staff_user(
+            email=email, name=name, organization=organization, role=role,
+            password_hash=password_hash, is_active=False,
+        )
+
+        await _db.log_event(
+            "signup_requested",
+            detail=f"role={role.value} email={email} org={organization}",
+        )
+        logger.info("[Signup] new pending %s account requested: %s (%s)",
+                    role.value, email, organization)
+
+        return _web.json_response({
+            "id":           new_user.id,
+            "email":        new_user.email,
+            "name":         new_user.name,
+            "organization": new_user.organization,
+            "role":         new_user.role.value,
+            "is_active":    new_user.is_active,
+            "message":      "Account created. An administrator must approve it before you can sign in.",
+        }, status=201)
 
     # ── POST /auth/refresh ────────────────────────────────────────────────
 
@@ -2500,18 +2639,61 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             "status":      "running",
             "bridge_id":   cfg.cardioai_backend_id,
             "endpoints": {
+                "GET  /dashboard":        "Live clinical dashboard (sign in with email/password)",
                 "GET  /health":           "Liveness probe (no auth)",
                 "GET  /status":           "Full bridge status (auth required)",
                 "POST /auth/apple":       "Sign in with Apple (iOS)",
                 "POST /auth/login":       "Email + password login",
+                "POST /auth/signup":      "Clinical staff self-registration (pending admin approval)",
                 "POST /auth/refresh":     "Rotate refresh token",
                 "POST /auth/logout":      "Revoke session",
                 "POST /devices/register": "Register a paired BLE device (auth required)",
+                "POST /clinical/devices/register-implant": "Register implant (clinical staff only)",
+                "GET  /clinical/devices/implants":          "List registered implants (auth required)",
+                "POST /vendor-gateway/ingest": "Vendor device gateway ingestion (X-Vendor-Api-Key)",
                 "GET  /devices":          "Device registry (auth required)",
                 "GET  /alerts":           "Active alerts (auth required)",
                 "GET  /reports":          "Clinical reports (auth required)",
+                "GET  /admin/users":      "List user accounts (admin only)",
+                "POST /admin/users":      "Create a clinician/admin account (admin only)",
+                "POST /admin/vendor-keys": "Generate a vendor API key (admin only)",
             },
         })
+
+    # ── GET /dashboard ────────────────────────────────────────────────────
+    #
+    # Serves the static HTML clinical dashboard directly from this backend,
+    # so there is one single public URL for both the API and the UI —
+    # no separate static-site hosting service needed.
+    #
+    # Unauthenticated at the HTTP level (the file itself has no patient
+    # data baked in) — the dashboard's own login screen calls POST
+    # /auth/login from the browser and stores the resulting token in
+    # sessionStorage, exactly like any other API client.
+    #
+    # The file is re-read from disk on every request rather than cached
+    # in memory, so editing iomt_cardioai_dashboard.html and redeploying
+    # picks up changes immediately with no code change required here.
+
+    _DASHBOARD_HTML_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "iomt_cardioai_dashboard.html"
+    )
+
+    async def dashboard(request: _web.Request) -> _web.Response:
+        try:
+            with open(_DASHBOARD_HTML_PATH, "r", encoding="utf-8") as f:
+                html = f.read()
+        except FileNotFoundError:
+            return _web.Response(
+                text=(
+                    "<h1>Dashboard file not found</h1>"
+                    "<p>iomt_cardioai_dashboard.html is missing from the deploy. "
+                    "Make sure it is committed to the repo at the project root.</p>"
+                ),
+                content_type="text/html",
+                status=500,
+            )
+        return _web.Response(text=html, content_type="text/html")
 
     # ── GET /health ───────────────────────────────────────────────────────
     #
@@ -2626,12 +2808,13 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         users = await _db.list_users(role=role_enum, limit=limit, offset=offset)
         return _web.json_response([
             {
-                "id":         u.id,
-                "email":      u.email,
-                "name":       u.name,
-                "role":       u.role.value,
-                "patient_id": u.patient_id,
-                "is_active":  u.is_active,
+                "id":           u.id,
+                "email":        u.email,
+                "name":         u.name,
+                "organization": u.organization,
+                "role":         u.role.value,
+                "patient_id":   u.patient_id,
+                "is_active":    u.is_active,
             }
             for u in users
         ])
@@ -2650,10 +2833,11 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         except Exception:
             return _web.json_response({"error": "invalid_json"}, status=400)
 
-        email    = (body.get("email")    or "").strip().lower()
-        name     = (body.get("name")     or "").strip()
-        password = (body.get("password") or "").strip()
-        role_str = (body.get("role")     or "").strip()
+        email        = (body.get("email")        or "").strip().lower()
+        name         = (body.get("name")         or "").strip()
+        organization = (body.get("organization") or "").strip()
+        password     = (body.get("password")     or "").strip()
+        role_str     = (body.get("role")         or "").strip()
 
         if not email or not name or not password or not role_str:
             return _web.json_response(
@@ -2695,7 +2879,8 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
         password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(12)).decode()
         new_user = await _db.create_staff_user(
-            email=email, name=name, role=role, password_hash=password_hash,
+            email=email, name=name, organization=organization,
+            role=role, password_hash=password_hash,
         )
 
         admin_user = request["user"]
@@ -2708,7 +2893,8 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
         return _web.json_response({
             "id": new_user.id, "email": new_user.email,
-            "name": new_user.name, "role": new_user.role.value,
+            "name": new_user.name, "organization": new_user.organization,
+            "role": new_user.role.value,
         }, status=201)
 
     # ── PATCH /admin/users/{user_id} ─────────────────────────────────────
@@ -3355,8 +3541,10 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     # ── Register routes ───────────────────────────────────────────────────
 
     app.router.add_get( "/",                  root)
+    app.router.add_get( "/dashboard",          dashboard)
     app.router.add_post("/auth/apple",        apple_signin)
     app.router.add_post("/auth/login",        login)
+    app.router.add_post("/auth/signup",       signup)
     app.router.add_post("/auth/refresh",      refresh)
     app.router.add_post("/auth/logout",       logout)
     app.router.add_post("/devices/register",  device_register)
