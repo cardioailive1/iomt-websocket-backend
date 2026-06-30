@@ -112,7 +112,35 @@ import numpy as np          # pip install numpy
 import websockets            # pip install websockets
 import aiohttp               # pip install aiohttp
 import jwt                   # pip install pyjwt
-import bcrypt                 # pip install bcrypt
+
+try:
+    import bcrypt             # pip install bcrypt
+except ImportError as _bcrypt_err:
+    import subprocess as _subprocess
+    print("=" * 78, file=sys.stderr)
+    print("FATAL: 'import bcrypt' failed at startup.", file=sys.stderr)
+    print(f"Original error: {_bcrypt_err}", file=sys.stderr)
+    print("-" * 78, file=sys.stderr)
+    print(f"sys.executable : {sys.executable}", file=sys.stderr)
+    print(f"sys.version    : {sys.version}", file=sys.stderr)
+    print(f"sys.path       :", file=sys.stderr)
+    for _p in sys.path:
+        print(f"    {_p}", file=sys.stderr)
+    print("-" * 78, file=sys.stderr)
+    try:
+        _freeze = _subprocess.run(
+            [sys.executable, "-m", "pip", "list"],
+            capture_output=True, text=True, timeout=15,
+        )
+        print("Installed packages (pip list):", file=sys.stderr)
+        print(_freeze.stdout, file=sys.stderr)
+        if _freeze.stderr:
+            print("pip list stderr:", _freeze.stderr, file=sys.stderr)
+    except Exception as _diag_err:
+        print(f"Could not run pip list: {_diag_err}", file=sys.stderr)
+    print("=" * 78, file=sys.stderr)
+    raise
+
 from aiohttp import web as _web
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 
@@ -280,7 +308,17 @@ class HandshakeConfig:
 
     @property
     def api_port(self) -> int:
-        return int(_optional_env("CARDIOAI_API_PORT", "8080"))
+        # Render.com (and most PaaS platforms) auto-inject PORT into every
+        # web service's environment. CARDIOAI_API_PORT takes priority if you
+        # set it explicitly; otherwise fall back to PORT; otherwise 8080
+        # for local/Docker development.
+        explicit = _optional_env("CARDIOAI_API_PORT", "")
+        if explicit:
+            return int(explicit)
+        platform_port = _optional_env("PORT", "")
+        if platform_port:
+            return int(platform_port)
+        return 8080
 
     @property
     def refresh_token_ttl(self) -> int:
