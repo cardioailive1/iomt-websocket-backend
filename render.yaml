@@ -3,46 +3,64 @@
 # Render.com Blueprint — IoMT CardioAI Backend
 # ==============================================================================
 #
-# Deploys iomt_cardioai_production.py to Render.com.
+# Deploys:
+#   1. cardioai-db   — managed PostgreSQL database (users, refresh tokens,
+#                       audit log, large/implanted device registry, vendor
+#                       API keys, raw vendor event audit trail)
+#   2. cardioai-api  — the HTTP REST API + 7-agent pipeline + outbound
+#                       bridge connector + Kafka vendor-event consumer
 #
-# Architecture note
-# ------------------
-# This backend has exactly ONE public-facing listener: the aiohttp HTTP API
-# (GET/POST /auth/*, /devices, /alerts, /reports, /health). The 7-agent
-# pipeline's "bridge" component makes an OUTBOUND WebSocket connection to
-# your real IoMT hardware server (IOMT_SERVER_WS_URL) — it does not itself
-# accept inbound connections, so it needs no public port of its own.
+# Kafka is NOT hosted on Render — Render has no native managed Kafka
+# offering. This blueprint expects a hosted Kafka cluster (Upstash Kafka's
+# free tier is the easiest fit: serverless, supports the standard Kafka
+# protocol, no server management). Set the four KAFKA_* secrets below to
+# point at whichever provider you use (Upstash, Confluent Cloud, AWS MSK,
+# or self-hosted) — the app speaks standard Kafka protocol via aiokafka,
+# so any provider works as long as you fill in the right connection values.
 #
-# That means a single Render web service is normally all you need
-# (CARDIOAI_RUN_MODE=all runs the HTTP API + the outbound bridge connector
-# together in one process, sharing Render's one public $PORT for the API).
+# If you don't set KAFKA_BOOTSTRAP_SERVERS at all, the large-device vendor
+# gateway pipeline still works end-to-end using an in-memory fallback queue
+# (see kafka_bus.py) — useful for initial testing, but events do NOT
+# survive a process restart in that mode. Set real Kafka credentials before
+# connecting any real vendor gateway in production.
 #
-# An optional second "worker" service is included below, commented out, for
-# the rare case where you want the outbound bridge connector running
-# completely independently of the public API (e.g. to redeploy/restart the
-# API without dropping the device connection). Most deployments do not need it.
+# Two independent device data paths feed the SAME 7-agent pipeline:
+#   - BLE wearables (patient self-pairs via iOS app) → POST /devices/register
+#     → in-process MessageBus → DataAcquisitionAgent (unchanged, no Kafka)
+#   - Pacemakers/ICDs (clinician registers, vendor gateway pushes ongoing
+#     data) → POST /vendor-gateway/ingest → Kafka → DataAcquisitionAgent
+# Both paths stay active permanently — see DEPLOYMENT_GUIDE.md.
 #
 # HOW TO DEPLOY
 # -------------
 #   1. Push this file to the root of your GitHub repo, alongside
-#      iomt_cardioai_production.py and requirements.txt.
+#      iomt_cardioai_production.py, db.py, kafka_bus.py, requirements.txt,
+#      and migrations/001_create_users.sql + 002_create_large_devices.sql.
 #   2. In the Render Dashboard: New + -> Blueprint -> connect this repo.
-#   3. Render reads this file and creates the service automatically.
-#   4. Go to the service -> Environment -> fill in the two secrets marked
-#      "sync: false" below (IOMT_SHARED_SECRET, IOMT_JWT_SECRET).
-#      Generate each with:
-#        python3 -c "import secrets; print(secrets.token_urlsafe(48))"
-#   5. Update IOMT_SERVER_WS_URL to point at your real IoMT hardware server.
-#   6. Copy the public URL Render gives you (e.g. https://cardioai-api.onrender.com)
-#      into your iOS app's CARDIOAI_API_URL build setting and into the
-#      dashboard's Configure panel.
+#   3. Render provisions the database and the API service, auto-wiring
+#      DATABASE_URL.
+#   4. Go to cardioai-api -> Environment -> fill in all secrets marked
+#      "sync: false" below.
+#   5. Run BOTH migrations once against the new database, in order:
+#        psql "<connection-string>" -f migrations/001_create_users.sql
+#        psql "<connection-string>" -f migrations/002_create_large_devices.sql
+#   6. Copy the cardioai-api public URL into your iOS app's CARDIOAI_API_URL
+#      build setting and into the dashboard's Configure panel.
 #
 # ==============================================================================
+
+databases:
+  - name: cardioai-db
+    plan: free
+    region: oregon
+    databaseName: cardioai
+    user: cardioai
 
 services:
 
   # ============================================================================
-  # cardioai-api — HTTP REST API + 7-agent pipeline (single combined service)
+  # cardioai-api — HTTP REST API + 7-agent pipeline + outbound bridge
+  # connector + Kafka vendor-event consumer (all in one process)
   # ============================================================================
   - type: web
     name: cardioai-api
@@ -50,24 +68,27 @@ services:
     plan: starter
     region: oregon
     branch: main
-    buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements-test.txt
+    buildCommand: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
     startCommand: python iomt_cardioai_production.py
     healthCheckPath: /health
     autoDeploy: true
     envVars:
       # -- Python runtime version --------------------------------------------------
-      # Pinned to 3.11 — bcrypt==4.1.2 has guaranteed prebuilt manylinux wheels
-      # for this version. Render defaults to the latest available Python
-      # unless told otherwise, which may be newer than bcrypt has wheels for,
-      # forcing a from-source build (requires Rust) that fails on Render's
-      # default build image.
+      # Pinned to 3.11 — bcrypt==4.1.2 and asyncpg both have guaranteed
+      # prebuilt manylinux wheels for this version.
       - key: PYTHON_VERSION
         value: 3.11.9
 
+      # -- Database -- auto-wired from the cardioai-db database above -----------
+      - key: DATABASE_URL
+        fromDatabase:
+          name: cardioai-db
+          property: connectionString
+
       # -- Run mode --------------------------------------------------------------
-      # "all" = HTTP API + outbound bridge connector in one process (recommended
-      # for a single Render service). Use "api" instead if you split the bridge
-      # connector into its own worker service (see commented block below).
+      # "all" = HTTP API + outbound bridge connector + Kafka consumer in one
+      # process. Use "api" instead if you split the bridge connector into
+      # its own worker service (see commented block below).
       - key: CARDIOAI_RUN_MODE
         value: all
 
@@ -81,16 +102,38 @@ services:
       - key: CARDIOAI_BACKEND_ID
         value: cardioai-render-prod
 
-      # -- IoMT hardware server (update to your real device server) -------------
+      # -- IoMT hardware server -- for BLE-gateway hardware, NOT pacemakers ------
+      # This is the outbound connection target for the existing
+      # IoMTServerConnector (RPM/BLE device aggregation path), unrelated to
+      # the large-device/vendor-gateway path below. Point this at a real
+      # IoMT hardware aggregation server when you have one; until then this
+      # connector will just retry quietly in the background with no effect
+      # on the rest of the system.
       - key: IOMT_SERVER_WS_URL
         value: wss://your-iomt-hardware-server.example.com/stream
       - key: IOMT_SERVER_ID
         value: iomt-hw-server-001
 
+      # -- Kafka -- large/implanted device vendor gateway pipeline --------------
+      # Required for production use with real pacemaker/ICD vendor gateways.
+      # Without these set, the system still works via an in-memory fallback
+      # queue (events do not survive a restart) — fine for initial testing,
+      # not for production. Example values shown are for Upstash Kafka;
+      # adjust KAFKA_SECURITY_PROTOCOL / KAFKA_SASL_MECHANISM for your
+      # specific provider (Confluent Cloud, AWS MSK, self-hosted, etc).
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false
+      - key: KAFKA_SECURITY_PROTOCOL
+        value: SASL_SSL
+      - key: KAFKA_SASL_MECHANISM
+        value: SCRAM-SHA-256
+      - key: KAFKA_SASL_USERNAME
+        sync: false
+      - key: KAFKA_SASL_PASSWORD
+        sync: false
+
       # -- HTTP API binding --------------------------------------------------------
-      # Render automatically injects a PORT environment variable into every
-      # web service — the app reads it directly (see api_port property in
-      # iomt_cardioai_production.py). No explicit CARDIOAI_API_PORT needed here.
+      # Render automatically injects PORT — the app reads it directly.
       - key: CARDIOAI_API_HOST
         value: 0.0.0.0
 
@@ -133,11 +176,10 @@ services:
         value: json
 
   # ============================================================================
-  # OPTIONAL -- cardioai-bridge worker (uncomment to run the outbound device
-  # connector as a separate background worker, independent of the public API).
-  # Most deployments do NOT need this -- CARDIOAI_RUN_MODE=all above already
-  # covers it. Only use this split if you want to restart the API service
-  # without interrupting the live device connection.
+  # OPTIONAL -- cardioai-bridge worker (uncomment to run the outbound BLE
+  # hardware connector as a separate background worker, independent of the
+  # public API). Most deployments do NOT need this -- CARDIOAI_RUN_MODE=all
+  # above already covers it.
   # ============================================================================
   # - type: worker
   #   name: cardioai-bridge
@@ -151,6 +193,10 @@ services:
   #   envVars:
   #     - key: CARDIOAI_RUN_MODE
   #       value: bridge
+  #     - key: DATABASE_URL
+  #       fromDatabase:
+  #         name: cardioai-db
+  #         property: connectionString
   #     - key: IOMT_SHARED_SECRET
   #       sync: false
   #     - key: IOMT_JWT_SECRET
