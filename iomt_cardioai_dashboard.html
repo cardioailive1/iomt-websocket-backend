@@ -558,7 +558,7 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
 <div class="cfg-ov" id="cfgOv" onclick="maybeCfgClose(event)">
   <div class="cfg-box">
     <h3>Backend configuration</h3>
-    <p class="cfg-sub">Connect to your live CardioAI backend. Polls /health, /devices, /alerts every 5 s.</p>
+    <p class="cfg-sub">Connect to your live CardioAI backend. Polls /status, /devices, /alerts every 5 s.</p>
     <div class="cfg-f"><label class="cfg-lbl">API Base URL</label><input class="cfg-input" id="cfgUrl" placeholder="https://cardioai.hospital.local/api" /></div>
     <div class="cfg-f"><label class="cfg-lbl">Bearer token (from /auth/login)</label><input class="cfg-input" id="cfgTok" type="password" placeholder="eyJhbGciOiJIUzI1NiIs..." /></div>
     <div class="cfg-f"><label class="cfg-lbl">Poll interval (seconds)</label><input class="cfg-input" id="cfgInt" type="number" min="2" max="60" value="5" /></div>
@@ -603,7 +603,7 @@ function closeCfg(){document.getElementById('cfgOv').classList.remove('open');}
 function maybeCfgClose(e){if(e.target.id==='cfgOv')closeCfg();}
 function applyCfg(){CFG.url=document.getElementById('cfgUrl').value.trim().replace(/\/$/,'');CFG.tok=document.getElementById('cfgTok').value.trim();CFG.int=Math.max(2,parseInt(document.getElementById('cfgInt').value)||5);sessionStorage.setItem('ca_url',CFG.url);sessionStorage.setItem('ca_tok',CFG.tok);sessionStorage.setItem('ca_int',CFG.int);closeCfg();if(CFG.url){startPoll();document.getElementById('banner').classList.remove('show');}}
 function setStatus(cls,txt){const p=document.getElementById('spill');p.className='spill '+cls;document.getElementById('sptxt').textContent=txt;}
-async function fetchAll(){if(!CFG.url)return;const h=CFG.tok?{'Authorization':'Bearer '+CFG.tok,'Accept':'application/json'}:{'Accept':'application/json'};setStatus('loading','Fetching...');try{const[hr,dr,ar]=await Promise.all([fetch(CFG.url+'/health',{headers:h}),fetch(CFG.url+'/devices',{headers:h}),fetch(CFG.url+'/alerts',{headers:h})]);if(!hr.ok)throw new Error('HTTP '+hr.status);cache.health=await hr.json();cache.devices=await dr.json();cache.alerts=await ar.json();setStatus('live','Live');document.getElementById('banner').classList.remove('show');const db=document.getElementById('demo-badge');if(db)db.style.display='none';renderAll();}catch(e){setStatus('err','Unreachable');document.getElementById('banner').classList.add('show');}}
+async function fetchAll(){if(!CFG.url)return;const h=CFG.tok?{'Authorization':'Bearer '+CFG.tok,'Accept':'application/json'}:{'Accept':'application/json'};setStatus('loading','Fetching...');try{const[hr,dr,ar]=await Promise.all([fetch(CFG.url+'/status',{headers:h}),fetch(CFG.url+'/devices',{headers:h}),fetch(CFG.url+'/alerts',{headers:h})]);if(!hr.ok)throw new Error('HTTP '+hr.status);cache.health=await hr.json();cache.devices=await dr.json();cache.alerts=await ar.json();setStatus('live','Live');document.getElementById('banner').classList.remove('show');const db=document.getElementById('demo-badge');if(db)db.style.display='none';renderAll();}catch(e){setStatus('err','Unreachable');document.getElementById('banner').classList.add('show');}}
 function startPoll(){if(pollT)clearInterval(pollT);fetchAll();pollT=setInterval(fetchAll,CFG.int*1000);}
 function renderAll(){renderLive();renderDevices();renderAlerts();updateBadge();}
 function setText(id,v){const e=document.getElementById(id);if(e)e.textContent=v;}
