@@ -1,0 +1,160 @@
+# render.yaml
+# ==============================================================================
+# Render.com Blueprint — IoMT CardioAI Backend
+# ==============================================================================
+#
+# Deploys iomt_cardioai_production.py to Render.com.
+#
+# Architecture note
+# ------------------
+# This backend has exactly ONE public-facing listener: the aiohttp HTTP API
+# (GET/POST /auth/*, /devices, /alerts, /reports, /health). The 7-agent
+# pipeline's "bridge" component makes an OUTBOUND WebSocket connection to
+# your real IoMT hardware server (IOMT_SERVER_WS_URL) — it does not itself
+# accept inbound connections, so it needs no public port of its own.
+#
+# That means a single Render web service is normally all you need
+# (CARDIOAI_RUN_MODE=all runs the HTTP API + the outbound bridge connector
+# together in one process, sharing Render's one public $PORT for the API).
+#
+# An optional second "worker" service is included below, commented out, for
+# the rare case where you want the outbound bridge connector running
+# completely independently of the public API (e.g. to redeploy/restart the
+# API without dropping the device connection). Most deployments do not need it.
+#
+# HOW TO DEPLOY
+# -------------
+#   1. Push this file to the root of your GitHub repo, alongside
+#      iomt_cardioai_production.py and requirements.txt.
+#   2. In the Render Dashboard: New + -> Blueprint -> connect this repo.
+#   3. Render reads this file and creates the service automatically.
+#   4. Go to the service -> Environment -> fill in the two secrets marked
+#      "sync: false" below (IOMT_SHARED_SECRET, IOMT_JWT_SECRET).
+#      Generate each with:
+#        python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+#   5. Update IOMT_SERVER_WS_URL to point at your real IoMT hardware server.
+#   6. Copy the public URL Render gives you (e.g. https://cardioai-api.onrender.com)
+#      into your iOS app's CARDIOAI_API_URL build setting and into the
+#      dashboard's Configure panel.
+#
+# ==============================================================================
+
+services:
+
+  # ============================================================================
+  # cardioai-api — HTTP REST API + 7-agent pipeline (single combined service)
+  # ============================================================================
+  - type: web
+    name: cardioai-api
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python iomt_cardioai_production.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # -- Run mode --------------------------------------------------------------
+      # "all" = HTTP API + outbound bridge connector in one process (recommended
+      # for a single Render service). Use "api" instead if you split the bridge
+      # connector into its own worker service (see commented block below).
+      - key: CARDIOAI_RUN_MODE
+        value: all
+
+      # -- Required secrets -- fill in via Render Dashboard after first deploy --
+      - key: IOMT_SHARED_SECRET
+        sync: false
+      - key: IOMT_JWT_SECRET
+        sync: false
+
+      # -- Required identifiers ---------------------------------------------------
+      - key: CARDIOAI_BACKEND_ID
+        value: cardioai-render-prod
+
+      # -- IoMT hardware server (update to your real device server) -------------
+      - key: IOMT_SERVER_WS_URL
+        value: wss://your-iomt-hardware-server.example.com/stream
+      - key: IOMT_SERVER_ID
+        value: iomt-hw-server-001
+
+      # -- HTTP API binding -- Render injects PORT, app reads CARDIOAI_API_PORT --
+      - key: CARDIOAI_API_HOST
+        value: 0.0.0.0
+      - key: CARDIOAI_API_PORT
+        fromService:
+          type: web
+          name: cardioai-api
+          envVarKey: PORT
+
+      # -- JWT / token configuration -----------------------------------------------
+      - key: JWT_ALGORITHM
+        value: HS256
+      - key: TOKEN_TTL_SECONDS
+        value: "3600"
+      - key: REFRESH_TOKEN_TTL_SECONDS
+        value: "604800"
+      - key: MFA_REQUIRED
+        value: "false"
+
+      # -- CORS -- set to your dashboard's real domain before going live --------
+      - key: ALLOWED_ORIGINS
+        value: "*"
+
+      # -- Apple Sign In (iOS) -------------------------------------------------------
+      - key: APPLE_VERIFY_TOKENS
+        value: "false"
+      - key: APPLE_BUNDLE_ID
+        value: com.cardioai.iomt
+
+      # -- Pipeline tuning -------------------------------------------------------------
+      - key: RPM_POLL_INTERVAL_SEC
+        value: "1.0"
+      - key: HEARTBEAT_INTERVAL_SEC
+        value: "10.0"
+      - key: RECONNECT_MAX_ATTEMPTS
+        value: "5"
+      - key: RECONNECT_BASE_DELAY_SEC
+        value: "2.0"
+      - key: INBOUND_QUEUE_MAXSIZE
+        value: "2000"
+
+      # -- Logging -------------------------------------------------------------------
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_FORMAT
+        value: json
+
+  # ============================================================================
+  # OPTIONAL -- cardioai-bridge worker (uncomment to run the outbound device
+  # connector as a separate background worker, independent of the public API).
+  # Most deployments do NOT need this -- CARDIOAI_RUN_MODE=all above already
+  # covers it. Only use this split if you want to restart the API service
+  # without interrupting the live device connection.
+  # ============================================================================
+  # - type: worker
+  #   name: cardioai-bridge
+  #   runtime: python
+  #   plan: starter
+  #   region: oregon
+  #   branch: main
+  #   buildCommand: pip install -r requirements.txt
+  #   startCommand: python iomt_cardioai_production.py
+  #   autoDeploy: true
+  #   envVars:
+  #     - key: CARDIOAI_RUN_MODE
+  #       value: bridge
+  #     - key: IOMT_SHARED_SECRET
+  #       sync: false
+  #     - key: IOMT_JWT_SECRET
+  #       sync: false
+  #     - key: CARDIOAI_BACKEND_ID
+  #       value: cardioai-bridge-prod
+  #     - key: IOMT_SERVER_WS_URL
+  #       value: wss://your-iomt-hardware-server.example.com/stream
+  #     - key: IOMT_SERVER_ID
+  #       value: iomt-hw-server-001
+  #     - key: LOG_LEVEL
+  #       value: INFO
+  #     - key: LOG_FORMAT
+  #       value: json
