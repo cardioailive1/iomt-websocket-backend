@@ -1,35 +1,8 @@
-# db.py
-# ==============================================================================
-# IoMT CardioAI — PostgreSQL Database Layer
-# ==============================================================================
-#
-# Replaces the in-memory _STUB_USERS dict and RefreshTokenStore class with
-# real asyncpg-backed Postgres queries. Drop this file alongside
-# iomt_cardioai_production.py and import from it.
-#
-# Required environment variable
-# -------------------------------
-#   DATABASE_URL   postgres connection string, e.g.
-#                   postgresql://user:pass@host:5432/dbname
-#                   Render auto-provisions this when you attach a Postgres
-#                   database to your service via render.yaml.
-#
-# Schema
-# ------
-#   See migrations/001_create_users.sql — run that once before first deploy.
-#
-# Pool lifecycle
-# ---------------
-#   Call `await db.connect()` once at startup (in main()), and
-#   `await db.disconnect()` on shutdown. A single connection pool is shared
-#   across all requests.
-# ==============================================================================
-
+# db.py (patched)
 from __future__ import annotations
 
 import logging
 import os
-import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -40,10 +13,6 @@ import bcrypt
 logger = logging.getLogger("cardioai.db")
 
 
-# ============================================================================
-# User Role (mirrors the enum in iomt_cardioai_production.py)
-# ============================================================================
-
 class UserRole(str, Enum):
     PATIENT      = "patient"
     NURSE        = "nurse"
@@ -51,14 +20,8 @@ class UserRole(str, Enum):
     ADMIN        = "admin"
 
 
-# ============================================================================
-# User Model
-# ============================================================================
-
 @dataclass
 class HospitalUser:
-    """Represents an authenticated user, loaded from Postgres."""
-
     id:            str
     email:         str
     name:          str
@@ -71,43 +34,41 @@ class HospitalUser:
     mfa_secret:    Optional[str] = field(default=None, repr=False)
 
     def verify_password(self, plain: str) -> bool:
-        """Constant-time bcrypt verification."""
         if not self.password_hash:
             return False
         try:
-            return bcrypt.checkpw(
-                plain.encode("utf-8"),
-                self.password_hash.encode("utf-8"),
-            )
+            return bcrypt.checkpw(plain.encode("utf-8"), self.password_hash.encode("utf-8"))
         except Exception:
             return False
 
     @classmethod
     def from_row(cls, row: asyncpg.Record) -> "HospitalUser":
+        # PATCHED: defensive against schema drift — uses .get()-with-default
+        # via explicit key membership checks instead of row["col"] direct
+        # indexing, so a column that doesn't exist in your actual migration
+        # (e.g. no apple_user_id / mfa_secret / organization column) no
+        # longer crashes every single request that loads a user with a
+        # raw, unhandled KeyError.
+        keys = row.keys()
         return cls(
             id            = str(row["id"]),
             email         = row["email"],
-            name          = row["name"],
+            name          = row["name"] if "name" in keys else (
+                              row["full_name"] if "full_name" in keys else ""
+                           ),
             role          = UserRole(row["role"]),
-            patient_id    = row["patient_id"],
+            patient_id    = row["patient_id"] if "patient_id" in keys else None,
             password_hash = row["password_hash"] or "",
-            organization  = row["organization"] if "organization" in row.keys() else "",
-            apple_user_id = row["apple_user_id"],
+            organization  = row["organization"] if "organization" in keys else "",
+            apple_user_id = row["apple_user_id"] if "apple_user_id" in keys else (
+                              row["apple_sub"] if "apple_sub" in keys else None
+                           ),
             is_active     = row["is_active"],
-            mfa_secret    = row["mfa_secret"],
+            mfa_secret    = row["mfa_secret"] if "mfa_secret" in keys else None,
         )
 
 
-# ============================================================================
-# Database Pool Manager
-# ============================================================================
-
 class Database:
-    """
-    Owns the asyncpg connection pool and exposes all user/token/audit queries.
-    Construct once, call connect() at startup, disconnect() at shutdown.
-    """
-
     def __init__(self, dsn: Optional[str] = None) -> None:
         self._dsn = dsn or os.environ.get("DATABASE_URL", "")
         self._pool: Optional[asyncpg.Pool] = None
@@ -118,19 +79,9 @@ class Database:
 
     async def connect(self) -> None:
         if not self._dsn:
-            raise RuntimeError(
-                "DATABASE_URL is not set. Attach a PostgreSQL database to "
-                "this service (see render.yaml) or set DATABASE_URL manually."
-            )
-        # Render's internal Postgres URLs sometimes use postgres:// — asyncpg
-        # requires postgresql://
+            raise RuntimeError("DATABASE_URL is not set.")
         dsn = self._dsn.replace("postgres://", "postgresql://", 1)
-        self._pool = await asyncpg.create_pool(
-            dsn,
-            min_size=2,
-            max_size=10,
-            command_timeout=10,
-        )
+        self._pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10, command_timeout=10)
         logger.info("[DB] connection pool established")
 
     async def disconnect(self) -> None:
@@ -143,46 +94,31 @@ class Database:
             raise RuntimeError("Database not connected — call connect() first")
         return self._pool
 
-    # ── User queries ─────────────────────────────────────────────────────────
-
     async def get_user_by_email(self, email: str) -> Optional[HospitalUser]:
         pool = self._require_pool()
-        row = await pool.fetchrow(
-            "SELECT * FROM users WHERE email = $1", email.lower().strip()
-        )
+        row = await pool.fetchrow("SELECT * FROM users WHERE email = $1", email.lower().strip())
         return HospitalUser.from_row(row) if row else None
 
     async def get_user_by_id(self, user_id: str) -> Optional[HospitalUser]:
         pool = self._require_pool()
         try:
-            row = await pool.fetchrow(
-                "SELECT * FROM users WHERE id = $1::uuid", user_id
-            )
+            row = await pool.fetchrow("SELECT * FROM users WHERE id = $1::uuid", user_id)
         except (ValueError, asyncpg.DataError):
             return None
         return HospitalUser.from_row(row) if row else None
 
     async def get_user_by_apple_id(self, apple_user_id: str) -> Optional[HospitalUser]:
         pool = self._require_pool()
-        row = await pool.fetchrow(
-            "SELECT * FROM users WHERE apple_user_id = $1", apple_user_id
-        )
+        row = await pool.fetchrow("SELECT * FROM users WHERE apple_user_id = $1", apple_user_id)
         return HospitalUser.from_row(row) if row else None
 
-    async def create_patient_from_apple(
-        self,
-        apple_user_id: str,
-        email:         str,
-        name:          str,
-    ) -> HospitalUser:
-        """Auto-provision a patient account on first Apple Sign In."""
+    async def create_patient_from_apple(self, apple_user_id: str, email: str, name: str) -> HospitalUser:
         pool = self._require_pool()
         row = await pool.fetchrow(
             """
             INSERT INTO users (email, name, role, patient_id, apple_user_id, password_hash, is_active)
             VALUES ($1, $2, 'patient', $3, $4, '', true)
-            ON CONFLICT (email) DO UPDATE
-                SET apple_user_id = EXCLUDED.apple_user_id
+            ON CONFLICT (email) DO UPDATE SET apple_user_id = EXCLUDED.apple_user_id
             RETURNING *
             """,
             email, name, apple_user_id, apple_user_id,
@@ -192,17 +128,9 @@ class Database:
 
     async def update_last_login(self, user_id: str) -> None:
         pool = self._require_pool()
-        await pool.execute(
-            "UPDATE users SET last_login_at = now() WHERE id = $1::uuid", user_id
-        )
+        await pool.execute("UPDATE users SET last_login_at = now() WHERE id = $1::uuid", user_id)
 
-    async def list_users(
-        self,
-        role:   Optional[UserRole] = None,
-        limit:  int = 100,
-        offset: int = 0,
-    ) -> List[HospitalUser]:
-        """Admin-only: list all users, optionally filtered by role."""
+    async def list_users(self, role: Optional[UserRole] = None, limit: int = 100, offset: int = 0) -> List[HospitalUser]:
         pool = self._require_pool()
         if role is not None:
             rows = await pool.fetch(
@@ -210,45 +138,118 @@ class Database:
                 role.value, limit, offset,
             )
         else:
-            rows = await pool.fetch(
-                "SELECT * FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2",
-                limit, offset,
-            )
+            rows = await pool.fetch("SELECT * FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2", limit, offset)
         return [HospitalUser.from_row(r) for r in rows]
 
     async def set_user_active(self, user_id: str, is_active: bool) -> bool:
-        """Admin-only: enable/disable an account."""
         pool = self._require_pool()
-        result = await pool.execute(
-            "UPDATE users SET is_active = $1 WHERE id = $2::uuid", is_active, user_id
-        )
+        result = await pool.execute("UPDATE users SET is_active = $1 WHERE id = $2::uuid", is_active, user_id)
         return result != "UPDATE 0"
 
     async def set_user_role(self, user_id: str, role: UserRole) -> bool:
-        """Admin-only: change a user's role."""
         pool = self._require_pool()
-        result = await pool.execute(
-            "UPDATE users SET role = $1 WHERE id = $2::uuid", role.value, user_id
-        )
+        result = await pool.execute("UPDATE users SET role = $1 WHERE id = $2::uuid", role.value, user_id)
         return result != "UPDATE 0"
 
-    async def create_staff_user(
-        self,
-        email:         str,
-        name:          str,
-        role:          UserRole,
-        password_hash: str,
-        organization:  str = "",
-        is_active:     bool = True,
-    ) -> HospitalUser:
+    async def get_organization_domains(self, organization: str) -> List[str]:
         """
-        Create a new nurse/cardiologist/admin account.
+        LEGACY fallback (pre-organizations-table heuristic): return the
+        distinct email domains already used by accounts registered under
+        this organization name (case-insensitive match on organization).
+        Only used by signup() when no canonical `organizations` row exists
+        yet for this name — see get_organization_by_name() below, which is
+        checked first.
+        """
+        pool = self._require_pool()
+        rows = await pool.fetch(
+            """
+            SELECT DISTINCT lower(split_part(email, '@', 2)) AS domain
+            FROM users
+            WHERE lower(organization) = lower($1) AND organization IS NOT NULL AND organization != ''
+            """,
+            organization.strip(),
+        )
+        return [r["domain"] for r in rows if r["domain"]]
 
-        is_active=True  — admin-created accounts (POST /admin/users), active immediately.
-        is_active=False — self-registered accounts (POST /auth/signup), pending admin
-                          approval before they can sign in. An admin must call
-                          PATCH /admin/users/{id} with {"is_active": true} to activate.
+    # ── Canonical organization registry ─────────────────────────────────────
+
+    @staticmethod
+    def _normalize_org_name(name: str) -> str:
+        return " ".join(name.strip().lower().split())
+
+    async def get_organization_by_name(self, name: str) -> Optional["Organization"]:
+        """Look up a canonical organization record by name (case/whitespace-insensitive)."""
+        pool = self._require_pool()
+        row = await pool.fetchrow(
+            "SELECT * FROM organizations WHERE name_normalized = $1",
+            self._normalize_org_name(name),
+        )
+        return Organization.from_row(row) if row else None
+
+    async def get_organization_by_id(self, org_id: str) -> Optional["Organization"]:
+        pool = self._require_pool()
+        try:
+            row = await pool.fetchrow("SELECT * FROM organizations WHERE id = $1::uuid", org_id)
+        except (ValueError, asyncpg.DataError):
+            return None
+        return Organization.from_row(row) if row else None
+
+    async def list_organizations(self) -> List["Organization"]:
+        pool = self._require_pool()
+        rows = await pool.fetch("SELECT * FROM organizations ORDER BY name ASC")
+        return [Organization.from_row(r) for r in rows]
+
+    async def create_organization(
+        self, name: str, allowed_domains: Optional[List[str]] = None,
+        created_by: Optional[str] = None, auto_registered: bool = False,
+    ) -> "Organization":
         """
+        Create a canonical organization record.
+
+        auto_registered=True  — implicitly created by the first signup under
+                                 this name (no admin action yet); the founding
+                                 email's domain becomes its only allowed domain.
+        auto_registered=False — explicitly created by an admin via
+                                 POST /admin/organizations, who sets the
+                                 allowed domain list directly.
+        """
+        pool = self._require_pool()
+        domains = sorted({d.strip().lower() for d in (allowed_domains or []) if d.strip()})
+        row = await pool.fetchrow(
+            """
+            INSERT INTO organizations (name, name_normalized, allowed_domains, auto_registered, created_by)
+            VALUES ($1, $2, $3, $4, $5::uuid)
+            RETURNING *
+            """,
+            name.strip(), self._normalize_org_name(name), domains, auto_registered, created_by,
+        )
+        return Organization.from_row(row)
+
+    async def update_organization(
+        self, org_id: str, allowed_domains: Optional[List[str]] = None, name: Optional[str] = None,
+    ) -> Optional["Organization"]:
+        """Admin-only: update an organization's allowed domains and/or rename it."""
+        pool = self._require_pool()
+        sets, params = [], []
+        idx = 1
+        if allowed_domains is not None:
+            domains = sorted({d.strip().lower() for d in allowed_domains if d.strip()})
+            sets.append(f"allowed_domains = ${idx}"); params.append(domains); idx += 1
+        if name is not None:
+            sets.append(f"name = ${idx}"); params.append(name.strip()); idx += 1
+            sets.append(f"name_normalized = ${idx}"); params.append(self._normalize_org_name(name)); idx += 1
+        if not sets:
+            return await self.get_organization_by_id(org_id)
+        sets.append("updated_at = now()")
+        params.append(org_id)
+        query = f"UPDATE organizations SET {', '.join(sets)} WHERE id = ${idx}::uuid RETURNING *"
+        row = await pool.fetchrow(query, *params)
+        return Organization.from_row(row) if row else None
+
+    async def create_staff_user(
+        self, email: str, name: str, role: UserRole, password_hash: str,
+        organization: str = "", is_active: bool = True,
+    ) -> HospitalUser:
         pool = self._require_pool()
         row = await pool.fetchrow(
             """
@@ -260,42 +261,27 @@ class Database:
         )
         return HospitalUser.from_row(row)
 
-    # ── Refresh token queries ────────────────────────────────────────────────
-
     async def issue_refresh_token(self, user_id: str, ttl_seconds: int) -> str:
         import secrets as _secrets
         pool = self._require_pool()
         token_id = _secrets.token_urlsafe(48)
         await pool.execute(
-            """
-            INSERT INTO refresh_tokens (token_id, user_id, expires_at)
-            VALUES ($1, $2::uuid, now() + ($3 || ' seconds')::interval)
-            """,
+            "INSERT INTO refresh_tokens (token_id, user_id, expires_at) VALUES ($1, $2::uuid, now() + ($3 || ' seconds')::interval)",
             token_id, user_id, str(ttl_seconds),
         )
         return token_id
 
     async def consume_refresh_token(self, token_id: str) -> Optional[str]:
-        """
-        Validate + rotate (delete) in one atomic query. Returns user_id or None.
-        """
         pool = self._require_pool()
         row = await pool.fetchrow(
-            """
-            DELETE FROM refresh_tokens
-            WHERE token_id = $1 AND expires_at > now()
-            RETURNING user_id
-            """,
+            "DELETE FROM refresh_tokens WHERE token_id = $1 AND expires_at > now() RETURNING user_id",
             token_id,
         )
         return str(row["user_id"]) if row else None
 
     async def revoke_all_refresh_tokens(self, user_id: str) -> int:
         pool = self._require_pool()
-        result = await pool.execute(
-            "DELETE FROM refresh_tokens WHERE user_id = $1::uuid", user_id
-        )
-        # result looks like "DELETE 3"
+        result = await pool.execute("DELETE FROM refresh_tokens WHERE user_id = $1::uuid", user_id)
         try:
             return int(result.split()[-1])
         except (ValueError, IndexError):
@@ -303,57 +289,28 @@ class Database:
 
     async def purge_expired_refresh_tokens(self) -> int:
         pool = self._require_pool()
-        result = await pool.execute(
-            "DELETE FROM refresh_tokens WHERE expires_at <= now()"
-        )
+        result = await pool.execute("DELETE FROM refresh_tokens WHERE expires_at <= now()")
         try:
             return int(result.split()[-1])
         except (ValueError, IndexError):
             return 0
 
-    # ── Audit log ────────────────────────────────────────────────────────────
-
-    async def log_event(
-        self,
-        event_type: str,
-        user_id:    Optional[str] = None,
-        ip_address: Optional[str] = None,
-        detail:     Optional[str] = None,
-    ) -> None:
+    async def log_event(self, event_type: str, user_id: Optional[str] = None, ip_address: Optional[str] = None, detail: Optional[str] = None) -> None:
         pool = self._require_pool()
         try:
             await pool.execute(
-                """
-                INSERT INTO audit_log (user_id, event_type, ip_address, detail)
-                VALUES ($1::uuid, $2, $3, $4)
-                """,
+                "INSERT INTO audit_log (user_id, event_type, ip_address, detail) VALUES ($1::uuid, $2, $3, $4)",
                 user_id, event_type, ip_address, detail,
             )
         except Exception as exc:
-            # Audit logging must never break the request it's logging
             logger.warning("[DB] audit log write failed: %s", exc)
 
-    # ── Large / implanted device registry ───────────────────────────────────
-
     async def register_large_device(
-        self,
-        vendor_device_id:          str,
-        vendor:                    str,
-        device_type:               str,
-        patient_id:                str,
-        model_number:              Optional[str] = None,
-        implanted_at:              Optional[str] = None,
-        implanting_clinician_id:   Optional[str] = None,
-        registered_by_user_id:     Optional[str] = None,
-        vendor_account_ref:        Optional[str] = None,
-        notes:                     Optional[str] = None,
+        self, vendor_device_id: str, vendor: str, device_type: str, patient_id: str,
+        model_number: Optional[str] = None, implanted_at: Optional[str] = None,
+        implanting_clinician_id: Optional[str] = None, registered_by_user_id: Optional[str] = None,
+        vendor_account_ref: Optional[str] = None, notes: Optional[str] = None,
     ) -> "LargeDevice":
-        """
-        Register a pacemaker / ICD / other implanted device against a
-        patient. Called by a clinician via POST /clinical/devices/register-implant
-        — never by a patient directly, since implants are placed by clinical
-        staff, not self-paired like a BLE wearable.
-        """
         pool = self._require_pool()
         row = await pool.fetchrow(
             """
@@ -364,8 +321,7 @@ class Database:
             )
             VALUES ($1, $2, $3, $4, $5, $6::date, $7::uuid, $8::uuid, $9, $10)
             ON CONFLICT (vendor_device_id) DO UPDATE
-                SET patient_id = EXCLUDED.patient_id,
-                    is_active  = true
+                SET patient_id = EXCLUDED.patient_id, is_active = true
             RETURNING *
             """,
             vendor_device_id, vendor, device_type, patient_id,
@@ -374,24 +330,12 @@ class Database:
         )
         return LargeDevice.from_row(row)
 
-    async def get_large_device_by_vendor_id(
-        self, vendor_device_id: str,
-    ) -> Optional["LargeDevice"]:
-        """Look up a registered implant by the vendor's device identifier."""
+    async def get_large_device_by_vendor_id(self, vendor_device_id: str) -> Optional["LargeDevice"]:
         pool = self._require_pool()
-        row = await pool.fetchrow(
-            "SELECT * FROM large_devices WHERE vendor_device_id = $1",
-            vendor_device_id,
-        )
+        row = await pool.fetchrow("SELECT * FROM large_devices WHERE vendor_device_id = $1", vendor_device_id)
         return LargeDevice.from_row(row) if row else None
 
-    async def list_large_devices(
-        self,
-        patient_id: Optional[str] = None,
-        vendor:     Optional[str] = None,
-        limit:      int = 100,
-        offset:     int = 0,
-    ) -> List["LargeDevice"]:
+    async def list_large_devices(self, patient_id: Optional[str] = None, vendor: Optional[str] = None, limit: int = 100, offset: int = 0) -> List["LargeDevice"]:
         pool = self._require_pool()
         conditions = []
         params: List[Any] = []
@@ -404,89 +348,45 @@ class Database:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.extend([limit, offset])
         rows = await pool.fetch(
-            f"SELECT * FROM large_devices {where} "
-            f"ORDER BY created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}",
+            f"SELECT * FROM large_devices {where} ORDER BY created_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}",
             *params,
         )
         return [LargeDevice.from_row(r) for r in rows]
 
     async def set_large_device_active(self, device_id: str, is_active: bool) -> bool:
         pool = self._require_pool()
-        result = await pool.execute(
-            "UPDATE large_devices SET is_active = $1 WHERE id = $2::uuid",
-            is_active, device_id,
-        )
+        result = await pool.execute("UPDATE large_devices SET is_active = $1 WHERE id = $2::uuid", is_active, device_id)
         return result != "UPDATE 0"
 
     async def touch_large_device_last_event(self, vendor_device_id: str) -> None:
         pool = self._require_pool()
-        await pool.execute(
-            "UPDATE large_devices SET last_event_at = now() WHERE vendor_device_id = $1",
-            vendor_device_id,
-        )
-
-    # ── Vendor API keys ──────────────────────────────────────────────────────
+        await pool.execute("UPDATE large_devices SET last_event_at = now() WHERE vendor_device_id = $1", vendor_device_id)
 
     async def verify_vendor_api_key(self, raw_key: str) -> Optional[str]:
-        """
-        Hash the provided raw key with SHA-256 and look it up. Returns the
-        vendor name if the key is valid and active, else None.
-
-        SHA-256 (not bcrypt) is deliberate here: this check runs on every
-        single ingested device event, potentially thousands per minute
-        across many devices. Vendor API keys are long, high-entropy,
-        machine-generated secrets — they don't need bcrypt's deliberate
-        slowness, which exists specifically to slow down brute-forcing
-        short human-chosen passwords.
-        """
         import hashlib as _hashlib
         pool = self._require_pool()
         key_hash = _hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
-        row = await pool.fetchrow(
-            "SELECT vendor, is_active FROM vendor_api_keys WHERE key_hash = $1",
-            key_hash,
-        )
+        row = await pool.fetchrow("SELECT vendor, is_active FROM vendor_api_keys WHERE key_hash = $1", key_hash)
         if row is None or not row["is_active"]:
             return None
-        await pool.execute(
-            "UPDATE vendor_api_keys SET last_used_at = now() WHERE key_hash = $1",
-            key_hash,
-        )
+        await pool.execute("UPDATE vendor_api_keys SET last_used_at = now() WHERE key_hash = $1", key_hash)
         return row["vendor"]
 
-    async def create_vendor_api_key(
-        self, vendor: str, label: str = "",
-    ) -> tuple[str, str]:
-        """
-        Admin-only: generate a new vendor API key. Returns (raw_key, key_id).
-        The raw key is shown to the admin EXACTLY ONCE at creation time and
-        is never recoverable afterward — only its hash is stored.
-        """
+    async def create_vendor_api_key(self, vendor: str, label: str = "") -> tuple[str, str]:
         import hashlib as _hashlib
         import secrets as _secrets
         pool = self._require_pool()
         raw_key = _secrets.token_urlsafe(40)
         key_hash = _hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
         row = await pool.fetchrow(
-            """
-            INSERT INTO vendor_api_keys (vendor, key_hash, label, is_active)
-            VALUES ($1, $2, $3, true)
-            RETURNING id
-            """,
+            "INSERT INTO vendor_api_keys (vendor, key_hash, label, is_active) VALUES ($1, $2, $3, true) RETURNING id",
             vendor, key_hash, label,
         )
         return raw_key, str(row["id"])
 
-    # ── Vendor raw event audit ────────────────────────────────────────────────
-
     async def log_vendor_event(
-        self,
-        vendor:           str,
-        raw_payload:      Dict[str, Any],
-        vendor_device_id: Optional[str] = None,
-        large_device_id:  Optional[str] = None,
-        matched:          bool = False,
-        kafka_published:  bool = False,
+        self, vendor: str, raw_payload: Dict[str, Any], vendor_device_id: Optional[str] = None,
+        large_device_id: Optional[str] = None, matched: bool = False, kafka_published: bool = False,
     ) -> None:
         import json as _json
         pool = self._require_pool()
@@ -504,14 +404,33 @@ class Database:
             logger.warning("[DB] vendor event audit write failed: %s", exc)
 
 
-# ============================================================================
-# Large Device Model
-# ============================================================================
+@dataclass
+class Organization:
+    """Canonical organization record — admin-managed allowed email domains."""
+
+    id:              str
+    name:            str
+    name_normalized: str
+    allowed_domains: List[str]
+    auto_registered: bool
+    created_by:      Optional[str]
+    created_at:      str
+
+    @classmethod
+    def from_row(cls, row: asyncpg.Record) -> "Organization":
+        return cls(
+            id              = str(row["id"]),
+            name            = row["name"],
+            name_normalized = row["name_normalized"],
+            allowed_domains = list(row["allowed_domains"] or []),
+            auto_registered = row["auto_registered"],
+            created_by      = str(row["created_by"]) if row["created_by"] else None,
+            created_at      = str(row["created_at"]),
+        )
+
 
 @dataclass
 class LargeDevice:
-    """Represents a registered implanted/large device (pacemaker, ICD, etc.)."""
-
     id:                      str
     vendor_device_id:        str
     vendor:                  str
@@ -544,10 +463,5 @@ class LargeDevice:
             last_event_at           = str(row["last_event_at"]) if row["last_event_at"] else None,
         )
 
-
-# ============================================================================
-# Module-level singleton (mirrors the pattern used for other globals
-# in iomt_cardioai_production.py)
-# ============================================================================
 
 db = Database()
