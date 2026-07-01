@@ -1,23 +1,28 @@
--- migrations/003_add_organization.sql
--- ==============================================================================
--- IoMT CardioAI — Add organization column to users table
--- ==============================================================================
--- Run this AFTER 001_create_users.sql and 002_create_large_devices.sql.
--- Safe to run on a database that already has the users table populated —
--- uses ADD COLUMN IF NOT EXISTS so it won't fail if already applied.
+-- migrations/003_create_organizations.sql
+-- Canonical organization registry with admin-managed allowed email domains.
+-- Run this AFTER 001_create_users.sql and 002_create_large_devices.sql
+-- (if you have that one) on your existing database.
 --
--- HOW TO RUN
--- ----------
---   psql "<connection-string>" -f migrations/003_add_organization.sql
--- ==============================================================================
+-- This does NOT touch the existing `users.organization` text column —
+-- that stays as-is for display purposes. This table is the source of
+-- truth for "which email domains are allowed to self-register under
+-- this organization name."
 
-ALTER TABLE users ADD COLUMN IF NOT EXISTS organization TEXT NOT NULL DEFAULT '';
+BEGIN;
 
--- Backfill a sensible default for the three seeded test accounts, if present
-UPDATE users SET organization = 'Test Hospital'
-WHERE email IN ('patient@hospital.local', 'nurse@hospital.local', 'cardio@hospital.local')
-  AND organization = '';
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- ── Verification query ────────────────────────────────────────────────────────
--- Run after migration:
---   SELECT email, organization, role FROM users;
+CREATE TABLE IF NOT EXISTS organizations (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name             TEXT UNIQUE NOT NULL,
+    name_normalized  TEXT UNIQUE NOT NULL,   -- lower(trim(name)), used for signup lookups
+    allowed_domains  TEXT[] NOT NULL DEFAULT '{}',
+    auto_registered  BOOLEAN NOT NULL DEFAULT FALSE,  -- true if created implicitly by first signup
+    created_by       UUID REFERENCES users(id),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_organizations_name_normalized ON organizations (name_normalized);
+
+COMMIT;
