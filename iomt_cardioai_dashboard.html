@@ -247,6 +247,7 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
     <button class="nb" onclick="sv('workflow')" id="tab-workflow"><div class="dot"></div>Clinical Workflow</button>
     <button class="nb" onclick="sv('emergency')" id="tab-emergency"><div class="dot"></div>Emergency Response</button>
     <button class="nb" onclick="sv('tests')" id="tab-tests"><div class="dot"></div>Test Suite</button>
+    <button class="nb" onclick="sv('admin');loadAdminUsers()" id="tab-admin" style="display:none"><div class="dot"></div>Admin<span class="bdg" id="admin-bdg">0</span></button>
   </div>
   <div class="tb-right">
     <div class="spill" id="spill"><div class="ind"></div><span id="sptxt">Not configured</span></div>
@@ -568,10 +569,30 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
   <div class="g-main" id="ts-panel"></div>
 </div>
 
+<!-- ADMIN — PENDING APPROVALS -->
+<div class="view" id="view-admin">
+  <div class="sec-hdr" style="margin-bottom:10px">User Accounts</div>
+  <div class="card" style="margin-bottom:14px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <span style="font-size:.7rem;font-weight:700;color:#fff">Pending Approval</span>
+      <span class="mono-tag" id="admin-pending-count">0</span>
+    </div>
+    <div id="admin-pending-list"><div class="empty-st">Loading…</div></div>
+  </div>
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <span style="font-size:.7rem;font-weight:700;color:#fff">All Accounts</span>
+      <span class="mono-tag" id="admin-total-count">0</span>
+    </div>
+    <div id="admin-all-list"><div class="empty-st">Loading…</div></div>
+  </div>
+</div>
+
 </div> <!-- /#appShell -->
 
 <!-- LOGIN / SIGNUP OVERLAY -->
 <div class="cfg-ov" id="loginOv">
+
   <div class="cfg-box" id="loginBox">
 
     <!-- SIGN IN VIEW -->
@@ -839,6 +860,85 @@ function renderAlerts(){const fb=document.getElementById('filt-btns');if(!fb.chi
 
 function updateBadge(){const n=cache.alerts.filter(x=>x.level==='critical').length;const b=document.getElementById('al-bdg');b.textContent=n;b.style.display=n>0?'inline-block':'none';}
 
+// ── Admin panel: pending approvals + all accounts ──────────────────────────
+// Uses the existing GET /admin/users and PATCH /admin/users/{id} endpoints —
+// no new backend routes needed. Only ever shown/callable for role=admin;
+// the backend independently enforces this via @require_role(UserRole.ADMIN)
+// regardless of what the UI shows, so hiding the tab here is a convenience,
+// not the actual security boundary.
+let _adminUsers = [];
+
+async function loadAdminUsers(){
+  if(!CFG.url||!CFG.tok||CFG.userRole!=='admin')return;
+  const pendingEl = document.getElementById('admin-pending-list');
+  const allEl = document.getElementById('admin-all-list');
+  try{
+    const resp = await fetch(CFG.url+'/admin/users',{headers:{'Authorization':'Bearer '+CFG.tok}});
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    _adminUsers = await resp.json();
+    renderAdminUsers();
+  }catch(e){
+    pendingEl.innerHTML = '<div class="empty-st">Could not load accounts. Check connection.</div>';
+    allEl.innerHTML = '';
+  }
+}
+
+function renderAdminUsers(){
+  const pending = _adminUsers.filter(u=>!u.is_active);
+  const pendingEl = document.getElementById('admin-pending-list');
+  const allEl = document.getElementById('admin-all-list');
+
+  document.getElementById('admin-pending-count').textContent = pending.length;
+  document.getElementById('admin-total-count').textContent = _adminUsers.length;
+  const badge = document.getElementById('admin-bdg');
+  if(badge){ badge.textContent = pending.length; badge.style.display = pending.length>0?'inline-block':'none'; }
+
+  pendingEl.innerHTML = pending.length===0
+    ? '<div class="empty-st">No accounts waiting for approval</div>'
+    : pending.map(u=>`
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:.68rem;font-weight:600;color:#fff">${esc(u.name)} <span style="color:var(--muted);font-weight:400">· ${esc(u.role)}</span></div>
+            <div style="font-family:var(--mono);font-size:.6rem;color:var(--text2)">${esc(u.email)}${u.organization?' · '+esc(u.organization):''}</div>
+          </div>
+          <button class="cfg-p" style="padding:5px 12px;font-size:.62rem;width:auto" onclick="approveUser('${u.id}')">Approve</button>
+        </div>`).join('');
+
+  allEl.innerHTML = _adminUsers.length===0
+    ? '<div class="empty-st">No accounts found</div>'
+    : _adminUsers.map(u=>`
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <div style="width:6px;height:6px;border-radius:50%;background:${u.is_active?'var(--green)':'var(--muted)'};flex-shrink:0"></div>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:.68rem;font-weight:600;color:#fff">${esc(u.name)} <span style="color:var(--muted);font-weight:400">· ${esc(u.role)}</span></div>
+            <div style="font-family:var(--mono);font-size:.6rem;color:var(--text2)">${esc(u.email)}${u.organization?' · '+esc(u.organization):''}</div>
+          </div>
+          <button class="cfg-p" style="padding:5px 12px;font-size:.62rem;width:auto;background:${u.is_active?'var(--card2)':'var(--green)'};color:${u.is_active?'var(--text2)':'#000'}" onclick="toggleUserActive('${u.id}',${!u.is_active})">${u.is_active?'Deactivate':'Activate'}</button>
+        </div>`).join('');
+}
+
+async function approveUser(id){
+  await toggleUserActive(id, true);
+}
+
+async function toggleUserActive(id, makeActive){
+  try{
+    const resp = await fetch(CFG.url+'/admin/users/'+id,{
+      method:'PATCH',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+CFG.tok},
+      body:JSON.stringify({is_active: makeActive})
+    });
+    if(!resp.ok){
+      const data = await resp.json().catch(()=>({}));
+      alert(data.message || data.error || ('Update failed (HTTP '+resp.status+')'));
+      return;
+    }
+    await loadAdminUsers();
+  }catch(e){
+    alert('Could not reach the backend. Check the URL and your connection.');
+  }
+}
+
 function buildAgents(){const g=document.getElementById('agtGrid');AGENTS.forEach((ag,i)=>{const d=document.createElement('div');d.className='agt-card';d.innerHTML=`<div class="agt-num">AGENT ${ag.num}</div><div class="agt-ico">${ag.ico}</div><div class="agt-nm">${ag.name}</div><div class="agt-dot"></div>`;d.onclick=()=>renderAgentDetail(ag,i);g.appendChild(d);});renderAgentDetail(AGENTS[0],0);}
 function renderAgentDetail(ag,idx){document.querySelectorAll('.agt-card').forEach((c,i)=>{c.style.borderColor=i===idx?'var(--green)':'';});document.getElementById('agt-detail').innerHTML=`<div class="card" style="margin-top:12px"><div style="display:flex;align-items:flex-start;gap:14px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)"><div style="font-size:2rem">${ag.ico}</div><div style="flex:1"><div style="font-size:.9rem;font-weight:700;color:#fff">${ag.name}</div><div style="font-family:var(--mono);font-size:.62rem;color:var(--green);margin-top:2px">class ${ag.cls}(BaseAgent)</div><div style="font-size:.65rem;color:var(--text2);margin-top:6px;line-height:1.6">${ag.desc}</div></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><div><div class="sec-hdr" style="margin-bottom:6px">Publishes</div>${ag.pub.map(t=>`<span class="mono-tag" style="display:inline-block;margin:2px;color:var(--green)">${t}</span>`).join('')}</div><div><div class="sec-hdr b" style="margin-bottom:6px">Subscribes</div>${ag.sub.map(t=>`<span class="mono-tag" style="display:inline-block;margin:2px;color:var(--blue)">${t}</span>`).join('')}</div></div></div>`;}
 
@@ -871,6 +971,19 @@ function initDashboard(){
   updateBadge();
   updateUserBadge();
   startPoll();
+
+  // Admin tab: only visible to role=admin. This is a UI convenience only —
+  // the backend independently enforces @require_role(UserRole.ADMIN) on
+  // /admin/* routes regardless of what this tab shows or hides.
+  const adminTab = document.getElementById('tab-admin');
+  if(adminTab){
+    if(CFG.userRole==='admin'){
+      adminTab.style.display='';
+      loadAdminUsers();
+    }else{
+      adminTab.style.display='none';
+    }
+  }
 }
 
 // Clock runs immediately (harmless, no patient data, just a wall clock).
