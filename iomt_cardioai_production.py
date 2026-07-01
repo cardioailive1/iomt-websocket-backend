@@ -3,92 +3,9 @@ IoMT CardioAI — Production System
 ===================================
 IoMT Server ↔ CardioAI Backend: HMAC-SHA256 handshake, real-time RPM
 streaming, 7-agent clinical AI pipeline, and authenticated HTTP API.
-
-Architecture
-------------
-  IoMT Server (WS) ──HMAC auth──► IoMTServerConnector
-                                        │ inbound_queue
-                                   RPMDataPump
-                                        │
-                              DataAcquisitionAgent
-                              DataProcessingAgent
-                              PatternRecognitionAgent
-                              DiagnosticAgent
-                              AlertMonitoringAgent
-                              PersonalizationAgent
-                              CommunicationAgent
-                                        │
-                              HTTP API (aiohttp)
-                              ├── POST /auth/apple    ← Sign in with Apple (iOS)
-                              ├── POST /auth/login    ← user authentication
-                              ├── POST /auth/refresh  ← token refresh
-                              ├── POST /auth/logout   ← revoke session
-                              ├── POST /devices/register ← register BLE device
-                              ├── GET  /health        ← liveness probe (no auth)
-                              ├── GET  /status        ← full bridge status (auth)
-                              ├── GET  /devices       ← device registry
-                              ├── GET  /alerts        ← active alerts
-                              └── GET  /reports       ← clinical reports
-
-Security model
---------------
-  1. 3-way HMAC-SHA256 challenge/response at WebSocket connection time.
-  2. JWT (HS256) session token for every subsequent WS message.
-  3. POST /auth/apple  — verifies Apple identityToken with Apple's public keys,
-     creates/loads the patient record, and issues access + refresh tokens.
-  4. POST /auth/login  — verifies user credentials (LDAP / stub), issues
-     short-lived access token (1h) + long-lived refresh token (7d).
-  5. POST /auth/refresh — exchanges a valid refresh token for a new pair.
-  6. All protected HTTP endpoints require Bearer JWT in Authorization header.
-  6. Secrets loaded exclusively from environment variables.
-  7. All comparisons use constant-time hmac.compare_digest().
-
-Required environment variables
--------------------------------
-  IOMT_SHARED_SECRET       HMAC shared secret (min 32 chars)
-  IOMT_JWT_SECRET          JWT signing secret  (min 32 chars)
-  IOMT_SERVER_WS_URL       wss://host/path
-  CARDIOAI_BACKEND_ID      unique service identifier
-
-Optional environment variables
--------------------------------
-  IOMT_SERVER_REST_URL       https://host/api/v1
-  IOMT_SERVER_ID             server identifier
-  CARDIOAI_WS_HOST           WebSocket listener host    (default 0.0.0.0)
-  CARDIOAI_WS_PORT           WebSocket listener port    (default 8765)
-  CARDIOAI_API_HOST          HTTP API host              (default 0.0.0.0)
-  CARDIOAI_API_PORT          HTTP API port              (default 8080)
-  JWT_ALGORITHM              HS256 | HS512              (default HS256)
-  TOKEN_TTL_SECONDS          access token TTL           (default 3600)
-  REFRESH_TOKEN_TTL_SECONDS  refresh token TTL          (default 604800)
-  MFA_REQUIRED               true | false               (default false)
-  ALLOWED_ORIGINS            CORS allowed origins       (default *)
-  RPM_POLL_INTERVAL_SEC      seconds between polls      (default 1.0)
-  HEARTBEAT_INTERVAL_SEC     WS keep-alive interval     (default 10.0)
-  RECONNECT_MAX_ATTEMPTS     before giving up           (default 5)
-  RECONNECT_BASE_DELAY_SEC   exponential back-off seed  (default 2.0)
-  INBOUND_QUEUE_MAXSIZE      back-pressure cap          (default 2000)
-  LOG_LEVEL                  DEBUG|INFO|WARNING|ERROR   (default INFO)
-  LOG_FORMAT                 json | text                (default text)
-
-Python dependencies
--------------------
-  pip install websockets aiohttp pyjwt numpy bcrypt
-
-Self-contained build
----------------------
-  This file has no external module dependencies beyond the pip packages
-  above. Everything — device registry, 7-agent pipeline, HMAC handshake,
-  HTTP API — is defined in this single file. There is no separate
-  IoMT_implementation.py / IoMT_clinical_workflow.py / IoMT_gcp_compduide.py
-  to ship alongside it.
 """
 
 from __future__ import annotations
-
-# ============================================================================
-# Standard Library
-# ============================================================================
 
 import asyncio
 import base64
@@ -107,114 +24,37 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# ============================================================================
-# Third-Party
-# ============================================================================
-
-import numpy as np          # pip install numpy
-import websockets            # pip install websockets
-import aiohttp               # pip install aiohttp
-import jwt                   # pip install pyjwt
+import numpy as np
+import websockets
+import aiohttp
+import jwt
 
 try:
-    import bcrypt             # pip install bcrypt
+    import bcrypt
 except ImportError as _bcrypt_err:
     import subprocess as _subprocess
     print("=" * 78, file=sys.stderr)
     print("FATAL: 'import bcrypt' failed at startup.", file=sys.stderr)
     print(f"Original error: {_bcrypt_err}", file=sys.stderr)
-    print("-" * 78, file=sys.stderr)
-    print(f"sys.executable : {sys.executable}", file=sys.stderr)
-    print(f"sys.version    : {sys.version}", file=sys.stderr)
-    print(f"sys.path       :", file=sys.stderr)
-    for _p in sys.path:
-        print(f"    {_p}", file=sys.stderr)
-    print("-" * 78, file=sys.stderr)
-    try:
-        _freeze = _subprocess.run(
-            [sys.executable, "-m", "pip", "list"],
-            capture_output=True, text=True, timeout=15,
-        )
-        print("Installed packages (pip list):", file=sys.stderr)
-        print(_freeze.stdout, file=sys.stderr)
-        if _freeze.stderr:
-            print("pip list stderr:", _freeze.stderr, file=sys.stderr)
-    except Exception as _diag_err:
-        print(f"Could not run pip list: {_diag_err}", file=sys.stderr)
-    print("=" * 78, file=sys.stderr)
     raise
 
 from aiohttp import web as _web
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 
-# Real PostgreSQL-backed user/token/audit store — replaces the in-memory
-# stub dict. See db.py and migrations/001_create_users.sql.
 try:
     from db import Database, HospitalUser, UserRole as DBUserRole, LargeDevice  # noqa: E402
 except ImportError as _db_import_err:
-    import subprocess as _subprocess
-    print("=" * 78, file=sys.stderr)
     print("FATAL: 'from db import ...' failed at startup.", file=sys.stderr)
     print(f"Original error: {_db_import_err}", file=sys.stderr)
-    print("-" * 78, file=sys.stderr)
-    print(f"sys.executable : {sys.executable}", file=sys.stderr)
-    print(f"sys.version    : {sys.version}", file=sys.stderr)
-    print(f"sys.path       :", file=sys.stderr)
-    for _p in sys.path:
-        print(f"    {_p}", file=sys.stderr)
-    print("-" * 78, file=sys.stderr)
-    try:
-        _freeze = _subprocess.run(
-            [sys.executable, "-m", "pip", "list"],
-            capture_output=True, text=True, timeout=15,
-        )
-        print("Installed packages (pip list):", file=sys.stderr)
-        print(_freeze.stdout, file=sys.stderr)
-        if _freeze.stderr:
-            print("pip list stderr:", _freeze.stderr, file=sys.stderr)
-    except Exception as _diag_err:
-        print(f"Could not run pip list: {_diag_err}", file=sys.stderr)
-    print("-" * 78, file=sys.stderr)
-    try:
-        import os as _os
-        cwd = _os.getcwd()
-        print(f"Current working directory: {cwd}", file=sys.stderr)
-        print(f"Files in cwd: {sorted(_os.listdir(cwd))}", file=sys.stderr)
-    except Exception as _diag_err:
-        print(f"Could not list cwd: {_diag_err}", file=sys.stderr)
-    print("=" * 78, file=sys.stderr)
     raise
+
 from kafka_bus import (  # noqa: E402
     KafkaEventProducer, KafkaEventConsumer,
     TOPIC_VENDOR_RAW, TOPIC_VENDOR_DEADLETTER,
 )
 
-# ============================================================================
-# Internal IoMT Module Imports
-# ============================================================================
-#
-# NOTE: This production build is fully self-contained. Earlier design
-# iterations referenced three companion modules (IoMT_implementation,
-# IoMT_clinical_workflow, IoMT_gcp_compduide) for low-level device drivers,
-# CDSS/EHR routing, and GCP managed-services write-back respectively.
-#
-# None of those modules' classes are actually instantiated or called anywhere
-# in this file's runtime logic — the imports were vestigial. If you want to
-# add real EHR/FHIR write-back or GCP Pub/Sub forwarding, implement those
-# integrations directly in CommunicationAgent (EHR) and RPMDataPump's
-# on_rpm_frame hook (GCP), or re-introduce the companion modules and restore
-# imports here once they exist in this repository.
-
-# ============================================================================
-# Logging
-# ============================================================================
 
 def _build_logger() -> logging.Logger:
-    """
-    Configure structured logging driven by LOG_LEVEL / LOG_FORMAT env vars.
-    json format emits machine-readable lines suitable for Cloud Logging /
-    Datadog / Splunk.  text format is human-friendly for local development.
-    """
     level_name  = os.environ.get("LOG_LEVEL",  "INFO").upper()
     log_format  = os.environ.get("LOG_FORMAT", "text").lower()
     level       = getattr(logging, level_name, logging.INFO)
@@ -228,11 +68,8 @@ def _build_logger() -> logging.Logger:
         fmt = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
 
     logging.basicConfig(
-        level     = level,
-        format    = fmt,
-        datefmt   = "%Y-%m-%dT%H:%M:%S",
-        stream    = sys.stdout,
-        force     = True,
+        level=level, format=fmt, datefmt="%Y-%m-%dT%H:%M:%S",
+        stream=sys.stdout, force=True,
     )
     return logging.getLogger("iomt_cardioai")
 
@@ -240,32 +77,16 @@ def _build_logger() -> logging.Logger:
 logger = _build_logger()
 
 
-# ============================================================================
-# SECTION 1 — CONFIGURATION
-# ============================================================================
-
 class ConfigurationError(RuntimeError):
-    """Raised when a required environment variable is missing or invalid."""
+    pass
 
 
 def _require_env(name: str, min_length: int = 0) -> str:
-    """
-    Read *name* from the environment; raise ConfigurationError if absent or
-    shorter than *min_length*.  This is the single enforcement point —
-    no secret ever has a default value in code.
-    """
     value = os.environ.get(name, "").strip()
     if not value:
-        raise ConfigurationError(
-            f"Required environment variable '{name}' is not set. "
-            "Set it via a secrets manager (Vault, K8s Secret, AWS SSM) "
-            "before starting the service."
-        )
+        raise ConfigurationError(f"Required environment variable '{name}' is not set.")
     if len(value) < min_length:
-        raise ConfigurationError(
-            f"'{name}' must be at least {min_length} characters long "
-            f"(got {len(value)})."
-        )
+        raise ConfigurationError(f"'{name}' must be at least {min_length} characters long (got {len(value)}).")
     return value
 
 
@@ -275,31 +96,16 @@ def _optional_env(name: str, default: str) -> str:
 
 @dataclass(frozen=True)
 class HandshakeConfig:
-    """
-    Immutable, environment-driven configuration for the transport layer.
-
-    All secrets are read from environment variables.  The dataclass is frozen
-    so that no runtime code can mutate security-critical fields after startup.
-    Never construct this with literal secret strings outside of tests.
-    """
-
-    # ── IoMT server ──────────────────────────────────────────────────────────
     iomt_server_ws_url:   str
     iomt_server_rest_url: str
     iomt_server_id:       str
-
-    # ── CardioAI backend identity ─────────────────────────────────────────────
     cardioai_backend_id:  str
     cardioai_ws_host:     str
     cardioai_ws_port:     int
-
-    # ── Secrets (injected at construction time from env) ─────────────────────
-    shared_secret:        str   # HMAC signing key — never log, never persist
-    jwt_secret:           str   # JWT signing key  — never log, never persist
+    shared_secret:        str
+    jwt_secret:           str
     jwt_algorithm:        str
     token_ttl_seconds:    int
-
-    # ── Streaming / reliability ───────────────────────────────────────────────
     rpm_poll_interval_seconds:    float
     heartbeat_interval_seconds:   float
     reconnect_max_attempts:       int
@@ -308,25 +114,17 @@ class HandshakeConfig:
 
     @classmethod
     def from_env(cls) -> "HandshakeConfig":
-        """
-        Factory that builds a HandshakeConfig entirely from env vars.
-        Call this once at startup; fail fast if any required variable is absent.
-        """
         return cls(
             iomt_server_ws_url   = _require_env("IOMT_SERVER_WS_URL"),
-            iomt_server_rest_url = _optional_env("IOMT_SERVER_REST_URL",
-                                                 "https://iomt-server.hospital.local/api/v1"),
+            iomt_server_rest_url = _optional_env("IOMT_SERVER_REST_URL", "https://iomt-server.hospital.local/api/v1"),
             iomt_server_id       = _optional_env("IOMT_SERVER_ID", "IOMT-SRV-001"),
-
             cardioai_backend_id  = _require_env("CARDIOAI_BACKEND_ID"),
             cardioai_ws_host     = _optional_env("CARDIOAI_WS_HOST", "0.0.0.0"),
             cardioai_ws_port     = int(_optional_env("CARDIOAI_WS_PORT", "8765")),
-
             shared_secret        = _require_env("IOMT_SHARED_SECRET", min_length=32),
             jwt_secret           = _require_env("IOMT_JWT_SECRET",    min_length=32),
             jwt_algorithm        = _optional_env("JWT_ALGORITHM",      "HS256"),
             token_ttl_seconds    = int(_optional_env("TOKEN_TTL_SECONDS", "3600")),
-
             rpm_poll_interval_seconds    = float(_optional_env("RPM_POLL_INTERVAL_SEC",    "1.0")),
             heartbeat_interval_seconds   = float(_optional_env("HEARTBEAT_INTERVAL_SEC",   "10.0")),
             reconnect_max_attempts       = int(_optional_env("RECONNECT_MAX_ATTEMPTS",      "5")),
@@ -334,18 +132,12 @@ class HandshakeConfig:
             inbound_queue_maxsize        = int(_optional_env("INBOUND_QUEUE_MAXSIZE",       "2000")),
         )
 
-    # ── Auth API config helpers ────────────────────────────────────────────
-
     @property
     def api_host(self) -> str:
         return _optional_env("CARDIOAI_API_HOST", "0.0.0.0")
 
     @property
     def api_port(self) -> int:
-        # Render.com (and most PaaS platforms) auto-inject PORT into every
-        # web service's environment. CARDIOAI_API_PORT takes priority if you
-        # set it explicitly; otherwise fall back to PORT; otherwise 8080
-        # for local/Docker development.
         explicit = _optional_env("CARDIOAI_API_PORT", "")
         if explicit:
             return int(explicit)
@@ -356,7 +148,7 @@ class HandshakeConfig:
 
     @property
     def refresh_token_ttl(self) -> int:
-        return int(_optional_env("REFRESH_TOKEN_TTL_SECONDS", "604800"))  # 7 days
+        return int(_optional_env("REFRESH_TOKEN_TTL_SECONDS", "604800"))
 
     @property
     def mfa_required(self) -> bool:
@@ -367,22 +159,14 @@ class HandshakeConfig:
         return _optional_env("ALLOWED_ORIGINS", "*")
 
     def __repr__(self) -> str:
-        # Redact secrets from repr so they cannot appear in logs or tracebacks.
         return (
-            f"HandshakeConfig("
-            f"iomt_server_ws_url={self.iomt_server_ws_url!r}, "
+            f"HandshakeConfig(iomt_server_ws_url={self.iomt_server_ws_url!r}, "
             f"cardioai_backend_id={self.cardioai_backend_id!r}, "
-            f"shared_secret=<REDACTED>, "
-            f"jwt_secret=<REDACTED>)"
+            f"shared_secret=<REDACTED>, jwt_secret=<REDACTED>)"
         )
 
 
-# ============================================================================
-# SECTION 2 — PROTOCOL DEFINITIONS
-# ============================================================================
-
 class MsgType(str, Enum):
-    """All wire-level message types for the IoMT ↔ CardioAI protocol."""
     HELLO            = "hello"
     CHALLENGE        = "challenge"
     CHALLENGE_RESP   = "challenge_resp"
@@ -401,29 +185,14 @@ class MsgType(str, Enum):
     ERROR            = "error"
 
 
-def build_message(
-    msg_type:  MsgType,
-    payload:   Dict[str, Any],
-    sender_id: str,
-) -> str:
-    """
-    Serialise a protocol message to a JSON string.
-    Every message carries a unique msg_id for deduplication and tracing.
-    """
+def build_message(msg_type: MsgType, payload: Dict[str, Any], sender_id: str) -> str:
     return json.dumps({
-        "msg_id":    str(uuid.uuid4()),
-        "type":      msg_type.value,
-        "sender_id": sender_id,
-        "timestamp": _utcnow_iso(),
-        "payload":   payload,
+        "msg_id": str(uuid.uuid4()), "type": msg_type.value, "sender_id": sender_id,
+        "timestamp": _utcnow_iso(), "payload": payload,
     })
 
 
 def parse_message(raw: str) -> Dict[str, Any]:
-    """
-    Deserialise a JSON message from the wire.
-    Raises ValueError on malformed input — callers must handle this.
-    """
     if not raw:
         raise ValueError("Empty message received")
     try:
@@ -433,91 +202,41 @@ def parse_message(raw: str) -> Dict[str, Any]:
 
 
 def _utcnow_iso() -> str:
-    """Return current UTC time as an ISO-8601 string (timezone-aware)."""
     return datetime.now(timezone.utc).isoformat()
 
 
-# ============================================================================
-# SECTION 3 — SECURITY MANAGER
-# ============================================================================
-
 class AuthenticationError(PermissionError):
-    """Raised when an HMAC challenge or JWT verification fails."""
+    pass
 
 
 class SecurityManager:
-    """
-    HMAC-SHA256 challenge/response authentication and JWT session tokens.
-
-    Design decisions
-    ----------------
-    * Challenges use secrets.token_bytes() (CSPRNG) — not uuid4() which,
-      while random, goes through the uuid module's entropy path.
-    * All signature comparisons use hmac.compare_digest() to prevent
-      timing side-channel attacks.
-    * datetime.now(timezone.utc) replaces the deprecated datetime.utcnow().
-    * Secrets are never logged, even at DEBUG level.
-    """
-
-    _CHALLENGE_BYTES = 32   # 256 bits of entropy per challenge
+    _CHALLENGE_BYTES = 32
 
     def __init__(self, cfg: HandshakeConfig) -> None:
         self._cfg = cfg
 
-    # ── Challenge generation ──────────────────────────────────────────────────
-
     def generate_challenge(self) -> str:
-        """Return a fresh, cryptographically random base64-encoded challenge."""
         return base64.b64encode(secrets.token_bytes(self._CHALLENGE_BYTES)).decode()
 
-    # ── HMAC operations ───────────────────────────────────────────────────────
-
     def sign_challenge(self, challenge: str) -> str:
-        """Produce an HMAC-SHA256 hex-digest of *challenge* using the shared secret."""
-        return _hmac.new(
-            self._cfg.shared_secret.encode("utf-8"),
-            challenge.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
+        return _hmac.new(self._cfg.shared_secret.encode("utf-8"), challenge.encode("utf-8"), hashlib.sha256).hexdigest()
 
     def verify_challenge(self, challenge: str, signature: str) -> bool:
-        """
-        Return True iff *signature* is the correct HMAC of *challenge*.
-        Uses constant-time comparison to prevent timing oracles.
-        """
         expected = self.sign_challenge(challenge)
         return _hmac.compare_digest(expected, signature)
 
-    # ── JWT session tokens ────────────────────────────────────────────────────
-
     def issue_token(self, peer_id: str, device_ids: List[str]) -> str:
-        """
-        Issue a short-lived HS256 JWT granting access to *device_ids*.
-        Expiry is set to now + token_ttl_seconds using timezone-aware datetimes.
-        """
         now = datetime.now(timezone.utc)
         payload = {
-            "iss":        self._cfg.cardioai_backend_id,
-            "sub":        peer_id,
-            "iat":        now,
-            "exp":        now + __import__("datetime").timedelta(
-                              seconds=self._cfg.token_ttl_seconds),
+            "iss": self._cfg.cardioai_backend_id, "sub": peer_id, "iat": now,
+            "exp": now + __import__("datetime").timedelta(seconds=self._cfg.token_ttl_seconds),
             "device_ids": device_ids,
         }
-        return jwt.encode(payload, self._cfg.jwt_secret,
-                          algorithm=self._cfg.jwt_algorithm)
+        return jwt.encode(payload, self._cfg.jwt_secret, algorithm=self._cfg.jwt_algorithm)
 
     def verify_token(self, token: str) -> Dict[str, Any]:
-        """
-        Verify and decode a JWT.
-        Raises AuthenticationError on expiry, bad signature, or malformed input.
-        """
         try:
-            return jwt.decode(
-                token,
-                self._cfg.jwt_secret,
-                algorithms=[self._cfg.jwt_algorithm],
-            )
+            return jwt.decode(token, self._cfg.jwt_secret, algorithms=[self._cfg.jwt_algorithm])
         except ExpiredSignatureError as exc:
             raise AuthenticationError("JWT has expired") from exc
         except InvalidTokenError as exc:
@@ -526,10 +245,6 @@ class SecurityManager:
     def __repr__(self) -> str:
         return f"SecurityManager(cfg={self._cfg!r})"
 
-
-# ============================================================================
-# SECTION 4 — DATA MODELS
-# ============================================================================
 
 class DeviceType(str, Enum):
     ECG_MONITOR         = "ecg_monitor"
@@ -559,69 +274,55 @@ class ArrhythmiaType(str, Enum):
 
 @dataclass
 class DeviceData:
-    device_id:   str
+    device_id: str
     device_type: str
-    patient_id:  str
-    timestamp:   str
-    data:        Dict[str, Any]
+    patient_id: str
+    timestamp: str
+    data: Dict[str, Any]
     quality_score: float = 1.0
 
 
 @dataclass
 class ProcessedSignal:
-    device_id:   str
+    device_id: str
     signal_type: str
-    features:    Dict[str, Any]
-    quality:     float
-    timestamp:   str
+    features: Dict[str, Any]
+    quality: float
+    timestamp: str
 
 
 @dataclass
 class DiagnosticResult:
-    patient_id:      str
-    diagnosis:       str
-    risk_scores:     Dict[str, float]
+    patient_id: str
+    diagnosis: str
+    risk_scores: Dict[str, float]
     recommendations: List[str]
-    confidence:      float
-    timestamp:       str
+    confidence: float
+    timestamp: str
 
 
 @dataclass
 class Alert:
-    alert_id:         str = field(default_factory=lambda: str(uuid.uuid4()))
-    patient_id:       str = ""
-    alert_level:      AlertLevel = AlertLevel.LOW
-    description:      str = ""
+    alert_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    patient_id: str = ""
+    alert_level: AlertLevel = AlertLevel.LOW
+    description: str = ""
     required_actions: List[str] = field(default_factory=list)
     notified_parties: List[str] = field(default_factory=list)
-    timestamp:        str = field(default_factory=_utcnow_iso)
+    timestamp: str = field(default_factory=_utcnow_iso)
 
-
-# ============================================================================
-# SECTION 5 — MESSAGE BUS
-# ============================================================================
 
 class MessageBus:
-    """
-    Async pub/sub event bus for inter-agent communication.
-
-    Topics are arbitrary strings.  Subscribers may be sync or async callables.
-    Exceptions in one subscriber are caught and logged; they do not prevent
-    other subscribers from receiving the same message.
-    """
-
     def __init__(self) -> None:
-        self._subscribers:    Dict[str, List[Callable]] = {}
-        self._message_history: List[Dict]               = []
+        self._subscribers: Dict[str, List[Callable]] = {}
+        self._message_history: List[Dict] = []
 
     def subscribe(self, topic: str, callback: Callable) -> None:
         self._subscribers.setdefault(topic, []).append(callback)
         logger.debug("[Bus] subscribed topic=%s", topic)
 
     async def publish(self, topic: str, message: Any) -> None:
-        self._message_history.append(
-            {"topic": topic, "message": message, "timestamp": _utcnow_iso()}
-        )
+        self._message_history.append({"topic": topic, "message": message, "timestamp": _utcnow_iso()})
         for cb in self._subscribers.get(topic, []):
             try:
                 if asyncio.iscoroutinefunction(cb):
@@ -636,18 +337,12 @@ class MessageBus:
         return len(self._message_history)
 
 
-# ============================================================================
-# SECTION 6 — BASE AGENT
-# ============================================================================
-
 class BaseAgent(ABC):
-    """Abstract base class for all CardioAI pipeline agents."""
-
     def __init__(self, agent_id: str, message_bus: MessageBus) -> None:
-        self.agent_id    = agent_id
+        self.agent_id = agent_id
         self.message_bus = message_bus
-        self.state:      Dict[str, Any] = {}
-        self.is_running  = False
+        self.state: Dict[str, Any] = {}
+        self.is_running = False
 
     @abstractmethod
     async def process(self, data: Any) -> Any: ...
@@ -661,49 +356,21 @@ class BaseAgent(ABC):
         logger.info("[Agent] %s stopped", self.agent_id)
 
 
-# ============================================================================
-# SECTION 7 — AGENT 1: DATA ACQUISITION
-# ============================================================================
-
 class DataAcquisitionAgent(BaseAgent):
-    """
-    Registers IoMT devices, validates incoming sensor data quality, and
-    publishes raw frames onto the shared MessageBus.
-
-    Quality scoring
-    ---------------
-    * None-valued fields: score × 0.7 per occurrence.
-    * Heart rate out of physiological range [30, 250] bpm: score × 0.5.
-    Frames scoring below 0.6 are silently discarded by the processing agent.
-    """
-
     def __init__(self, agent_id: str, message_bus: MessageBus) -> None:
         super().__init__(agent_id, message_bus)
-        self._devices:      Dict[str, Dict]              = {}
-        self._stream_queues: Dict[str, asyncio.Queue]    = {}
+        self._devices: Dict[str, Dict] = {}
+        self._stream_queues: Dict[str, asyncio.Queue] = {}
         message_bus.subscribe("device.register", self._on_device_register)
 
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    async def register_device(
-        self,
-        device_id:   str,
-        device_type: str,
-        patient_id:  str,
-    ) -> None:
+    async def register_device(self, device_id: str, device_type: str, patient_id: str) -> None:
         self._devices[device_id] = {
-            "device_id":   device_id,
-            "device_type": device_type,
-            "patient_id":  patient_id,
+            "device_id": device_id, "device_type": device_type, "patient_id": patient_id,
             "registered_at": _utcnow_iso(),
         }
         self._stream_queues[device_id] = asyncio.Queue()
-        await self.message_bus.publish(
-            "device.registered",
-            {"device_id": device_id, "patient_id": patient_id},
-        )
-        logger.info("[Acquisition] registered device=%s patient=%s",
-                    device_id, patient_id)
+        await self.message_bus.publish("device.registered", {"device_id": device_id, "patient_id": patient_id})
+        logger.info("[Acquisition] registered device=%s patient=%s", device_id, patient_id)
 
     async def stream_data(self, device_id: str, data: Dict[str, Any]) -> None:
         if device_id not in self._devices:
@@ -716,13 +383,7 @@ class DataAcquisitionAgent(BaseAgent):
         if isinstance(data, dict) and "device_id" in data:
             await self.stream_data(data["device_id"], data)
 
-    # ── Quality scoring ───────────────────────────────────────────────────────
-
     def validate_data_quality(self, data: Dict[str, Any]) -> float:
-        """
-        Return a [0, 1] quality score for an incoming sensor data dict.
-        Handles None values safely before numeric comparisons.
-        """
         score = 1.0
         for v in data.values():
             if v is None:
@@ -732,25 +393,11 @@ class DataAcquisitionAgent(BaseAgent):
             score *= 0.5
         return score
 
-    # ── Internal ──────────────────────────────────────────────────────────────
-
     async def _on_device_register(self, msg: Dict) -> None:
-        await self.register_device(
-            msg["device_id"], msg["device_type"], msg["patient_id"]
-        )
+        await self.register_device(msg["device_id"], msg["device_type"], msg["patient_id"])
 
-
-# ============================================================================
-# SECTION 8 — AGENT 2: DATA PROCESSING
-# ============================================================================
 
 class DataProcessingAgent(BaseAgent):
-    """
-    Applies a quality gate (threshold 0.6) and routes frames to
-    signal-specific feature extractors before publishing ProcessedSignal
-    objects for pattern recognition.
-    """
-
     _QUALITY_THRESHOLD = 0.6
 
     def __init__(self, agent_id: str, message_bus: MessageBus) -> None:
@@ -761,86 +408,58 @@ class DataProcessingAgent(BaseAgent):
         if data.get("quality_score", 0) < self._QUALITY_THRESHOLD:
             logger.debug("[Processing] frame dropped (quality=%.2f)", data.get("quality_score", 0))
             return None
-
         signal_type = data.get("device_type", "generic")
         handlers: Dict[str, Callable] = {
-            "ecg_monitor":   self._process_ecg,
-            "bp_monitor":    self._process_bp,
+            "ecg_monitor": self._process_ecg, "bp_monitor": self._process_bp,
             "pulse_oximeter": self._process_spo2,
         }
         handler = handlers.get(signal_type, self._process_generic)
-        result  = await handler(data)
+        result = await handler(data)
         if result:
             await self.message_bus.publish("data.processed", result)
         return result
 
     async def _process_ecg(self, data: Dict) -> ProcessedSignal:
         raw = data.get("data", {})
-        hr  = raw.get("heart_rate", 60.0)
+        hr = raw.get("heart_rate", 60.0)
         return ProcessedSignal(
-            device_id   = data["device_id"],
-            signal_type = "ecg",
-            features    = {
-                "heart_rate":  hr,
-                "rr_mean_ms":  60_000 / hr if hr else 0,
+            device_id=data["device_id"], signal_type="ecg",
+            features={
+                "heart_rate": hr, "rr_mean_ms": 60_000 / hr if hr else 0,
                 "qrs_width_ms": raw.get("qrs_width_ms", 80),
                 "qt_interval_ms": raw.get("qt_interval_ms", 400),
                 "st_elevation": raw.get("st_elevation", 0.0),
             },
-            quality   = data["quality_score"],
-            timestamp = data["timestamp"],
+            quality=data["quality_score"], timestamp=data["timestamp"],
         )
 
     async def _process_bp(self, data: Dict) -> ProcessedSignal:
         raw = data.get("data", {})
-        s   = raw.get("systolic",  120.0)
-        d   = raw.get("diastolic",  80.0)
-        pp  = s - d
+        s = raw.get("systolic", 120.0)
+        d = raw.get("diastolic", 80.0)
+        pp = s - d
         return ProcessedSignal(
-            device_id   = data["device_id"],
-            signal_type = "bp",
-            features    = {
-                "systolic":         s,
-                "diastolic":        d,
-                "pulse_pressure":   pp,
-                "map":              d + pp / 3,
-            },
-            quality   = data["quality_score"],
-            timestamp = data["timestamp"],
+            device_id=data["device_id"], signal_type="bp",
+            features={"systolic": s, "diastolic": d, "pulse_pressure": pp, "map": d + pp / 3},
+            quality=data["quality_score"], timestamp=data["timestamp"],
         )
 
     async def _process_spo2(self, data: Dict) -> ProcessedSignal:
         raw = data.get("data", {})
         return ProcessedSignal(
-            device_id   = data["device_id"],
-            signal_type = "spo2",
-            features    = {"spo2_pct": raw.get("spo2", 98.0)},
-            quality     = data["quality_score"],
-            timestamp   = data["timestamp"],
+            device_id=data["device_id"], signal_type="spo2",
+            features={"spo2_pct": raw.get("spo2", 98.0)},
+            quality=data["quality_score"], timestamp=data["timestamp"],
         )
 
     async def _process_generic(self, data: Dict) -> ProcessedSignal:
         return ProcessedSignal(
-            device_id   = data["device_id"],
-            signal_type = "generic",
-            features    = data.get("data", {}),
-            quality     = data["quality_score"],
-            timestamp   = data["timestamp"],
+            device_id=data["device_id"], signal_type="generic", features=data.get("data", {}),
+            quality=data["quality_score"], timestamp=data["timestamp"],
         )
 
 
-# ============================================================================
-# SECTION 9 — AGENT 3: PATTERN RECOGNITION
-# ============================================================================
-
 class PatternRecognitionAgent(BaseAgent):
-    """
-    Clinical pattern classifier using ACC/AHA 2017 guidelines.
-
-    Classifies: arrhythmia type, ST-elevation ischemia, hypertension stage,
-    and QT-interval abnormalities.
-    """
-
     def __init__(self, agent_id: str, message_bus: MessageBus) -> None:
         super().__init__(agent_id, message_bus)
         message_bus.subscribe("data.processed", self.process)
@@ -853,41 +472,31 @@ class PatternRecognitionAgent(BaseAgent):
         elif signal.signal_type == "bp":
             await self._analyse_bp(signal)
 
-    # ── ECG pattern analysis ──────────────────────────────────────────────────
-
     async def _analyse_ecg(self, signal: ProcessedSignal) -> None:
-        f       = signal.features
+        f = signal.features
         pattern = {
-            "device_id":    signal.device_id,
-            "pattern_type": "ecg_pattern",
-            "arrhythmia":   self.detect_arrhythmia(f).value,
-            "ischemia":     self.detect_ischemia(f),
-            "qt_abnormal":  self._qt_abnormal(f.get("qt_interval_ms", 400)),
-            "confidence":   0.92,
-            "timestamp":    signal.timestamp,
+            "device_id": signal.device_id, "pattern_type": "ecg_pattern",
+            "arrhythmia": self.detect_arrhythmia(f).value, "ischemia": self.detect_ischemia(f),
+            "qt_abnormal": self._qt_abnormal(f.get("qt_interval_ms", 400)),
+            "confidence": 0.92, "timestamp": signal.timestamp,
         }
         await self.message_bus.publish("pattern.ecg", pattern)
 
     async def _analyse_bp(self, signal: ProcessedSignal) -> None:
-        f       = signal.features
+        f = signal.features
         pattern = {
-            "device_id":    signal.device_id,
-            "pattern_type": "bp_pattern",
+            "device_id": signal.device_id, "pattern_type": "bp_pattern",
             "hypertension_stage": self.classify_hypertension(f),
-            "hypotension":  f.get("systolic", 120) < 90,
+            "hypotension": f.get("systolic", 120) < 90,
             "wide_pulse_pressure": f.get("pulse_pressure", 40) > 60,
-            "confidence":   0.95,
-            "timestamp":    signal.timestamp,
+            "confidence": 0.95, "timestamp": signal.timestamp,
         }
         await self.message_bus.publish("pattern.bp", pattern)
 
-    # ── Classifiers ───────────────────────────────────────────────────────────
-
     def detect_arrhythmia(self, features: Dict) -> ArrhythmiaType:
-        hr       = features.get("heart_rate", 60)
-        qrs_ms   = features.get("qrs_width_ms", 80)
-        rr_mean  = features.get("rr_mean_ms", 1000)
-
+        hr = features.get("heart_rate", 60)
+        qrs_ms = features.get("qrs_width_ms", 80)
+        rr_mean = features.get("rr_mean_ms", 1000)
         if hr < 50:
             return ArrhythmiaType.BRADYCARDIA
         if hr > 150 and qrs_ms > 120:
@@ -899,17 +508,15 @@ class PatternRecognitionAgent(BaseAgent):
         return ArrhythmiaType.NORMAL_SINUS
 
     def detect_ischemia(self, features: Dict) -> bool:
-        """ST elevation or depression beyond ±0.1 mV indicates ischemia."""
         return abs(features.get("st_elevation", 0.0)) > 0.1
 
     def classify_hypertension(self, features: Dict) -> str:
-        """ACC/AHA 2017 staging: normal / elevated / stage_1 / stage_2 / hypertensive_crisis."""
-        s = features.get("systolic",  120)
-        d = features.get("diastolic",  80)
-        if s >= 180 or d >= 120:  return "hypertensive_crisis"
-        if s >= 140 or d >= 90:   return "stage_2"
-        if s >= 130 or d >= 80:   return "stage_1"
-        if s >= 120 and d < 80:   return "elevated"
+        s = features.get("systolic", 120)
+        d = features.get("diastolic", 80)
+        if s >= 180 or d >= 120: return "hypertensive_crisis"
+        if s >= 140 or d >= 90:  return "stage_2"
+        if s >= 130 or d >= 80:  return "stage_1"
+        if s >= 120 and d < 80:  return "elevated"
         return "normal"
 
     @staticmethod
@@ -917,50 +524,36 @@ class PatternRecognitionAgent(BaseAgent):
         return qt_ms > 480 or qt_ms < 340
 
 
-# ============================================================================
-# SECTION 10 — AGENT 4: DIAGNOSTIC
-# ============================================================================
-
 class DiagnosticAgent(BaseAgent):
-    """
-    Interprets patterns into clinical diagnoses and computes multi-dimensional
-    risk scores (ASCVD, HF, stroke, SCD).  All recommendations are staged for
-    clinician review — never auto-approved.
-    """
-
     def __init__(self, agent_id: str, message_bus: MessageBus) -> None:
         super().__init__(agent_id, message_bus)
         self._patient_history: Dict[str, List[DiagnosticResult]] = {}
         message_bus.subscribe("pattern.ecg", self.process)
-        message_bus.subscribe("pattern.bp",  self.process)
+        message_bus.subscribe("pattern.bp", self.process)
 
     async def process(self, pattern: Any) -> Optional[DiagnosticResult]:
         if not isinstance(pattern, dict):
             return None
         patient_id = pattern.get("device_id", "unknown")
         result = DiagnosticResult(
-            patient_id      = patient_id,
-            diagnosis       = self._interpret_pattern(pattern),
-            risk_scores     = self._compute_risk_scores(pattern),
-            recommendations = self._generate_recommendations(pattern),
-            confidence      = pattern.get("confidence", 0.8),
-            timestamp       = _utcnow_iso(),
+            patient_id=patient_id, diagnosis=self._interpret_pattern(pattern),
+            risk_scores=self._compute_risk_scores(pattern),
+            recommendations=self._generate_recommendations(pattern),
+            confidence=pattern.get("confidence", 0.8), timestamp=_utcnow_iso(),
         )
         self._patient_history.setdefault(patient_id, []).append(result)
         await self.message_bus.publish("diagnosis.result", result)
         return result
 
-    # ── Interpretation ────────────────────────────────────────────────────────
-
     def _interpret_pattern(self, pattern: Dict) -> str:
         arrhythmia = pattern.get("arrhythmia", "")
         labels = {
-            ArrhythmiaType.ATRIAL_FIBRILLATION.value:      "Atrial Fibrillation",
-            ArrhythmiaType.VENTRICULAR_TACHYCARDIA.value:  "Ventricular Tachycardia",
+            ArrhythmiaType.ATRIAL_FIBRILLATION.value: "Atrial Fibrillation",
+            ArrhythmiaType.VENTRICULAR_TACHYCARDIA.value: "Ventricular Tachycardia",
             ArrhythmiaType.VENTRICULAR_FIBRILLATION.value: "Ventricular Fibrillation",
-            ArrhythmiaType.BRADYCARDIA.value:               "Bradycardia",
-            ArrhythmiaType.TACHYCARDIA.value:               "Tachycardia",
-            ArrhythmiaType.NORMAL_SINUS.value:              "Normal Sinus Rhythm",
+            ArrhythmiaType.BRADYCARDIA.value: "Bradycardia",
+            ArrhythmiaType.TACHYCARDIA.value: "Tachycardia",
+            ArrhythmiaType.NORMAL_SINUS.value: "Normal Sinus Rhythm",
         }
         stage = pattern.get("hypertension_stage")
         if stage and stage != "normal":
@@ -971,10 +564,10 @@ class DiagnosticAgent(BaseAgent):
         is_afib = pattern.get("arrhythmia") == ArrhythmiaType.ATRIAL_FIBRILLATION.value
         is_vtach = pattern.get("arrhythmia") == ArrhythmiaType.VENTRICULAR_TACHYCARDIA.value
         return {
-            "ascvd_10yr":   min(0.95, 0.15 + (0.2 if pattern.get("ischemia") else 0.0)),
-            "hf_risk":      min(0.95, 0.10 + (0.3 if is_afib else 0.0)),
-            "stroke_risk":  0.35 if is_afib else 0.05,
-            "scd_risk":     0.45 if is_vtach else 0.05,
+            "ascvd_10yr": min(0.95, 0.15 + (0.2 if pattern.get("ischemia") else 0.0)),
+            "hf_risk": min(0.95, 0.10 + (0.3 if is_afib else 0.0)),
+            "stroke_risk": 0.35 if is_afib else 0.05,
+            "scd_risk": 0.45 if is_vtach else 0.05,
         }
 
     def _generate_recommendations(self, pattern: Dict) -> List[str]:
@@ -995,24 +588,7 @@ class DiagnosticAgent(BaseAgent):
         return recs
 
 
-# ============================================================================
-# SECTION 11 — AGENT 5: ALERT MONITORING
-# ============================================================================
-
 class AlertMonitoringAgent(BaseAgent):
-    """
-    Triages diagnostic results into CRITICAL / HIGH / MEDIUM / LOW alerts
-    and determines notification targets.
-
-    Triage rules (in priority order)
-    ---------------------------------
-    CRITICAL : VTach / VFib / SCD risk > 0.4
-    HIGH     : AFib with HR > 130 / ischemia / ASCVD > 0.3
-    MEDIUM   : AFib with HR ≤ 130 / hypertension stage_2
-    LOW      : everything else with any finding
-    None     : normal sinus, normal BP
-    """
-
     def __init__(self, agent_id: str, message_bus: MessageBus) -> None:
         super().__init__(agent_id, message_bus)
         self.active_alerts: Dict[str, Alert] = {}
@@ -1025,23 +601,18 @@ class AlertMonitoringAgent(BaseAgent):
         if level is None:
             return None
         alert = Alert(
-            patient_id       = result.patient_id,
-            alert_level      = level,
-            description      = result.diagnosis,
-            required_actions = self._required_actions(level, result),
-            notified_parties = self._notification_list(level),
+            patient_id=result.patient_id, alert_level=level, description=result.diagnosis,
+            required_actions=self._required_actions(level, result),
+            notified_parties=self._notification_list(level),
         )
         self.active_alerts[alert.alert_id] = alert
         await self.message_bus.publish("alert.new", alert)
-        logger.warning(
-            "[Alert] %s — patient=%s diagnosis=%s",
-            level.value.upper(), result.patient_id, result.diagnosis,
-        )
+        logger.warning("[Alert] %s — patient=%s diagnosis=%s", level.value.upper(), result.patient_id, result.diagnosis)
         return alert
 
     def _triage(self, result: DiagnosticResult) -> Optional[AlertLevel]:
         rs = result.risk_scores
-        d  = result.diagnosis.lower()
+        d = result.diagnosis.lower()
         if "ventricular tachycardia" in d or "ventricular fibrillation" in d or rs.get("scd_risk", 0) > 0.4:
             return AlertLevel.CRITICAL
         if "atrial fibrillation" in d and rs.get("stroke_risk", 0) > 0.3:
@@ -1059,60 +630,45 @@ class AlertMonitoringAgent(BaseAgent):
     def _required_actions(self, level: AlertLevel, result: DiagnosticResult) -> List[str]:
         base = {
             AlertLevel.CRITICAL: ["ACTIVATE_DEFIBRILLATOR", "CALL_RAPID_RESPONSE", "DISPATCH_EMS"],
-            AlertLevel.HIGH:     ["NOTIFY_CARDIOLOGIST_15_MIN", "PREPARE_ADVANCED_MONITORING"],
-            AlertLevel.MEDIUM:   ["NOTIFY_PRIMARY_CARE", "SCHEDULE_REVIEW_24H"],
-            AlertLevel.LOW:      ["LOG_FOR_ROUTINE_REVIEW"],
+            AlertLevel.HIGH: ["NOTIFY_CARDIOLOGIST_15_MIN", "PREPARE_ADVANCED_MONITORING"],
+            AlertLevel.MEDIUM: ["NOTIFY_PRIMARY_CARE", "SCHEDULE_REVIEW_24H"],
+            AlertLevel.LOW: ["LOG_FOR_ROUTINE_REVIEW"],
         }
         return base.get(level, []) + [f"REVIEW: {r}" for r in result.recommendations[:2]]
 
     @staticmethod
     def _notification_list(level: AlertLevel) -> List[str]:
         targets = {
-            AlertLevel.CRITICAL: ["emergency_services", "rapid_response_team",
-                                  "on_call_cardiologist", "nursing_supervisor"],
-            AlertLevel.HIGH:     ["on_call_cardiologist", "primary_nurse"],
-            AlertLevel.MEDIUM:   ["primary_care_physician"],
-            AlertLevel.LOW:      ["care_coordinator"],
+            AlertLevel.CRITICAL: ["emergency_services", "rapid_response_team", "on_call_cardiologist", "nursing_supervisor"],
+            AlertLevel.HIGH: ["on_call_cardiologist", "primary_nurse"],
+            AlertLevel.MEDIUM: ["primary_care_physician"],
+            AlertLevel.LOW: ["care_coordinator"],
         }
         return targets.get(level, [])
 
 
-# ============================================================================
-# SECTION 12 — AGENT 6: PERSONALIZATION
-# ============================================================================
-
 class PersonalizationAgent(BaseAgent):
-    """
-    Maintains per-patient baseline profiles via running averages and stores
-    alert histories to surface personalised thresholds over time.
-    """
-
     _DEFAULT_THRESHOLDS: Dict[str, float] = {
-        "hr_high":        100.0,
-        "spo2_low":        92.0,
-        "systolic_high":  140.0,
-        "diastolic_high":  90.0,
+        "hr_high": 100.0, "spo2_low": 92.0, "systolic_high": 140.0, "diastolic_high": 90.0,
     }
 
     def __init__(self, agent_id: str, message_bus: MessageBus) -> None:
         super().__init__(agent_id, message_bus)
         self.patient_profiles: Dict[str, Dict] = {}
         message_bus.subscribe("data.processed", self.process)
-        message_bus.subscribe("alert.new",       self._on_alert)
+        message_bus.subscribe("alert.new", self._on_alert)
 
     async def process(self, signal: Any) -> None:
         if not isinstance(signal, ProcessedSignal):
             return
         pid = signal.device_id
         if pid not in self.patient_profiles:
-            self.patient_profiles[pid] = {
-                "baselines": {}, "alert_history": [], "sample_count": 0,
-            }
+            self.patient_profiles[pid] = {"baselines": {}, "alert_history": [], "sample_count": 0}
         await self._update_baseline(pid, signal.features)
 
     async def _update_baseline(self, patient_id: str, features: Dict) -> None:
         profile = self.patient_profiles[patient_id]
-        n       = profile["sample_count"] + 1
+        n = profile["sample_count"] + 1
         for k, v in features.items():
             if not isinstance(v, (int, float)):
                 continue
@@ -1123,35 +679,17 @@ class PersonalizationAgent(BaseAgent):
     async def _on_alert(self, alert: Alert) -> None:
         pid = alert.patient_id
         if pid not in self.patient_profiles:
-            self.patient_profiles[pid] = {
-                "baselines": {}, "alert_history": [], "sample_count": 0,
-            }
+            self.patient_profiles[pid] = {"baselines": {}, "alert_history": [], "sample_count": 0}
         self.patient_profiles[pid]["alert_history"].append({
-            "alert_id": alert.alert_id,
-            "level":    alert.alert_level.value,
-            "ts":       alert.timestamp,
+            "alert_id": alert.alert_id, "level": alert.alert_level.value, "ts": alert.timestamp,
         })
 
     def get_threshold(self, patient_id: str, metric: str) -> float:
-        """Return personalised threshold if available, else clinical default."""
         profile = self.patient_profiles.get(patient_id, {})
-        return profile.get("thresholds", {}).get(
-            metric, self._DEFAULT_THRESHOLDS.get(metric, 0.0)
-        )
+        return profile.get("thresholds", {}).get(metric, self._DEFAULT_THRESHOLDS.get(metric, 0.0))
 
-
-# ============================================================================
-# SECTION 13 — AGENT 7: COMMUNICATION
-# ============================================================================
 
 class CommunicationAgent(BaseAgent):
-    """
-    Formats alert summaries and generates structured clinical reports.
-    Reports accumulate in-memory for status queries. To write these to a
-    real EHR via FHIR R4, implement an EHRConnector in this file and call
-    it from process() below.
-    """
-
     def __init__(self, agent_id: str, message_bus: MessageBus) -> None:
         super().__init__(agent_id, message_bus)
         self.report_store: List[Dict] = []
@@ -1161,50 +699,34 @@ class CommunicationAgent(BaseAgent):
         if not isinstance(alert, Alert):
             return
         summary = self._format_summary(alert)
-        report  = {
-            "report_id":  str(uuid.uuid4()),
-            "alert_id":   alert.alert_id,
-            "patient_id": alert.patient_id,
-            "level":      alert.alert_level.value,
-            "summary":    summary,
-            "actions":    alert.required_actions,
-            "notified":   alert.notified_parties,
-            "generated_at": _utcnow_iso(),
+        report = {
+            "report_id": str(uuid.uuid4()), "alert_id": alert.alert_id, "patient_id": alert.patient_id,
+            "level": alert.alert_level.value, "summary": summary, "actions": alert.required_actions,
+            "notified": alert.notified_parties, "generated_at": _utcnow_iso(),
         }
         self.report_store.append(report)
-        logger.info("[Comms] report generated patient=%s level=%s",
-                    alert.patient_id, alert.alert_level.value)
+        logger.info("[Comms] report generated patient=%s level=%s", alert.patient_id, alert.alert_level.value)
 
     @staticmethod
     def _format_summary(alert: Alert) -> str:
         return (
-            f"[{alert.alert_level.value.upper()}] Patient {alert.patient_id}: "
-            f"{alert.description}. "
+            f"[{alert.alert_level.value.upper()}] Patient {alert.patient_id}: {alert.description}. "
             f"Actions: {', '.join(alert.required_actions[:2])}. "
             f"Notified: {', '.join(alert.notified_parties)}."
         )
 
 
-# ============================================================================
-# SECTION 14 — MULTI-AGENT COORDINATOR
-# ============================================================================
-
 class CardioAISystem:
-    """
-    Lifecycle coordinator for the 7-agent clinical AI pipeline.
-    Creates a shared MessageBus and wires all agents onto it.
-    """
-
     def __init__(self) -> None:
         self.message_bus = MessageBus()
         self.agents: Dict[str, BaseAgent] = {
-            "acquisition":    DataAcquisitionAgent("acq-001",    self.message_bus),
-            "processing":     DataProcessingAgent("proc-001",    self.message_bus),
-            "pattern":        PatternRecognitionAgent("pat-001", self.message_bus),
-            "diagnostic":     DiagnosticAgent("diag-001",        self.message_bus),
-            "alert_monitoring": AlertMonitoringAgent("alert-001",self.message_bus),
-            "personalization":  PersonalizationAgent("pers-001", self.message_bus),
-            "communication":    CommunicationAgent("comm-001",   self.message_bus),
+            "acquisition": DataAcquisitionAgent("acq-001", self.message_bus),
+            "processing": DataProcessingAgent("proc-001", self.message_bus),
+            "pattern": PatternRecognitionAgent("pat-001", self.message_bus),
+            "diagnostic": DiagnosticAgent("diag-001", self.message_bus),
+            "alert_monitoring": AlertMonitoringAgent("alert-001", self.message_bus),
+            "personalization": PersonalizationAgent("pers-001", self.message_bus),
+            "communication": CommunicationAgent("comm-001", self.message_bus),
         }
 
     async def start(self) -> None:
@@ -1218,40 +740,28 @@ class CardioAISystem:
         logger.info("[CardioAI] All agents stopped")
 
 
-# ============================================================================
-# SECTION 15 — DEVICE SESSION REGISTRY
-# ============================================================================
-
 @dataclass
 class DeviceSession:
-    device_id:          str
-    device_type:        DeviceType
-    patient_id:         str
-    is_active:          bool          = True
-    registered_at:      str           = field(default_factory=_utcnow_iso)
-    last_data_at:       Optional[str] = None
-    data_count:         int           = 0
-    missed_heartbeats:  int           = 0
+    device_id: str
+    device_type: DeviceType
+    patient_id: str
+    is_active: bool = True
+    registered_at: str = field(default_factory=_utcnow_iso)
+    last_data_at: Optional[str] = None
+    data_count: int = 0
+    missed_heartbeats: int = 0
 
 
 class DeviceSessionRegistry:
-    """Thread-safe in-memory registry of active device sessions."""
-
     def __init__(self) -> None:
         self._sessions: Dict[str, DeviceSession] = {}
 
-    def register(
-        self, device_id: str, device_type: str, patient_id: str
-    ) -> DeviceSession:
+    def register(self, device_id: str, device_type: str, patient_id: str) -> DeviceSession:
         try:
             dt = DeviceType(device_type)
         except ValueError:
             dt = DeviceType.ECG_MONITOR
-        session = DeviceSession(
-            device_id   = device_id,
-            device_type = dt,
-            patient_id  = patient_id,
-        )
+        session = DeviceSession(device_id=device_id, device_type=dt, patient_id=patient_id)
         self._sessions[device_id] = session
         logger.info("[Registry] registered device=%s type=%s", device_id, device_type)
         return session
@@ -1262,9 +772,9 @@ class DeviceSessionRegistry:
     def mark_data_received(self, device_id: str) -> None:
         session = self._sessions.get(device_id)
         if session:
-            session.data_count         += 1
-            session.last_data_at        = _utcnow_iso()
-            session.missed_heartbeats   = 0
+            session.data_count += 1
+            session.last_data_at = _utcnow_iso()
+            session.missed_heartbeats = 0
 
     def mark_inactive(self, device_id: str) -> None:
         session = self._sessions.get(device_id)
@@ -1277,84 +787,44 @@ class DeviceSessionRegistry:
     def summary(self) -> Dict[str, Any]:
         sessions = list(self._sessions.values())
         return {
-            "total":    len(sessions),
-            "active":   sum(1 for s in sessions if s.is_active),
+            "total": len(sessions),
+            "active": sum(1 for s in sessions if s.is_active),
             "inactive": sum(1 for s in sessions if not s.is_active),
-            "devices":  [
+            "devices": [
                 {
-                    "device_id":   s.device_id,
-                    "patient_id":  s.patient_id,
-                    "is_active":   s.is_active,
-                    "data_count":  s.data_count,
-                    "last_data_at": s.last_data_at,
+                    "device_id": s.device_id, "patient_id": s.patient_id, "is_active": s.is_active,
+                    "data_count": s.data_count, "last_data_at": s.last_data_at,
                 }
                 for s in sessions
             ],
         }
 
 
-# ============================================================================
-# SECTION 16 — IoMT SERVER CONNECTOR  (WebSocket CLIENT)
-# ============================================================================
-
 class IoMTServerConnector:
-    """
-    WebSocket client that connects to the IoMT server and runs the
-    3-way HMAC-SHA256 handshake before streaming RPM data.
-
-    Reconnection
-    ------------
-    Exponential back-off up to *reconnect_max_attempts*.  Attempt counter
-    resets on a successful session to allow recovery after transient faults.
-
-    Back-pressure
-    -------------
-    When the inbound queue is full, the oldest frame is evicted before the
-    new one is enqueued, ensuring the pipeline always processes the most
-    recent sensor readings.
-    """
-
-    def __init__(
-        self,
-        cfg:           HandshakeConfig,
-        inbound_queue: asyncio.Queue,
-        registry:      DeviceSessionRegistry,
-    ) -> None:
-        self.cfg            = cfg
-        self.inbound_queue  = inbound_queue
-        self.registry       = registry
-        self._security      = SecurityManager(cfg)
-        self._ws:            Optional[websockets.WebSocketClientProtocol] = None
-        self._token:         Optional[str]   = None
-        self._connected      = asyncio.Event()
-        self._stop           = asyncio.Event()
-
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    def __init__(self, cfg: HandshakeConfig, inbound_queue: asyncio.Queue, registry: DeviceSessionRegistry) -> None:
+        self.cfg = cfg
+        self.inbound_queue = inbound_queue
+        self.registry = registry
+        self._security = SecurityManager(cfg)
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._token: Optional[str] = None
+        self._connected = asyncio.Event()
+        self._stop = asyncio.Event()
 
     async def run(self) -> None:
-        """Outer reconnect loop with exponential back-off."""
         attempt = 0
         while not self._stop.is_set():
             try:
-                logger.info("[Connector] connecting to %s (attempt %d)",
-                            self.cfg.iomt_server_ws_url, attempt + 1)
-                async with websockets.connect(
-                    self.cfg.iomt_server_ws_url,
-                    ping_interval = None,   # we handle keep-alive manually
-                    ssl           = None,   # set ssl=True in production with TLS context
-                ) as ws:
-                    self._ws  = ws
-                    attempt   = 0           # reset on successful connect
+                logger.info("[Connector] connecting to %s (attempt %d)", self.cfg.iomt_server_ws_url, attempt + 1)
+                async with websockets.connect(self.cfg.iomt_server_ws_url, ping_interval=None, ssl=None) as ws:
+                    self._ws = ws
+                    attempt = 0
                     await self._run_session(ws)
-
-            except (websockets.ConnectionClosed, OSError) as exc:
+            except (websockets.ConnectionClosed, OSError):
                 self._connected.clear()
                 attempt += 1
                 if attempt >= self.cfg.reconnect_max_attempts:
-                    logger.error(
-                        "[Connector] max reconnect attempts (%d) reached — stopping",
-                        self.cfg.reconnect_max_attempts,
-                    )
+                    logger.error("[Connector] max reconnect attempts (%d) reached — stopping", self.cfg.reconnect_max_attempts)
                     break
                 delay = self.cfg.reconnect_base_delay_seconds * (2 ** (attempt - 1))
                 logger.info("[Connector] reconnecting in %.1fs ...", delay)
@@ -1365,211 +835,106 @@ class IoMTServerConnector:
         if self._ws:
             await self._ws.close()
 
-    # ── Session orchestration ─────────────────────────────────────────────────
-
-    async def _run_session(self, ws: websockets.WebSocketClientProtocol) -> None:
+    async def _run_session(self, ws) -> None:
         await self._handshake(ws)
         device_ids = await self._fetch_and_register_devices(ws)
         await self._subscribe_devices(ws, device_ids)
         self._connected.set()
-        logger.info("[Connector] session established — streaming %d device(s)",
-                    len(device_ids))
-        await asyncio.gather(
-            self._receive_loop(ws),
-            self._heartbeat_loop(ws),
-        )
+        logger.info("[Connector] session established — streaming %d device(s)", len(device_ids))
+        await asyncio.gather(self._receive_loop(ws), self._heartbeat_loop(ws))
 
-    # ── 3-way HMAC handshake ──────────────────────────────────────────────────
-
-    async def _handshake(self, ws: websockets.WebSocketClientProtocol) -> None:
-        """
-        Perform the 3-way HMAC-SHA256 handshake:
-          1. Send HELLO with client identity.
-          2. Receive CHALLENGE (random nonce from server).
-          3. Send CHALLENGE_RESP with HMAC-SHA256(shared_secret, nonce).
-          4. Receive AUTH_OK with JWT session token.
-        """
-        # Step 1 — HELLO
-        await ws.send(build_message(
-            MsgType.HELLO,
-            {"client_id": self.cfg.cardioai_backend_id, "version": "1.0"},
-            self.cfg.cardioai_backend_id,
-        ))
-
-        # Step 2 — CHALLENGE
+    async def _handshake(self, ws) -> None:
+        await ws.send(build_message(MsgType.HELLO, {"client_id": self.cfg.cardioai_backend_id, "version": "1.0"}, self.cfg.cardioai_backend_id))
         msg = parse_message(await asyncio.wait_for(ws.recv(), timeout=10))
         if msg["type"] != MsgType.CHALLENGE.value:
             raise RuntimeError(f"Expected CHALLENGE, got {msg['type']}")
         challenge = msg["payload"]["challenge"]
-
-        # Step 3 — CHALLENGE_RESP  (sign nonce with shared secret)
-        await ws.send(build_message(
-            MsgType.CHALLENGE_RESP,
-            {
-                "challenge":  challenge,
-                "signature":  self._security.sign_challenge(challenge),
-            },
-            self.cfg.cardioai_backend_id,
-        ))
-
-        # Step 4 — AUTH_OK / AUTH_FAIL
+        await ws.send(build_message(MsgType.CHALLENGE_RESP, {"challenge": challenge, "signature": self._security.sign_challenge(challenge)}, self.cfg.cardioai_backend_id))
         msg = parse_message(await asyncio.wait_for(ws.recv(), timeout=10))
         if msg["type"] == MsgType.AUTH_FAIL.value:
-            raise AuthenticationError(
-                f"IoMT server rejected authentication: {msg['payload']}"
-            )
+            raise AuthenticationError(f"IoMT server rejected authentication: {msg['payload']}")
         if msg["type"] != MsgType.AUTH_OK.value:
             raise RuntimeError(f"Expected AUTH_OK, got {msg['type']}")
-
         self._token = msg["payload"].get("token")
         logger.info("[Handshake] authentication successful")
 
-    # ── Device registration ───────────────────────────────────────────────────
-
-    async def _fetch_and_register_devices(
-        self, ws: websockets.WebSocketClientProtocol
-    ) -> List[str]:
-        await ws.send(build_message(
-            MsgType.DEVICE_LIST,
-            {"token": self._token},
-            self.cfg.cardioai_backend_id,
-        ))
+    async def _fetch_and_register_devices(self, ws) -> List[str]:
+        await ws.send(build_message(MsgType.DEVICE_LIST, {"token": self._token}, self.cfg.cardioai_backend_id))
         msg = parse_message(await asyncio.wait_for(ws.recv(), timeout=15))
         if msg["type"] != MsgType.DEVICE_LIST_ACK.value:
             raise RuntimeError(f"Expected DEVICE_LIST_ACK, got {msg['type']}")
-
         device_ids = []
         for d in msg["payload"]["devices"]:
             self.registry.register(d["device_id"], d["device_type"], d["patient_id"])
             device_ids.append(d["device_id"])
-
         logger.info("[Connector] %d device(s) registered", len(device_ids))
         return device_ids
 
-    async def _subscribe_devices(
-        self, ws: websockets.WebSocketClientProtocol, device_ids: List[str]
-    ) -> None:
-        await ws.send(build_message(
-            MsgType.SUBSCRIBE,
-            {
-                "token":           self._token,
-                "device_ids":      device_ids,
-                "rpm_interval_ms": int(self.cfg.rpm_poll_interval_seconds * 1000),
-            },
-            self.cfg.cardioai_backend_id,
-        ))
+    async def _subscribe_devices(self, ws, device_ids: List[str]) -> None:
+        await ws.send(build_message(MsgType.SUBSCRIBE, {
+            "token": self._token, "device_ids": device_ids,
+            "rpm_interval_ms": int(self.cfg.rpm_poll_interval_seconds * 1000),
+        }, self.cfg.cardioai_backend_id))
         msg = parse_message(await asyncio.wait_for(ws.recv(), timeout=10))
         if msg["type"] != MsgType.SUBSCRIBE_ACK.value:
             raise RuntimeError(f"Subscription failed: {msg}")
         logger.info("[Connector] subscribed to RPM streams")
 
-    # ── Receive / heartbeat loops ─────────────────────────────────────────────
-
-    async def _receive_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
+    async def _receive_loop(self, ws) -> None:
         async for raw in ws:
             try:
                 msg = parse_message(raw)
             except ValueError as exc:
                 logger.warning("[Connector] malformed message: %s", exc)
                 continue
-
             mtype = msg.get("type")
             if mtype == MsgType.RPM_DATA.value:
                 await self._handle_rpm_data(msg, ws)
             elif mtype == MsgType.HEARTBEAT.value:
-                await ws.send(build_message(
-                    MsgType.HEARTBEAT_ACK,
-                    {"ts": _utcnow_iso()},
-                    self.cfg.cardioai_backend_id,
-                ))
+                await ws.send(build_message(MsgType.HEARTBEAT_ACK, {"ts": _utcnow_iso()}, self.cfg.cardioai_backend_id))
             elif mtype == MsgType.ERROR.value:
                 logger.error("[Connector] server error: %s", msg["payload"])
             elif mtype == MsgType.DISCONNECT.value:
                 logger.warning("[Connector] server requested disconnect")
                 break
 
-    async def _heartbeat_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
+    async def _heartbeat_loop(self, ws) -> None:
         while not self._stop.is_set():
             await asyncio.sleep(self.cfg.heartbeat_interval_seconds)
             try:
-                await ws.send(build_message(
-                    MsgType.HEARTBEAT,
-                    {"ts": _utcnow_iso()},
-                    self.cfg.cardioai_backend_id,
-                ))
+                await ws.send(build_message(MsgType.HEARTBEAT, {"ts": _utcnow_iso()}, self.cfg.cardioai_backend_id))
             except websockets.ConnectionClosed:
                 break
 
-    # ── RPM frame handling ────────────────────────────────────────────────────
-
-    async def _handle_rpm_data(
-        self, msg: Dict, ws: websockets.WebSocketClientProtocol
-    ) -> None:
-        payload   = msg["payload"]
+    async def _handle_rpm_data(self, msg: Dict, ws) -> None:
+        payload = msg["payload"]
         device_id = payload.get("device_id")
-        session   = self.registry.get(device_id)
-
+        session = self.registry.get(device_id)
         if not session or not session.is_active:
             return
-
         self.registry.mark_data_received(device_id)
-
-        # Back-pressure: evict oldest frame if queue is full
         if self.inbound_queue.full():
             try:
                 self.inbound_queue.get_nowait()
                 logger.warning("[Connector] inbound queue full — oldest frame evicted")
             except asyncio.QueueEmpty:
                 pass
-
         await self.inbound_queue.put({
-            "device_id":   device_id,
-            "device_type": session.device_type.value,
-            "patient_id":  session.patient_id,
-            "timestamp":   payload.get("timestamp", _utcnow_iso()),
-            "data":        payload.get("data", {}),
+            "device_id": device_id, "device_type": session.device_type.value, "patient_id": session.patient_id,
+            "timestamp": payload.get("timestamp", _utcnow_iso()), "data": payload.get("data", {}),
             "quality_score": payload.get("quality_score", 1.0),
         })
+        await ws.send(build_message(MsgType.RPM_ACK, {"msg_id": msg["msg_id"]}, self.cfg.cardioai_backend_id))
 
-        # Acknowledge receipt
-        await ws.send(build_message(
-            MsgType.RPM_ACK,
-            {"msg_id": msg["msg_id"]},
-            self.cfg.cardioai_backend_id,
-        ))
-
-
-# ============================================================================
-# SECTION 17 — RPM DATA PUMP
-# ============================================================================
 
 class RPMDataPump:
-    """
-    Drains the inbound queue and injects frames into the CardioAI pipeline
-    via DataAcquisitionAgent.process().
-
-    An optional *on_rpm_frame* callback is invoked for each frame,
-    which can be used to forward frames to Kafka, InfluxDB, or any other
-    external sink without coupling this class to those dependencies.
-    """
-
-    def __init__(
-        self,
-        inbound_queue:   asyncio.Queue,
-        cardioai_system: CardioAISystem,
-        registry:        DeviceSessionRegistry,
-        on_rpm_frame:    Optional[Callable[[Dict], Any]] = None,
-    ) -> None:
-        self.queue        = inbound_queue
-        self.system       = cardioai_system
-        self.registry     = registry
+    def __init__(self, inbound_queue: asyncio.Queue, cardioai_system: CardioAISystem, registry: DeviceSessionRegistry, on_rpm_frame: Optional[Callable[[Dict], Any]] = None) -> None:
+        self.queue = inbound_queue
+        self.system = cardioai_system
+        self.registry = registry
         self.on_rpm_frame = on_rpm_frame
-        self._stop        = asyncio.Event()
-        self.stats: Dict[str, Any] = {
-            "frames_processed": 0,
-            "frames_dropped":   0,
-            "last_frame_at":    None,
-        }
+        self._stop = asyncio.Event()
+        self.stats: Dict[str, Any] = {"frames_processed": 0, "frames_dropped": 0, "last_frame_at": None}
 
     async def run(self) -> None:
         logger.info("[RPMPump] started")
@@ -1578,12 +943,10 @@ class RPMDataPump:
                 frame = await asyncio.wait_for(self.queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
-
             try:
                 await self._process_frame(frame)
             except Exception:
-                logger.exception("[RPMPump] error processing frame device=%s",
-                                 frame.get("device_id"))
+                logger.exception("[RPMPump] error processing frame device=%s", frame.get("device_id"))
                 self.stats["frames_dropped"] += 1
             finally:
                 self.queue.task_done()
@@ -1594,18 +957,11 @@ class RPMDataPump:
     async def _process_frame(self, frame: Dict) -> None:
         device_id = frame.get("device_id")
         if device_id and not self.registry.get(device_id):
-            self.registry.register(
-                device_id,
-                frame.get("device_type", "ecg_monitor"),
-                frame.get("patient_id", "unknown"),
-            )
-
+            self.registry.register(device_id, frame.get("device_type", "ecg_monitor"), frame.get("patient_id", "unknown"))
         acq_agent = self.system.agents["acquisition"]
         await acq_agent.process(frame)
-
         self.stats["frames_processed"] += 1
-        self.stats["last_frame_at"]     = _utcnow_iso()
-
+        self.stats["last_frame_at"] = _utcnow_iso()
         if self.on_rpm_frame:
             try:
                 result = self.on_rpm_frame(frame)
@@ -1615,36 +971,15 @@ class RPMDataPump:
                 logger.exception("[RPMPump] on_rpm_frame callback error")
 
 
-# ============================================================================
-# SECTION 18 — DEVICE HEALTH MONITOR
-# ============================================================================
-
 class DeviceHealthMonitor:
-    """
-    Periodically inspects active DeviceSession objects for data staleness.
-
-    A device is considered stale when:
-      • last_data_at is older than *stale_threshold_seconds*, OR
-      • missed_heartbeats ≥ 3
-
-    On detection the device is marked inactive and a 'device.inactive' event
-    is published so downstream consumers can react (e.g. raise a nurse alert).
-    """
-
     _MAX_MISSED_HEARTBEATS = 3
 
-    def __init__(
-        self,
-        registry:                DeviceSessionRegistry,
-        message_bus:             MessageBus,
-        stale_threshold_seconds: float = 30.0,
-        check_interval_seconds:  float = 10.0,
-    ) -> None:
-        self.registry        = registry
-        self.message_bus     = message_bus
+    def __init__(self, registry: DeviceSessionRegistry, message_bus: MessageBus, stale_threshold_seconds: float = 30.0, check_interval_seconds: float = 10.0) -> None:
+        self.registry = registry
+        self.message_bus = message_bus
         self.stale_threshold = stale_threshold_seconds
-        self.check_interval  = check_interval_seconds
-        self._stop           = asyncio.Event()
+        self.check_interval = check_interval_seconds
+        self._stop = asyncio.Event()
 
     async def run(self) -> None:
         logger.info("[HealthMonitor] started (threshold=%.0fs)", self.stale_threshold)
@@ -1659,94 +994,41 @@ class DeviceHealthMonitor:
         now = datetime.now(timezone.utc)
         for session in self.registry.active_devices():
             if session.last_data_at is None:
-                continue  # device registered but never sent data — skip
+                continue
             last = datetime.fromisoformat(session.last_data_at)
-            # Make last timezone-aware if necessary
             if last.tzinfo is None:
                 last = last.replace(tzinfo=timezone.utc)
-            stale = (
-                (now - last).total_seconds() > self.stale_threshold
-                or session.missed_heartbeats >= self._MAX_MISSED_HEARTBEATS
-            )
+            stale = (now - last).total_seconds() > self.stale_threshold or session.missed_heartbeats >= self._MAX_MISSED_HEARTBEATS
             if stale:
                 self.registry.mark_inactive(session.device_id)
                 await self.message_bus.publish("device.inactive", {
-                    "device_id":  session.device_id,
-                    "patient_id": session.patient_id,
-                    "reason":     "stale_data",
-                    "last_seen":  session.last_data_at,
+                    "device_id": session.device_id, "patient_id": session.patient_id,
+                    "reason": "stale_data", "last_seen": session.last_data_at,
                 })
-                logger.warning(
-                    "[HealthMonitor] device=%s patient=%s marked inactive",
-                    session.device_id, session.patient_id,
-                )
+                logger.warning("[HealthMonitor] device=%s patient=%s marked inactive", session.device_id, session.patient_id)
 
-
-# ============================================================================
-# SECTION 19 — BRIDGE (TOP-LEVEL ORCHESTRATOR)
-# ============================================================================
 
 class IoMTCardioAIBridge:
-    """
-    Top-level orchestrator that wires all subsystems together and exposes a
-    single start() / stop() interface.
-
-    Component ownership
-    -------------------
-    - CardioAISystem         : 7-agent AI pipeline with shared MessageBus
-    - IoMTServerConnector    : WebSocket client + HMAC handshake
-    - RPMDataPump            : queue → pipeline injection
-    - DeviceHealthMonitor    : dropout detection
-    - DeviceSessionRegistry  : session state
-
-    Optional cloud write-back
-    --------------------------
-    RPMDataPump accepts an on_rpm_frame hook (see its constructor) that you
-    can use to forward every frame to Pub/Sub, BigQuery, or any other sink.
-    None is wired up by default — add your own integration and pass it in
-    when constructing RPMDataPump if you need cloud write-back.
-    """
-
-    def __init__(
-        self,
-        cardioai_system: CardioAISystem,
-        cfg:             Optional[HandshakeConfig] = None,
-    ) -> None:
-        self.cfg      = cfg or HandshakeConfig.from_env()
-        self.system   = cardioai_system
+    def __init__(self, cardioai_system: CardioAISystem, cfg: Optional[HandshakeConfig] = None) -> None:
+        self.cfg = cfg or HandshakeConfig.from_env()
+        self.system = cardioai_system
         self.registry = DeviceSessionRegistry()
-        self._queue: asyncio.Queue = asyncio.Queue(
-            maxsize=self.cfg.inbound_queue_maxsize
-        )
-        self.connector = IoMTServerConnector(
-            self.cfg, self._queue, self.registry
-        )
-        self.pump = RPMDataPump(
-            inbound_queue   = self._queue,
-            cardioai_system = self.system,
-            registry        = self.registry,
-        )
-        self.health_monitor = DeviceHealthMonitor(
-            registry    = self.registry,
-            message_bus = self.system.message_bus,
-        )
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=self.cfg.inbound_queue_maxsize)
+        self.connector = IoMTServerConnector(self.cfg, self._queue, self.registry)
+        self.pump = RPMDataPump(inbound_queue=self._queue, cardioai_system=self.system, registry=self.registry)
+        self.health_monitor = DeviceHealthMonitor(registry=self.registry, message_bus=self.system.message_bus)
         self._tasks: List[asyncio.Task] = []
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
-
     async def start(self) -> None:
-        """Start the 7-agent pipeline and all background services."""
         await self.system.start()
         self._tasks = [
-            asyncio.create_task(self.connector.run(),       name="iomt_connector"),
-            asyncio.create_task(self.pump.run(),            name="rpm_pump"),
-            asyncio.create_task(self.health_monitor.run(),  name="health_monitor"),
+            asyncio.create_task(self.connector.run(), name="iomt_connector"),
+            asyncio.create_task(self.pump.run(), name="rpm_pump"),
+            asyncio.create_task(self.health_monitor.run(), name="health_monitor"),
         ]
-        logger.info("[Bridge] started — %d background tasks running",
-                    len(self._tasks))
+        logger.info("[Bridge] started — %d background tasks running", len(self._tasks))
 
     async def stop(self) -> None:
-        """Graceful shutdown: stop all background tasks then the pipeline."""
         await self.connector.stop()
         await self.pump.stop()
         await self.health_monitor.stop()
@@ -1756,52 +1038,14 @@ class IoMTCardioAIBridge:
         await self.system.stop()
         logger.info("[Bridge] stopped cleanly")
 
-    # ── Status snapshot ────────────────────────────────────────────────────────
-
     def status(self) -> Dict[str, Any]:
-        """Return a JSON-serialisable snapshot of the bridge's current state."""
         return {
-            "bridge_id":         self.cfg.cardioai_backend_id,
-            "timestamp":         _utcnow_iso(),
-            "queue_depth":       self._queue.qsize(),
-            "pump_stats":        self.pump.stats,
-            "devices":           self.registry.summary(),
-            "agent_count":       len(self.system.agents),
+            "bridge_id": self.cfg.cardioai_backend_id, "timestamp": _utcnow_iso(),
+            "queue_depth": self._queue.qsize(), "pump_stats": self.pump.stats,
+            "devices": self.registry.summary(), "agent_count": len(self.system.agents),
             "message_bus_total": self.system.message_bus.message_count,
         }
 
-
-
-# ============================================================================
-# SECTION 19b — USER AUTHENTICATION & HTTP API
-# ============================================================================
-#
-# Two authentication flows are supported:
-#
-#   POST /auth/login
-#   ────────────────
-#   Body : { "email": "...", "password": "...", "mfa_code": "..." (optional) }
-#   Returns:
-#     200 { "access_token": "...", "refresh_token": "...",
-#           "token_type": "Bearer", "expires_in": 3600,
-#           "user": { "id": "...", "name": "...", "role": "...", "patient_id": "..." } }
-#     401 { "error": "invalid_credentials" }
-#     403 { "error": "mfa_required" }
-#     429 { "error": "rate_limited" }
-#
-#   POST /auth/refresh
-#   ──────────────────
-#   Body : { "refresh_token": "..." }
-#   Returns:
-#     200 { "access_token": "...", "refresh_token": "...",
-#           "token_type": "Bearer", "expires_in": 3600 }
-#     401 { "error": "invalid_refresh_token" }
-#     401 { "error": "refresh_token_expired" }
-#
-# All other endpoints require:
-#   Authorization: Bearer <access_token>
-#
-# ============================================================================
 
 import re as _re
 import time as _time
@@ -1809,72 +1053,23 @@ from collections import defaultdict as _defaultdict
 from datetime import timedelta as _timedelta
 from functools import wraps as _wraps
 
-
-# ── User roles ────────────────────────────────────────────────────────────────
-
-# UserRole is defined in db.py and imported above as DBUserRole, then
-# re-exported here under the plain name "UserRole" so existing code in this
-# file (and the rest of build_http_app) doesn't need to change.
 UserRole = DBUserRole
-
-
-# ── User model ────────────────────────────────────────────────────────────────
-#
-# HospitalUser now lives in db.py and is backed by a real PostgreSQL `users`
-# table. It is imported above as `HospitalUser`. The class is re-exported
-# here under the same name for backward compatibility with any code below
-# that still references `HospitalUser` directly.
-
-# ── Database-backed user store ─────────────────────────────────────────────────
-#
-# Replaces the old in-memory _STUB_USERS dict entirely. `_db` is a single
-# asyncpg connection pool shared across every request — connected once in
-# main() at startup, disconnected on shutdown.
-
 _db = Database()
-
-# ── Kafka — large/implanted device vendor event pipeline ──────────────────────
-#
-# Completely separate from the BLE patient-pairing flow and from the
-# outbound IoMT hardware connector above. This producer is used ONLY by
-# POST /vendor-gateway/ingest to publish normalized vendor events; the
-# consumer (started in main()) drains them into the SAME 7-agent pipeline
-# that BLE devices feed, via DataAcquisitionAgent.register_device() /
-# stream_data() — see _consume_vendor_event() below.
-
 _kafka_producer = KafkaEventProducer()
 
 
 async def _load_user_by_email(email: str) -> Optional[HospitalUser]:
-    """Look up a user by email address from PostgreSQL."""
     return await _db.get_user_by_email(email)
 
 
 async def _load_user_by_id(user_id: str) -> Optional[HospitalUser]:
-    """Look up a user by UUID from PostgreSQL."""
     return await _db.get_user_by_id(user_id)
 
 
-# ── Refresh tokens — now backed by the `refresh_tokens` Postgres table ────────
-#
-# The old in-memory RefreshTokenStore class has been removed. All refresh
-# token operations go through _db.issue_refresh_token() / consume_refresh_token()
-# / revoke_all_refresh_tokens() directly, which persist to Postgres and
-# survive process restarts and multi-instance deployments — unlike the old
-# in-memory dict, which lost all sessions on every redeploy.
-
-
-# ── Rate limiter ───────────────────────────────────────────────────────────────
-
 class RateLimiter:
-    """
-    Simple in-memory sliding-window rate limiter for auth endpoints.
-    Replace with Redis in a multi-instance deployment.
-    """
-
     def __init__(self, max_attempts: int = 5, window_seconds: int = 300) -> None:
-        self._max      = max_attempts
-        self._window   = window_seconds
+        self._max = max_attempts
+        self._window = window_seconds
         self._attempts: Dict[str, list[float]] = _defaultdict(list)
 
     def is_allowed(self, key: str) -> bool:
@@ -1894,50 +1089,26 @@ class RateLimiter:
 _AUTH_RATE_LIMITER = RateLimiter(max_attempts=5, window_seconds=300)
 
 
-# ── JWT helpers for user tokens ────────────────────────────────────────────────
-
 def _issue_access_token(user: HospitalUser, cfg: "HandshakeConfig") -> str:
-    """Issue a short-lived access token (default 1h) for a user."""
     now = datetime.now(timezone.utc)
-    return jwt.encode(
-        {
-            "iss":        cfg.cardioai_backend_id,
-            "sub":        user.id,
-            "email":      user.email,
-            "role":       user.role.value,
-            "patient_id": user.patient_id,
-            "iat":        now,
-            "exp":        now + _timedelta(seconds=cfg.token_ttl_seconds),
-            "token_type": "access",
-        },
-        cfg.jwt_secret,
-        algorithm=cfg.jwt_algorithm,
-    )
+    return jwt.encode({
+        "iss": cfg.cardioai_backend_id, "sub": user.id, "email": user.email,
+        "role": user.role.value, "patient_id": user.patient_id, "iat": now,
+        "exp": now + _timedelta(seconds=cfg.token_ttl_seconds), "token_type": "access",
+    }, cfg.jwt_secret, algorithm=cfg.jwt_algorithm)
 
 
 def _verify_access_token(token: str, cfg: "HandshakeConfig") -> Dict[str, Any]:
-    """
-    Decode and validate a user access token.
-    Raises AuthenticationError on expiry, bad sig, wrong type.
-    """
     try:
-        payload = jwt.decode(
-            token,
-            cfg.jwt_secret,
-            algorithms=[cfg.jwt_algorithm],
-        )
+        payload = jwt.decode(token, cfg.jwt_secret, algorithms=[cfg.jwt_algorithm])
     except ExpiredSignatureError as exc:
         raise AuthenticationError("Access token has expired") from exc
     except InvalidTokenError as exc:
         raise AuthenticationError(f"Invalid access token: {exc}") from exc
-
     if payload.get("token_type") != "access":
         raise AuthenticationError("Token is not an access token")
-
     return payload
 
-
-# ── CORS middleware ────────────────────────────────────────────────────────────
 
 def _cors_middleware(allowed_origins: str):
     @_web.middleware
@@ -1950,32 +1121,43 @@ def _cors_middleware(allowed_origins: str):
                 resp = await handler(request)
             except _web.HTTPException as exc:
                 resp = _web.Response(
-                    status=exc.status,
-                    content_type="application/json",
+                    status=exc.status, content_type="application/json",
                     body=json.dumps({"error": exc.reason}).encode(),
+                )
+            except Exception:
+                # PATCHED: without this branch, any non-HTTPException error
+                # (KeyError, asyncpg error, etc.) escapes this middleware
+                # entirely. aiohttp then returns a bare 500 with NO CORS
+                # headers, the browser blocks that response, and fetch()
+                # throws on the client — which looks exactly like "server
+                # unreachable" even though the server responded. This also
+                # logs the full traceback so the real cause shows up in
+                # Render logs instead of vanishing silently.
+                logger.exception("[API] unhandled exception in %s %s", request.method, request.path)
+                resp = _web.Response(
+                    status=500, content_type="application/json",
+                    body=json.dumps({
+                        "error": "internal_server_error",
+                        "message": "An unexpected error occurred. Check server logs.",
+                    }).encode(),
                 )
 
         allowed = allowed_origins if allowed_origins == "*" else allowed_origins
-        resp.headers["Access-Control-Allow-Origin"]  = allowed
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
-        resp.headers["Access-Control-Max-Age"]       = "86400"
+        resp.headers["Access-Control-Allow-Origin"] = allowed
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS, PATCH"
+        resp.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Vendor-Api-Key"
+        resp.headers["Access-Control-Max-Age"] = "86400"
         return resp
     return middleware
 
 
-# ── Bearer auth decorator ──────────────────────────────────────────────────────
-
 def _require_auth(cfg: "HandshakeConfig"):
-    """Decorator that validates Bearer JWT before calling the handler."""
     def decorator(handler):
         @_wraps(handler)
         async def wrapper(request: _web.Request) -> _web.Response:
             auth_header = request.headers.get("Authorization", "")
             if not auth_header.startswith("Bearer "):
-                raise _web.HTTPUnauthorized(
-                    reason="Missing or malformed Authorization header"
-                )
+                raise _web.HTTPUnauthorized(reason="Missing or malformed Authorization header")
             token = auth_header[7:].strip()
             try:
                 payload = _verify_access_token(token, cfg)
@@ -1988,25 +1170,6 @@ def _require_auth(cfg: "HandshakeConfig"):
 
 
 def require_role(*allowed_roles: "UserRole"):
-    """
-    RBAC decorator — stacks ON TOP of @_require_auth(cfg), which must run
-    first so request["user"] is already populated.
-
-    Usage
-    -----
-        @_require_auth(cfg)
-        @require_role(UserRole.ADMIN)
-        async def some_admin_only_handler(request): ...
-
-        @_require_auth(cfg)
-        @require_role(UserRole.NURSE, UserRole.CARDIOLOGIST, UserRole.ADMIN)
-        async def clinical_staff_only_handler(request): ...
-
-    Returns 403 forbidden_role if the authenticated user's role is not in
-    allowed_roles. This is a separate, composable layer on top of auth —
-    @_require_auth confirms WHO the caller is, @require_role confirms
-    whether that role is ALLOWED to call this specific endpoint.
-    """
     allowed_values = {r.value for r in allowed_roles}
 
     def decorator(handler):
@@ -2014,36 +1177,17 @@ def require_role(*allowed_roles: "UserRole"):
         async def wrapper(request: _web.Request) -> _web.Response:
             user = request.get("user")
             if user is None:
-                # require_role used without _require_auth above it — programmer error
                 raise _web.HTTPUnauthorized(reason="Authentication required")
             role = user.get("role")
             if role not in allowed_values:
-                logger.warning(
-                    "[RBAC] forbidden: user_id=%s role=%s attempted endpoint requiring %s",
-                    user.get("sub"), role, sorted(allowed_values),
-                )
-                raise _web.HTTPForbidden(
-                    reason=f"This action requires one of: {', '.join(sorted(allowed_values))}"
-                )
+                logger.warning("[RBAC] forbidden: user_id=%s role=%s attempted endpoint requiring %s", user.get("sub"), role, sorted(allowed_values))
+                raise _web.HTTPForbidden(reason=f"This action requires one of: {', '.join(sorted(allowed_values))}")
             return await handler(request)
         return wrapper
     return decorator
 
 
-# ── Vendor gateway authentication ──────────────────────────────────────────────
-#
-# Large/implanted device vendor gateways (Medtronic CareLink, Abbott
-# Merlin.net, Boston Scientific LATITUDE, etc.) authenticate with a
-# per-vendor API key in the X-Vendor-Api-Key header — NOT a patient/
-# clinician JWT. This is a machine-to-machine credential issued once per
-# vendor integration via POST /admin/vendor-keys.
-
 def _require_vendor_api_key(handler):
-    """
-    Decorator for POST /vendor-gateway/ingest. Verifies the X-Vendor-Api-Key
-    header against the vendor_api_keys table and attaches the resolved
-    vendor name to request["vendor"] for the handler to use.
-    """
     @_wraps(handler)
     async def wrapper(request: _web.Request) -> _web.Response:
         api_key = request.headers.get("X-Vendor-Api-Key", "").strip()
@@ -2058,114 +1202,58 @@ def _require_vendor_api_key(handler):
     return wrapper
 
 
-# ── Vendor payload normalization ───────────────────────────────────────────────
-#
-# Each implant vendor has its own JSON shape. These functions translate a
-# vendor's raw payload into the SAME normalized frame shape that BLE devices
-# produce, so both paths feed identical data into DataAcquisitionAgent.
-#
-# Add a new function here (and a branch in normalize_vendor_payload) for
-# each additional vendor you integrate. Until a real vendor contract exists,
-# these implement a reasonable best-guess shape based on each vendor's
-# publicly documented data export formats — verify field names against the
-# actual gateway contract once you have one, and adjust here.
-
 def _normalize_medtronic_payload(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Best-guess normalizer for Medtronic CareLink-style exports.
-    Expected raw shape (adjust once you have a real CareLink contract):
-        {
-          "deviceSerialNumber": "...",
-          "heartRateBpm": 72,
-          "episodeType": "AF" | "VT" | "normal" | ...,
-          "recordedAt": "2026-01-01T00:00:00Z"
-        }
-    """
     device_id = raw.get("deviceSerialNumber")
     if not device_id:
         return None
     return {
-        "vendor_device_id": device_id,
-        "timestamp":        raw.get("recordedAt", _utcnow_iso()),
+        "vendor_device_id": device_id, "timestamp": raw.get("recordedAt", _utcnow_iso()),
         "data": {
-            "heart_rate": raw.get("heartRateBpm"),
-            "systolic":   raw.get("systolicBp"),
-            "diastolic":  raw.get("diastolicBp"),
-            "spo2":       raw.get("spo2Pct"),
+            "heart_rate": raw.get("heartRateBpm"), "systolic": raw.get("systolicBp"),
+            "diastolic": raw.get("diastolicBp"), "spo2": raw.get("spo2Pct"),
         },
         "vendor_episode_type": raw.get("episodeType"),
     }
 
 
 def _normalize_abbott_payload(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Best-guess normalizer for Abbott Merlin.net-style exports.
-    Expected raw shape (adjust once you have a real Merlin.net contract):
-        {
-          "implantId": "...",
-          "vitals": {"hr": 72, "spo2": 97},
-          "alertCode": "ATRIAL_FIB" | null,
-          "timestamp": "2026-01-01T00:00:00Z"
-        }
-    """
     device_id = raw.get("implantId")
     if not device_id:
         return None
     vitals = raw.get("vitals", {})
     return {
-        "vendor_device_id": device_id,
-        "timestamp":        raw.get("timestamp", _utcnow_iso()),
+        "vendor_device_id": device_id, "timestamp": raw.get("timestamp", _utcnow_iso()),
         "data": {
-            "heart_rate": vitals.get("hr"),
-            "systolic":   vitals.get("systolic"),
-            "diastolic":  vitals.get("diastolic"),
-            "spo2":       vitals.get("spo2"),
+            "heart_rate": vitals.get("hr"), "systolic": vitals.get("systolic"),
+            "diastolic": vitals.get("diastolic"), "spo2": vitals.get("spo2"),
         },
         "vendor_episode_type": raw.get("alertCode"),
     }
 
 
 def _normalize_boston_scientific_payload(raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Best-guess normalizer for Boston Scientific LATITUDE-style exports.
-    Expected raw shape (adjust once you have a real LATITUDE contract):
-        {
-          "device_id": "...",
-          "measurements": {"heart_rate_bpm": 72, "spo2_percent": 97},
-          "event": "normal" | "vt_detected" | ...,
-          "event_time": "2026-01-01T00:00:00Z"
-        }
-    """
     device_id = raw.get("device_id")
     if not device_id:
         return None
     m = raw.get("measurements", {})
     return {
-        "vendor_device_id": device_id,
-        "timestamp":        raw.get("event_time", _utcnow_iso()),
+        "vendor_device_id": device_id, "timestamp": raw.get("event_time", _utcnow_iso()),
         "data": {
-            "heart_rate": m.get("heart_rate_bpm"),
-            "systolic":   m.get("systolic_bp"),
-            "diastolic":  m.get("diastolic_bp"),
-            "spo2":       m.get("spo2_percent"),
+            "heart_rate": m.get("heart_rate_bpm"), "systolic": m.get("systolic_bp"),
+            "diastolic": m.get("diastolic_bp"), "spo2": m.get("spo2_percent"),
         },
         "vendor_episode_type": raw.get("event"),
     }
 
 
 _VENDOR_NORMALIZERS: Dict[str, Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]] = {
-    "medtronic":         _normalize_medtronic_payload,
-    "abbott":             _normalize_abbott_payload,
-    "boston_scientific":  _normalize_boston_scientific_payload,
+    "medtronic": _normalize_medtronic_payload,
+    "abbott": _normalize_abbott_payload,
+    "boston_scientific": _normalize_boston_scientific_payload,
 }
 
 
 def normalize_vendor_payload(vendor: str, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Dispatch to the correct per-vendor normalizer. Returns None if the
-    vendor is unrecognized or the payload is missing its device identifier
-    — callers should treat None as "send to dead-letter, do not crash".
-    """
     normalizer = _VENDOR_NORMALIZERS.get(vendor)
     if normalizer is None:
         logger.warning("[VendorGateway] no normalizer registered for vendor=%s", vendor)
@@ -2178,506 +1266,243 @@ def normalize_vendor_payload(vendor: str, raw: Dict[str, Any]) -> Optional[Dict[
 
 
 async def _consume_vendor_event(bridge: "IoMTCardioAIBridge", event: Dict[str, Any]) -> None:
-    """
-    Kafka consumer callback — receives a NORMALIZED vendor event and feeds
-    it into the exact same 7-agent pipeline entry points that BLE devices
-    use (DataAcquisitionAgent.register_device / stream_data), so pattern
-    recognition, diagnosis, and alerting work identically regardless of
-    which path the data arrived through.
-    """
     vendor_device_id = event.get("vendor_device_id")
     if not vendor_device_id:
         return
-
     large_device = await _db.get_large_device_by_vendor_id(vendor_device_id)
     if large_device is None or not large_device.is_active:
-        logger.warning(
-            "[VendorGateway] event for unregistered/inactive device=%s — dropped",
-            vendor_device_id,
-        )
+        logger.warning("[VendorGateway] event for unregistered/inactive device=%s — dropped", vendor_device_id)
         return
-
     acq_agent = bridge.system.agents["acquisition"]
-
-    # Register (idempotent — re-registering an already-known device_id is
-    # harmless, register_device() just overwrites its own entry)
-    await acq_agent.register_device(
-        device_id   = vendor_device_id,
-        device_type = large_device.device_type,
-        patient_id  = large_device.patient_id,
-    )
-
-    await acq_agent.stream_data(vendor_device_id, {
-        "device_id":  vendor_device_id,
-        "patient_id": large_device.patient_id,
-        "data":       event.get("data", {}),
-    })
-
+    await acq_agent.register_device(device_id=vendor_device_id, device_type=large_device.device_type, patient_id=large_device.patient_id)
+    await acq_agent.stream_data(vendor_device_id, {"device_id": vendor_device_id, "patient_id": large_device.patient_id, "data": event.get("data", {})})
     await _db.touch_large_device_last_event(vendor_device_id)
 
 
-# ── HTTP API factory ───────────────────────────────────────────────────────────
-
 def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
-    """
-    Construct and return the aiohttp Application with all routes mounted.
-
-    Routes
-    ------
-    POST /auth/apple        — Sign in with Apple (iOS app)
-    POST /auth/login        — authenticate user, issue access + refresh tokens
-    POST /auth/refresh      — rotate refresh token, issue new access token
-    POST /auth/logout       — revoke all refresh tokens for user
-    POST /devices/register  — register a paired BLE device (requires Bearer)
-    GET  /health            — liveness probe, NO auth required (for Render/LB checks)
-    GET  /status            — full bridge status (requires Bearer)
-    GET  /devices           — device registry (requires Bearer)
-    GET  /alerts            — active alerts   (requires Bearer)
-    GET  /reports           — clinical reports (requires Bearer)
-    """
     cfg = bridge.cfg
-
-    app = _web.Application(
-        middlewares=[_cors_middleware(cfg.allowed_origins)]
-    )
-
-    # ── POST /auth/login ──────────────────────────────────────────────────
+    app = _web.Application(middlewares=[_cors_middleware(cfg.allowed_origins)])
 
     async def login(request: _web.Request) -> _web.Response:
-        """
-        Authenticate a hospital user and issue tokens.
-
-        Request body (JSON)
-        -------------------
-        {
-          "email":    "user@hospital.local",   # required
-          "password": "plaintext_password",    # required
-          "mfa_code": "123456"                 # required only if MFA_REQUIRED=true
-        }
-
-        Success (200)
-        -------------
-        {
-          "access_token":  "<JWT>",
-          "refresh_token": "<opaque token>",
-          "token_type":    "Bearer",
-          "expires_in":    3600,
-          "user": {
-            "id":         "<uuid>",
-            "name":       "John Anderson",
-            "role":       "patient",
-            "patient_id": "PT_12345"   (null for non-patient roles)
-          }
-        }
-
-        Errors
-        ------
-        400  missing_fields
-        401  invalid_credentials
-        403  mfa_required   (when MFA_REQUIRED=true and mfa_code absent)
-        403  invalid_mfa    (wrong MFA code)
-        403  account_disabled
-        429  rate_limited
-        """
-        # ── Parse body ────────────────────────────────────────────────────
         try:
             body = await request.json()
         except Exception:
-            return _web.json_response(
-                {"error": "invalid_json", "message": "Request body must be valid JSON"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_json", "message": "Request body must be valid JSON"}, status=400)
 
-        email    = (body.get("email")    or "").strip().lower()
+        email = (body.get("email") or "").strip().lower()
         password = (body.get("password") or "").strip()
         mfa_code = (body.get("mfa_code") or "").strip()
 
         if not email or not password:
-            return _web.json_response(
-                {"error": "missing_fields",
-                 "message": "Both 'email' and 'password' are required"},
-                status=400,
-            )
+            return _web.json_response({"error": "missing_fields", "message": "Both 'email' and 'password' are required"}, status=400)
 
-        # ── Email format guard ────────────────────────────────────────────
         if not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
-            return _web.json_response(
-                {"error": "invalid_email", "message": "Invalid email format"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_email", "message": "Invalid email format"}, status=400)
 
-        # ── Rate limiting (by IP) ─────────────────────────────────────────
         client_ip = request.remote or "unknown"
         if not _AUTH_RATE_LIMITER.is_allowed(client_ip):
             logger.warning("[Auth] rate limited IP=%s email=%s", client_ip, email)
-            return _web.json_response(
-                {"error": "rate_limited",
-                 "message": "Too many login attempts. Try again in 5 minutes."},
-                status=429,
-            )
+            return _web.json_response({"error": "rate_limited", "message": "Too many login attempts. Try again in 5 minutes."}, status=429)
 
-        # ── Load user ─────────────────────────────────────────────────────
         user = await _load_user_by_email(email)
         if user is None:
-            # Return the same error as wrong password — prevents user enumeration
             logger.warning("[Auth] unknown email=%s IP=%s", email, client_ip)
-            await _db.log_event("login_failed", ip_address=client_ip,
-                                detail=f"unknown email: {email}")
-            return _web.json_response(
-                {"error": "invalid_credentials",
-                 "message": "Email or password is incorrect"},
-                status=401,
-            )
+            await _db.log_event("login_failed", ip_address=client_ip, detail=f"unknown email: {email}")
+            return _web.json_response({"error": "invalid_credentials", "message": "Email or password is incorrect"}, status=401)
 
-        # ── Account active check ──────────────────────────────────────────
         if not user.is_active:
             logger.warning("[Auth] inactive account login attempt email=%s", email)
-            await _db.log_event("login_failed", user_id=user.id, ip_address=client_ip,
-                                detail="account inactive")
-            return _web.json_response(
-                {"error": "account_inactive",
-                 "message": "Your account is not yet active. If you just signed up, "
-                            "an administrator needs to approve your account first. "
-                            "If your account was previously active, contact your "
-                            "administrator to find out why it was disabled."},
-                status=403,
-            )
+            await _db.log_event("login_failed", user_id=user.id, ip_address=client_ip, detail="account inactive")
+            return _web.json_response({
+                "error": "account_inactive",
+                "message": "Your account is not yet active. If you just signed up, an administrator needs to approve your account first.",
+            }, status=403)
 
-        # ── Password verification (bcrypt, constant-time) ─────────────────
         if not user.verify_password(password):
             logger.warning("[Auth] wrong password email=%s IP=%s", email, client_ip)
-            await _db.log_event("login_failed", user_id=user.id, ip_address=client_ip,
-                                detail="wrong password")
-            return _web.json_response(
-                {"error": "invalid_credentials",
-                 "message": "Email or password is incorrect"},
-                status=401,
-            )
+            await _db.log_event("login_failed", user_id=user.id, ip_address=client_ip, detail="wrong password")
+            return _web.json_response({"error": "invalid_credentials", "message": "Email or password is incorrect"}, status=401)
 
-        # ── MFA check ─────────────────────────────────────────────────────
         if cfg.mfa_required:
             if not mfa_code:
-                return _web.json_response(
-                    {"error": "mfa_required",
-                     "message": "A 6-digit MFA code is required",
-                     "next_step": "submit mfa_code"},
-                    status=403,
-                )
-            # Stub MFA: accept any 6-digit numeric code in dev, validate TOTP in prod
-            # Production: replace with pyotp.TOTP(user.mfa_secret).verify(mfa_code)
+                return _web.json_response({"error": "mfa_required", "message": "A 6-digit MFA code is required", "next_step": "submit mfa_code"}, status=403)
             if not (_re.match(r"^\d{6}$", mfa_code)):
-                return _web.json_response(
-                    {"error": "invalid_mfa",
-                     "message": "Invalid MFA code"},
-                    status=403,
-                )
+                return _web.json_response({"error": "invalid_mfa", "message": "Invalid MFA code"}, status=403)
 
-        # ── Issue tokens ──────────────────────────────────────────────────
-        _AUTH_RATE_LIMITER.reset(client_ip)   # successful login resets counter
-        access_token  = _issue_access_token(user, cfg)
+        _AUTH_RATE_LIMITER.reset(client_ip)
+        access_token = _issue_access_token(user, cfg)
         refresh_token = await _db.issue_refresh_token(user.id, cfg.refresh_token_ttl)
         await _db.update_last_login(user.id)
         await _db.log_event("login_success", user_id=user.id, ip_address=client_ip)
-
-        logger.info(
-            "[Auth] login successful email=%s role=%s IP=%s",
-            email, user.role.value, client_ip,
-        )
+        logger.info("[Auth] login successful email=%s role=%s IP=%s", email, user.role.value, client_ip)
 
         return _web.json_response({
-            "access_token":  access_token,
-            "refresh_token": refresh_token,
-            "token_type":    "Bearer",
-            "expires_in":    cfg.token_ttl_seconds,
-            "user": {
-                "id":         user.id,
-                "name":       user.name,
-                "role":       user.role.value,
-                "patient_id": user.patient_id,
-            },
+            "access_token": access_token, "refresh_token": refresh_token, "token_type": "Bearer",
+            "expires_in": cfg.token_ttl_seconds,
+            "user": {"id": user.id, "name": user.name, "role": user.role.value, "patient_id": user.patient_id},
         })
 
-    # ── POST /auth/signup ────────────────────────────────────────────────────
-    #
-    # Self-registration for clinical staff (nurse / cardiologist / admin).
-    # Unauthenticated — anyone with a hospital email can request an account,
-    # but NEW ACCOUNTS START INACTIVE (is_active=False). They cannot sign in
-    # until an existing admin approves them via:
-    #     PATCH /admin/users/{id}  body: {"is_active": true}
-    #
-    # This prevents arbitrary self-registration from granting immediate
-    # access to patient data, while still letting clinicians request an
-    # account without needing IT to create it for them first.
-    #
-    # Patient accounts are NEVER created here — patients authenticate via
-    # Sign in with Apple (POST /auth/apple), which auto-provisions on first
-    # sign-in. This endpoint only accepts nurse / cardiologist / admin.
-    #
-    # The very first admin account for a fresh deployment has no admin yet
-    # to approve it — see the "bootstrap admin" note in the README for how
-    # to activate the first account directly via SQL.
-
     async def signup(request: _web.Request) -> _web.Response:
-        """
-        Request a new clinical staff account. Account is created INACTIVE
-        and requires admin approval before it can sign in.
-
-        Request body (JSON)
-        -------------------
-        {
-          "email":        "newdoctor@hospital.local",
-          "name":         "Dr. Smith",
-          "organization": "St. Mary's Medical Center",
-          "password":     "SecurePass123",
-          "role":         "nurse" | "cardiologist" | "admin"
-        }
-
-        Success (201)
-        -------------
-        {
-          "id": "<uuid>", "email": "...", "name": "...",
-          "organization": "...", "role": "...", "is_active": false,
-          "message": "Account created. An administrator must approve it before you can sign in."
-        }
-
-        Errors
-        ------
-        400  missing_fields | invalid_role | weak_password
-        409  email_taken
-        429  rate_limited
-        """
         try:
             body = await request.json()
         except Exception:
             return _web.json_response({"error": "invalid_json"}, status=400)
 
-        email        = (body.get("email")        or "").strip().lower()
-        name         = (body.get("name")         or "").strip()
+        email = (body.get("email") or "").strip().lower()
+        name = (body.get("name") or "").strip()
         organization = (body.get("organization") or "").strip()
-        password     = (body.get("password")     or "").strip()
-        role_str     = (body.get("role")         or "").strip()
+        password = (body.get("password") or "").strip()
+        role_str = (body.get("role") or "").strip()
 
         if not email or not name or not organization or not password or not role_str:
-            return _web.json_response(
-                {"error": "missing_fields",
-                 "message": "email, name, organization, password, and role are all required"},
-                status=400,
-            )
+            return _web.json_response({"error": "missing_fields", "message": "email, name, organization, password, and role are all required"}, status=400)
 
         if not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
-            return _web.json_response(
-                {"error": "invalid_email", "message": "Invalid email format"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_email", "message": "Invalid email format"}, status=400)
 
         client_ip = request.remote or "unknown"
         if not _AUTH_RATE_LIMITER.is_allowed(client_ip):
             logger.warning("[Signup] rate limited IP=%s email=%s", client_ip, email)
-            return _web.json_response(
-                {"error": "rate_limited",
-                 "message": "Too many signup attempts. Try again in 5 minutes."},
-                status=429,
-            )
+            return _web.json_response({"error": "rate_limited", "message": "Too many signup attempts. Try again in 5 minutes."}, status=429)
 
         try:
             role = UserRole(role_str)
         except ValueError:
-            return _web.json_response(
-                {"error": "invalid_role",
-                 "message": f"'{role_str}' must be one of: nurse, cardiologist, admin"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_role", "message": f"'{role_str}' must be one of: nurse, cardiologist, admin"}, status=400)
 
         if role == UserRole.PATIENT:
-            return _web.json_response(
-                {"error": "invalid_role",
-                 "message": "Patients sign in with Apple — this endpoint is for clinical staff only"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_role", "message": "Patients sign in with Apple — this endpoint is for clinical staff only"}, status=400)
 
         if len(password) < 8:
-            return _web.json_response(
-                {"error": "weak_password",
-                 "message": "Password must be at least 8 characters"},
-                status=400,
-            )
+            return _web.json_response({"error": "weak_password", "message": "Password must be at least 8 characters"}, status=400)
 
         existing = await _load_user_by_email(email)
         if existing:
-            return _web.json_response(
-                {"error": "email_taken",
-                 "message": "An account with this email already exists"},
-                status=409,
+            return _web.json_response({"error": "email_taken", "message": "An account with this email already exists"}, status=409)
+
+        # Organization-domain lock (canonical table first, legacy heuristic
+        # as fallback): stops someone from signing up as e.g.
+        # "attacker@gmail.com" claiming to be staff at an organization that
+        # already has a locked domain list.
+        new_domain = email.rsplit("@", 1)[-1].lower()
+        org_record = await _db.get_organization_by_name(organization)
+
+        if org_record is not None:
+            # Canonical record exists (either admin-created or auto-registered
+            # by an earlier signup). If it has any allowed_domains set,
+            # enforce them strictly.
+            if org_record.allowed_domains and new_domain not in org_record.allowed_domains:
+                logger.warning(
+                    "[Signup] domain mismatch: org=%s email_domain=%s expected one of %s",
+                    organization, new_domain, org_record.allowed_domains,
+                )
+                return _web.json_response({
+                    "error": "organization_domain_mismatch",
+                    "message": (
+                        f"'{organization}' is already registered with a different "
+                        "email domain. If you believe this is an error, contact "
+                        "your administrator or use your organization's official "
+                        "email address."
+                    ),
+                }, status=409)
+            # If allowed_domains is empty (admin created the org without
+            # locking a domain, or it's an older auto-registered record),
+            # fall back to the legacy heuristic against existing users.
+            elif not org_record.allowed_domains:
+                existing_domains = await _db.get_organization_domains(organization)
+                if existing_domains and new_domain not in existing_domains:
+                    return _web.json_response({
+                        "error": "organization_domain_mismatch",
+                        "message": (
+                            f"'{organization}' is already registered with a different "
+                            "email domain. If you believe this is an error, contact "
+                            "your administrator or use your organization's official "
+                            "email address."
+                        ),
+                    }, status=409)
+        else:
+            # Brand-new organization name — nothing to check against yet.
+            # Auto-register it now with THIS signup's domain as its founding
+            # (and only) allowed domain, so every subsequent signup under
+            # this name is locked to it immediately. An admin can broaden
+            # this later via PATCH /admin/organizations/{id} if the hospital
+            # legitimately uses multiple email domains.
+            await _db.create_organization(
+                name=organization, allowed_domains=[new_domain], auto_registered=True,
+            )
+            logger.info(
+                "[Signup] auto-registered new organization=%s founding_domain=%s",
+                organization, new_domain,
             )
 
         password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(12)).decode()
-        new_user = await _db.create_staff_user(
-            email=email, name=name, organization=organization, role=role,
-            password_hash=password_hash, is_active=False,
-        )
+        new_user = await _db.create_staff_user(email=email, name=name, organization=organization, role=role, password_hash=password_hash, is_active=False)
 
-        await _db.log_event(
-            "signup_requested",
-            detail=f"role={role.value} email={email} org={organization}",
-        )
-        logger.info("[Signup] new pending %s account requested: %s (%s)",
-                    role.value, email, organization)
+        await _db.log_event("signup_requested", detail=f"role={role.value} email={email} org={organization}")
+        logger.info("[Signup] new pending %s account requested: %s (%s)", role.value, email, organization)
 
         return _web.json_response({
-            "id":           new_user.id,
-            "email":        new_user.email,
-            "name":         new_user.name,
-            "organization": new_user.organization,
-            "role":         new_user.role.value,
-            "is_active":    new_user.is_active,
-            "message":      "Account created. An administrator must approve it before you can sign in.",
+            "id": new_user.id, "email": new_user.email, "name": new_user.name,
+            "organization": new_user.organization, "role": new_user.role.value, "is_active": new_user.is_active,
+            "message": "Account created. An administrator must approve it before you can sign in.",
         }, status=201)
 
-    # ── POST /auth/refresh ────────────────────────────────────────────────
-
     async def refresh(request: _web.Request) -> _web.Response:
-        """
-        Rotate a refresh token and issue a new access token.
-
-        Implements refresh token rotation: the submitted token is
-        immediately invalidated, and a brand-new refresh token is returned
-        alongside the new access token.
-
-        Request body (JSON)
-        -------------------
-        { "refresh_token": "<opaque token>" }
-
-        Success (200)
-        -------------
-        {
-          "access_token":  "<new JWT>",
-          "refresh_token": "<new opaque token>",
-          "token_type":    "Bearer",
-          "expires_in":    3600
-        }
-
-        Errors
-        ------
-        400  missing_fields
-        401  invalid_refresh_token
-        401  refresh_token_expired
-        404  user_not_found
-        """
         try:
             body = await request.json()
         except Exception:
-            return _web.json_response(
-                {"error": "invalid_json"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_json"}, status=400)
 
         token_id = (body.get("refresh_token") or "").strip()
         if not token_id:
-            return _web.json_response(
-                {"error": "missing_fields",
-                 "message": "'refresh_token' is required"},
-                status=400,
-            )
+            return _web.json_response({"error": "missing_fields", "message": "'refresh_token' is required"}, status=400)
 
-        # consume() validates, deletes the token row, and returns user_id
         user_id = await _db.consume_refresh_token(token_id)
-
         if user_id is None:
             logger.warning("[Auth] invalid or expired refresh token")
-            return _web.json_response(
-                {"error": "invalid_refresh_token",
-                 "message": "Refresh token is invalid or has expired. Please sign in again."},
-                status=401,
-            )
+            return _web.json_response({"error": "invalid_refresh_token", "message": "Refresh token is invalid or has expired. Please sign in again."}, status=401)
 
-        # Re-load the user to pick up any role/status changes since last login
         user = await _load_user_by_id(user_id)
         if user is None or not user.is_active:
-            return _web.json_response(
-                {"error": "user_not_found",
-                 "message": "User account no longer exists or has been disabled"},
-                status=404,
-            )
+            return _web.json_response({"error": "user_not_found", "message": "User account no longer exists or has been disabled"}, status=404)
 
-        # Issue rotated tokens
-        new_access  = _issue_access_token(user, cfg)
+        new_access = _issue_access_token(user, cfg)
         new_refresh = await _db.issue_refresh_token(user.id, cfg.refresh_token_ttl)
-
         logger.info("[Auth] token refreshed user_id=%s", user_id)
 
-        return _web.json_response({
-            "access_token":  new_access,
-            "refresh_token": new_refresh,
-            "token_type":    "Bearer",
-            "expires_in":    cfg.token_ttl_seconds,
-        })
-
-    # ── GET /auth/logout ──────────────────────────────────────────────────
+        return _web.json_response({"access_token": new_access, "refresh_token": new_refresh, "token_type": "Bearer", "expires_in": cfg.token_ttl_seconds})
 
     @_require_auth(cfg)
     async def logout(request: _web.Request) -> _web.Response:
-        """
-        Revoke all refresh tokens for the authenticated user.
-        The client is responsible for discarding the access token locally.
-        """
         user_payload = request["user"]
         revoked = await _db.revoke_all_refresh_tokens(user_payload["sub"])
         logger.info("[Auth] logout user_id=%s revoked=%d", user_payload["sub"], revoked)
-        return _web.json_response(
-            {"message": "Signed out successfully", "tokens_revoked": revoked}
-        )
-
-    # ── GET / ─────────────────────────────────────────────────────────────
-    #
-    # Friendly landing page for the bare root path. Unauthenticated — this
-    # is just a directory listing so visiting the deploy URL in a browser
-    # shows something useful instead of a 404. Contains no patient data.
+        return _web.json_response({"message": "Signed out successfully", "tokens_revoked": revoked})
 
     async def root(request: _web.Request) -> _web.Response:
         return _web.json_response({
-            "service":     "IoMT CardioAI Backend",
-            "status":      "running",
-            "bridge_id":   cfg.cardioai_backend_id,
+            "service": "IoMT CardioAI Backend", "status": "running", "bridge_id": cfg.cardioai_backend_id,
             "endpoints": {
-                "GET  /dashboard":        "Live clinical dashboard (sign in with email/password)",
-                "GET  /health":           "Liveness probe (no auth)",
-                "GET  /status":           "Full bridge status (auth required)",
-                "POST /auth/apple":       "Sign in with Apple (iOS)",
-                "POST /auth/login":       "Email + password login",
-                "POST /auth/signup":      "Clinical staff self-registration (pending admin approval)",
-                "POST /auth/refresh":     "Rotate refresh token",
-                "POST /auth/logout":      "Revoke session",
+                "GET  /dashboard": "Live clinical dashboard (sign in with email/password)",
+                "GET  /health": "Liveness probe (no auth)", "GET  /status": "Full bridge status (auth required)",
+                "POST /auth/apple": "Sign in with Apple (iOS)", "POST /auth/login": "Email + password login",
+                "POST /auth/signup": "Clinical staff self-registration (pending admin approval)",
+                "POST /auth/refresh": "Rotate refresh token", "POST /auth/logout": "Revoke session",
                 "POST /devices/register": "Register a paired BLE device (auth required)",
                 "POST /clinical/devices/register-implant": "Register implant (clinical staff only)",
-                "GET  /clinical/devices/implants":          "List registered implants (auth required)",
+                "GET  /clinical/devices/implants": "List registered implants (auth required)",
                 "POST /vendor-gateway/ingest": "Vendor device gateway ingestion (X-Vendor-Api-Key)",
-                "GET  /devices":          "Device registry (auth required)",
-                "GET  /alerts":           "Active alerts (auth required)",
-                "GET  /reports":          "Clinical reports (auth required)",
-                "GET  /admin/users":      "List user accounts (admin only)",
-                "POST /admin/users":      "Create a clinician/admin account (admin only)",
+                "GET  /devices": "Device registry (auth required)", "GET  /alerts": "Active alerts (auth required)",
+                "GET  /reports": "Clinical reports (auth required)", "GET  /admin/users": "List user accounts (admin only)",
+                "POST /admin/users": "Create a clinician/admin account (admin only)",
                 "POST /admin/vendor-keys": "Generate a vendor API key (admin only)",
+                "GET  /admin/organizations": "List canonical organizations (admin only)",
+                "POST /admin/organizations": "Pre-register an organization with locked email domains (admin only)",
+                "PATCH /admin/organizations/{id}": "Update an organization's allowed domains/name (admin only)",
             },
         })
 
-    # ── GET /dashboard ────────────────────────────────────────────────────
-    #
-    # Serves the static HTML clinical dashboard directly from this backend,
-    # so there is one single public URL for both the API and the UI —
-    # no separate static-site hosting service needed.
-    #
-    # Unauthenticated at the HTTP level (the file itself has no patient
-    # data baked in) — the dashboard's own login screen calls POST
-    # /auth/login from the browser and stores the resulting token in
-    # sessionStorage, exactly like any other API client.
-    #
-    # The file is re-read from disk on every request rather than cached
-    # in memory, so editing iomt_cardioai_dashboard.html and redeploying
-    # picks up changes immediately with no code change required here.
-
-    _DASHBOARD_HTML_PATH = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "iomt_cardioai_dashboard.html"
-    )
+    _DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iomt_cardioai_dashboard.html")
 
     async def dashboard(request: _web.Request) -> _web.Response:
         try:
@@ -2685,145 +1510,71 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
                 html = f.read()
         except FileNotFoundError:
             return _web.Response(
-                text=(
-                    "<h1>Dashboard file not found</h1>"
-                    "<p>iomt_cardioai_dashboard.html is missing from the deploy. "
-                    "Make sure it is committed to the repo at the project root.</p>"
-                ),
-                content_type="text/html",
-                status=500,
+                text="<h1>Dashboard file not found</h1><p>iomt_cardioai_dashboard.html is missing from the deploy.</p>",
+                content_type="text/html", status=500,
             )
         return _web.Response(text=html, content_type="text/html")
 
-    # ── GET /health ───────────────────────────────────────────────────────
-    #
-    # Deliberately UNAUTHENTICATED. This is an infrastructure liveness probe
-    # used by Render.com (and any other platform) to confirm the process is
-    # up and the event loop is responsive — it contains no patient data.
-    # Render's health checker cannot send a Bearer token, so requiring auth
-    # here causes every health check to fail with 401, which prevents the
-    # deploy from ever being marked "Live".
-    #
-    # If you want to restrict what this endpoint reveals in production,
-    # trim the fields returned below rather than adding @_require_auth.
-
     async def health(request: _web.Request) -> _web.Response:
         status = bridge.status()
-        return _web.json_response({
-            "status":     "ok",
-            "bridge_id":  status.get("bridge_id"),
-            "timestamp":  status.get("timestamp"),
-            "agent_count": status.get("agent_count"),
-        })
-
-    # ── GET /status ───────────────────────────────────────────────────────
-    #
-    # Full bridge status (queue depth, device registry, message bus count).
-    # This DOES require auth, since it reveals operational details about
-    # connected devices. Use this from the dashboard instead of /health.
+        return _web.json_response({"status": "ok", "bridge_id": status.get("bridge_id"), "timestamp": status.get("timestamp"), "agent_count": status.get("agent_count")})
 
     @_require_auth(cfg)
     async def full_status(request: _web.Request) -> _web.Response:
         return _web.json_response(bridge.status())
 
-    # ── GET /devices ──────────────────────────────────────────────────────
-
     @_require_auth(cfg)
     async def devices(request: _web.Request) -> _web.Response:
-        user   = request["user"]
+        user = request["user"]
         summary = bridge.registry.summary()
-
-        # Patients can only see their own device
         if user.get("role") == UserRole.PATIENT.value:
-            pid     = user.get("patient_id")
-            summary = {
-                **summary,
-                "devices": [d for d in summary["devices"] if d["patient_id"] == pid],
-            }
-
+            pid = user.get("patient_id")
+            summary = {**summary, "devices": [d for d in summary["devices"] if d["patient_id"] == pid]}
         return _web.json_response(summary)
-
-    # ── GET /alerts ───────────────────────────────────────────────────────
 
     @_require_auth(cfg)
     async def alerts(request: _web.Request) -> _web.Response:
-        user   = request["user"]
-        agent  = bridge.system.agents["alert_monitoring"]
+        user = request["user"]
+        agent = bridge.system.agents["alert_monitoring"]
         all_alerts = [
             {
-                "alert_id":   a.alert_id,
-                "patient_id": a.patient_id,
-                "level":      a.alert_level.value,
-                "description": a.description,
-                "actions":    a.required_actions,
-                "notified":   a.notified_parties,
-                "timestamp":  a.timestamp,
+                "alert_id": a.alert_id, "patient_id": a.patient_id, "level": a.alert_level.value,
+                "description": a.description, "actions": a.required_actions, "notified": a.notified_parties,
+                "timestamp": a.timestamp,
             }
             for a in agent.active_alerts.values()
         ]
-
-        # Patients see only their own alerts
         if user.get("role") == UserRole.PATIENT.value:
-            pid        = user.get("patient_id")
+            pid = user.get("patient_id")
             all_alerts = [a for a in all_alerts if a["patient_id"] == pid]
-
         return _web.json_response(all_alerts)
-
-    # ── GET /reports ──────────────────────────────────────────────────────
 
     @_require_auth(cfg)
     async def reports(request: _web.Request) -> _web.Response:
-        user  = request["user"]
+        user = request["user"]
         store = bridge.system.agents["communication"].report_store
-
         if user.get("role") == UserRole.PATIENT.value:
-            pid   = user.get("patient_id")
+            pid = user.get("patient_id")
             store = [r for r in store if r.get("patient_id") == pid]
-
-        return _web.json_response(store[-50:])  # last 50 reports
-
-    # ── GET /admin/users ─────────────────────────────────────────────────
-    #
-    # Admin-only: list all user accounts. Supports ?role=nurse filtering
-    # and ?limit=N&offset=N pagination.
+        return _web.json_response(store[-50:])
 
     @_require_auth(cfg)
     @require_role(UserRole.ADMIN)
     async def admin_list_users(request: _web.Request) -> _web.Response:
         role_filter = request.query.get("role")
-        limit  = min(int(request.query.get("limit",  "100")), 500)
+        limit = min(int(request.query.get("limit", "100")), 500)
         offset = max(int(request.query.get("offset", "0")), 0)
-
         role_enum = None
         if role_filter:
             try:
                 role_enum = UserRole(role_filter)
             except ValueError:
-                return _web.json_response(
-                    {"error": "invalid_role",
-                     "message": f"'{role_filter}' is not a valid role"},
-                    status=400,
-                )
-
+                return _web.json_response({"error": "invalid_role", "message": f"'{role_filter}' is not a valid role"}, status=400)
         users = await _db.list_users(role=role_enum, limit=limit, offset=offset)
         return _web.json_response([
-            {
-                "id":           u.id,
-                "email":        u.email,
-                "name":         u.name,
-                "organization": u.organization,
-                "role":         u.role.value,
-                "patient_id":   u.patient_id,
-                "is_active":    u.is_active,
-            }
+            {"id": u.id, "email": u.email, "name": u.name, "organization": u.organization, "role": u.role.value, "patient_id": u.patient_id, "is_active": u.is_active}
             for u in users
         ])
-
-    # ── POST /admin/users ────────────────────────────────────────────────
-    #
-    # Admin-only: create a new nurse / cardiologist / admin account.
-    # Patient accounts are never created here — they are auto-provisioned
-    # via /auth/apple on first sign-in.
 
     @_require_auth(cfg)
     @require_role(UserRole.ADMIN)
@@ -2833,80 +1584,43 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         except Exception:
             return _web.json_response({"error": "invalid_json"}, status=400)
 
-        email        = (body.get("email")        or "").strip().lower()
-        name         = (body.get("name")         or "").strip()
+        email = (body.get("email") or "").strip().lower()
+        name = (body.get("name") or "").strip()
         organization = (body.get("organization") or "").strip()
-        password     = (body.get("password")     or "").strip()
-        role_str     = (body.get("role")         or "").strip()
+        password = (body.get("password") or "").strip()
+        role_str = (body.get("role") or "").strip()
 
         if not email or not name or not password or not role_str:
-            return _web.json_response(
-                {"error": "missing_fields",
-                 "message": "email, name, password, and role are all required"},
-                status=400,
-            )
+            return _web.json_response({"error": "missing_fields", "message": "email, name, password, and role are all required"}, status=400)
 
         try:
             role = UserRole(role_str)
         except ValueError:
-            return _web.json_response(
-                {"error": "invalid_role",
-                 "message": f"'{role_str}' must be one of: nurse, cardiologist, admin"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_role", "message": f"'{role_str}' must be one of: nurse, cardiologist, admin"}, status=400)
 
         if role == UserRole.PATIENT:
-            return _web.json_response(
-                {"error": "invalid_role",
-                 "message": "Patient accounts are created via Sign in with Apple, not this endpoint"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_role", "message": "Patient accounts are created via Sign in with Apple, not this endpoint"}, status=400)
 
         if len(password) < 8:
-            return _web.json_response(
-                {"error": "weak_password",
-                 "message": "Password must be at least 8 characters"},
-                status=400,
-            )
+            return _web.json_response({"error": "weak_password", "message": "Password must be at least 8 characters"}, status=400)
 
         existing = await _load_user_by_email(email)
         if existing:
-            return _web.json_response(
-                {"error": "email_taken",
-                 "message": "An account with this email already exists"},
-                status=409,
-            )
+            return _web.json_response({"error": "email_taken", "message": "An account with this email already exists"}, status=409)
 
         password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(12)).decode()
-        new_user = await _db.create_staff_user(
-            email=email, name=name, organization=organization,
-            role=role, password_hash=password_hash,
-        )
+        new_user = await _db.create_staff_user(email=email, name=name, organization=organization, role=role, password_hash=password_hash)
 
         admin_user = request["user"]
-        await _db.log_event(
-            "user_created", user_id=admin_user.get("sub"),
-            detail=f"created {role.value} account: {email}",
-        )
-        logger.info("[Admin] user_id=%s created new %s account: %s",
-                    admin_user.get("sub"), role.value, email)
+        await _db.log_event("user_created", user_id=admin_user.get("sub"), detail=f"created {role.value} account: {email}")
+        logger.info("[Admin] user_id=%s created new %s account: %s", admin_user.get("sub"), role.value, email)
 
-        return _web.json_response({
-            "id": new_user.id, "email": new_user.email,
-            "name": new_user.name, "organization": new_user.organization,
-            "role": new_user.role.value,
-        }, status=201)
-
-    # ── PATCH /admin/users/{user_id} ─────────────────────────────────────
-    #
-    # Admin-only: enable/disable an account and/or change its role.
-    # Body: { "is_active": false } and/or { "role": "cardiologist" }
+        return _web.json_response({"id": new_user.id, "email": new_user.email, "name": new_user.name, "organization": new_user.organization, "role": new_user.role.value}, status=201)
 
     @_require_auth(cfg)
     @require_role(UserRole.ADMIN)
     async def admin_update_user(request: _web.Request) -> _web.Response:
         target_user_id = request.match_info.get("user_id", "")
-
         try:
             body = await request.json()
         except Exception:
@@ -2914,527 +1628,211 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
         target = await _load_user_by_id(target_user_id)
         if target is None:
-            return _web.json_response(
-                {"error": "user_not_found"}, status=404,
-            )
+            return _web.json_response({"error": "user_not_found"}, status=404)
 
         admin_user = request["user"]
 
         if "is_active" in body:
             new_active = bool(body["is_active"])
             await _db.set_user_active(target_user_id, new_active)
-            await _db.log_event(
-                "account_disabled" if not new_active else "account_enabled",
-                user_id=admin_user.get("sub"),
-                detail=f"target={target.email}",
-            )
+            await _db.log_event("account_disabled" if not new_active else "account_enabled", user_id=admin_user.get("sub"), detail=f"target={target.email}")
             if not new_active:
-                # Disabling an account immediately revokes all of its sessions
                 await _db.revoke_all_refresh_tokens(target_user_id)
 
         if "role" in body:
             try:
                 new_role = UserRole(body["role"])
             except ValueError:
-                return _web.json_response(
-                    {"error": "invalid_role"}, status=400,
-                )
+                return _web.json_response({"error": "invalid_role"}, status=400)
             await _db.set_user_role(target_user_id, new_role)
-            await _db.log_event(
-                "role_change", user_id=admin_user.get("sub"),
-                detail=f"target={target.email} new_role={new_role.value}",
-            )
-            logger.info("[Admin] user_id=%s changed role of %s to %s",
-                        admin_user.get("sub"), target.email, new_role.value)
+            await _db.log_event("role_change", user_id=admin_user.get("sub"), detail=f"target={target.email} new_role={new_role.value}")
+            logger.info("[Admin] user_id=%s changed role of %s to %s", admin_user.get("sub"), target.email, new_role.value)
 
         updated = await _load_user_by_id(target_user_id)
-        return _web.json_response({
-            "id": updated.id, "email": updated.email,
-            "name": updated.name, "role": updated.role.value,
-            "is_active": updated.is_active,
-        })
-
-
-    # ── POST /auth/apple ──────────────────────────────────────────────────
-    #
-    # Called by the iOS app immediately after Sign in with Apple succeeds.
-    # The iOS ASAuthorizationAppleIDCredential contains:
-    #   - identityToken:      a short-lived JWT signed by Apple
-    #   - authorizationCode:  a one-time code for server-side token exchange
-    #   - fullName:           optional, only provided on first sign-in
-    #
-    # Verification strategy
-    # ─────────────────────
-    # Production: validate the identityToken JWT signature against Apple's
-    #   public keys at https://appleid.apple.com/auth/keys using python-jose:
-    #       pip install python-jose[cryptography] httpx
-    #       keys = httpx.get("https://appleid.apple.com/auth/keys").json()
-    #       payload = jose.jwt.decode(token, keys, algorithms=["RS256"],
-    #                                 audience="com.cardioai.iomt")
-    #
-    # Development: the stub below decodes without signature verification.
-    #   Set APPLE_VERIFY_TOKENS=true in production to enable full verification.
+        return _web.json_response({"id": updated.id, "email": updated.email, "name": updated.name, "role": updated.role.value, "is_active": updated.is_active})
 
     async def apple_signin(request: _web.Request) -> _web.Response:
-        """
-        Authenticate an iOS patient via Sign in with Apple.
-
-        Request body (JSON)
-        -------------------
-        {
-          "identity_token":      "<Apple JWT>",      # required
-          "authorization_code":  "<one-time code>",  # required
-          "first_name":          "John",             # optional, first login only
-          "last_name":           "Anderson"          # optional, first login only
-        }
-
-        Success (200)
-        -------------
-        {
-          "access_token":  "<JWT>",
-          "refresh_token": "<opaque>",
-          "token_type":    "Bearer",
-          "expires_in":    3600,
-          "user": {
-            "id":         "<apple_user_id>",
-            "name":       "John Anderson",
-            "email":      "user@privaterelay.appleid.com",
-            "role":       "patient",
-            "patient_id": "<apple_user_id>"
-          }
-        }
-
-        Errors
-        ------
-        400  missing_fields
-        401  invalid_apple_token
-        403  account_disabled
-        429  rate_limited
-        """
-        # ── Parse body ────────────────────────────────────────────────────
         try:
             body = await request.json()
         except Exception:
-            return _web.json_response(
-                {"error": "invalid_json", "message": "Request body must be valid JSON"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_json", "message": "Request body must be valid JSON"}, status=400)
 
-        identity_token     = (body.get("identity_token")     or "").strip()
+        identity_token = (body.get("identity_token") or "").strip()
         authorization_code = (body.get("authorization_code") or "").strip()
-        first_name         = (body.get("first_name")         or "").strip()
-        last_name          = (body.get("last_name")          or "").strip()
+        first_name = (body.get("first_name") or "").strip()
+        last_name = (body.get("last_name") or "").strip()
 
         if not identity_token or not authorization_code:
-            return _web.json_response(
-                {"error": "missing_fields",
-                 "message": "Both 'identity_token' and 'authorization_code' are required"},
-                status=400,
-            )
+            return _web.json_response({"error": "missing_fields", "message": "Both 'identity_token' and 'authorization_code' are required"}, status=400)
 
-        # ── Rate limit by IP (shares pool with /auth/login) ───────────────
         client_ip = request.remote or "unknown"
         if not _AUTH_RATE_LIMITER.is_allowed(client_ip):
             logger.warning("[AppleAuth] rate limited IP=%s", client_ip)
-            return _web.json_response(
-                {"error": "rate_limited",
-                 "message": "Too many sign-in attempts. Try again in 5 minutes."},
-                status=429,
-            )
+            return _web.json_response({"error": "rate_limited", "message": "Too many sign-in attempts. Try again in 5 minutes."}, status=429)
 
-        # ── Verify Apple identity token ───────────────────────────────────
         verify_tokens = _optional_env("APPLE_VERIFY_TOKENS", "false").lower() == "true"
 
         try:
             if verify_tokens:
-                # Production path — full RS256 signature verification
-                # Requires: pip install python-jose[cryptography] httpx
                 try:
-                    import httpx as _httpx                      # type: ignore
-                    from jose import jwt as _jose_jwt           # type: ignore
-                    from jose.exceptions import JWTError        # type: ignore
-
-                    apple_keys = _httpx.get(
-                        "https://appleid.apple.com/auth/keys", timeout=10
-                    ).json()
-                    apple_payload = _jose_jwt.decode(
-                        identity_token,
-                        apple_keys,
-                        algorithms=["RS256"],
-                        audience=_optional_env("APPLE_BUNDLE_ID", "com.cardioai.iomt"),
-                    )
+                    import httpx as _httpx
+                    from jose import jwt as _jose_jwt
+                    apple_keys = _httpx.get("https://appleid.apple.com/auth/keys", timeout=10).json()
+                    apple_payload = _jose_jwt.decode(identity_token, apple_keys, algorithms=["RS256"], audience=_optional_env("APPLE_BUNDLE_ID", "com.cardioai.iomt"))
                 except ImportError:
-                    logger.error(
-                        "[AppleAuth] APPLE_VERIFY_TOKENS=true but python-jose / httpx "
-                        "are not installed. Run: pip install python-jose[cryptography] httpx"
-                    )
-                    return _web.json_response(
-                        {"error": "server_configuration",
-                         "message": "Apple token verification not configured"},
-                        status=500,
-                    )
+                    logger.error("[AppleAuth] APPLE_VERIFY_TOKENS=true but python-jose / httpx are not installed.")
+                    return _web.json_response({"error": "server_configuration", "message": "Apple token verification not configured"}, status=500)
                 except Exception as exc:
                     logger.warning("[AppleAuth] token verification failed: %s", exc)
-                    return _web.json_response(
-                        {"error": "invalid_apple_token",
-                         "message": "Apple identity token is invalid or expired"},
-                        status=401,
-                    )
+                    return _web.json_response({"error": "invalid_apple_token", "message": "Apple identity token is invalid or expired"}, status=401)
             else:
-                # Development path — decode without verification
-                # WARNING: this trusts the token blindly — never use in production
                 import base64 as _b64
                 parts = identity_token.split(".")
                 if len(parts) != 3:
                     raise ValueError("Not a valid JWT structure")
-                padding       = "=" * (4 - len(parts[1]) % 4)
+                padding = "=" * (4 - len(parts[1]) % 4)
                 decoded_bytes = _b64.urlsafe_b64decode(parts[1] + padding)
                 apple_payload = json.loads(decoded_bytes.decode("utf-8"))
-
         except Exception as exc:
             logger.warning("[AppleAuth] token decode failed: %s", exc)
-            return _web.json_response(
-                {"error": "invalid_apple_token",
-                 "message": "Could not decode Apple identity token"},
-                status=401,
-            )
+            return _web.json_response({"error": "invalid_apple_token", "message": "Could not decode Apple identity token"}, status=401)
 
-        # ── Extract user identity from Apple payload ───────────────────────
         apple_user_id = apple_payload.get("sub", "")
         if not apple_user_id:
-            return _web.json_response(
-                {"error": "invalid_apple_token",
-                 "message": "Apple token missing subject claim"},
-                status=401,
-            )
+            return _web.json_response({"error": "invalid_apple_token", "message": "Apple token missing subject claim"}, status=401)
 
         apple_email = apple_payload.get("email", "")
-        # Apple relays a private email if user hides their real email
         if not apple_email:
             apple_email = f"{apple_user_id[:8].lower()}@privaterelay.appleid.com"
 
-        # Build display name — Apple only provides fullName on the very first sign-in
         display_name = f"{first_name} {last_name}".strip()
         if not display_name:
             display_name = apple_email.split("@")[0].replace(".", " ").title()
 
-        # ── Load or create patient record ──────────────────────────────────
-        # First: try to find an existing user by Apple user ID, then by email
-        existing_user = (
-            await _db.get_user_by_apple_id(apple_user_id)
-            or await _load_user_by_email(apple_email)
-        )
+        existing_user = await _db.get_user_by_apple_id(apple_user_id) or await _load_user_by_email(apple_email)
 
         if existing_user:
             user = existing_user
             if not user.is_active:
-                return _web.json_response(
-                    {"error": "account_disabled",
-                     "message": "Your account has been disabled. Contact your administrator."},
-                    status=403,
-                )
+                return _web.json_response({"error": "account_disabled", "message": "Your account has been disabled. Contact your administrator."}, status=403)
         else:
-            # First-ever sign-in — auto-provision a patient account in Postgres
-            user = await _db.create_patient_from_apple(
-                apple_user_id = apple_user_id,
-                email         = apple_email,
-                name          = display_name,
-            )
-            logger.info(
-                "[AppleAuth] auto-provisioned patient apple_id=%s email=%s",
-                apple_user_id[:12], apple_email,
-            )
+            user = await _db.create_patient_from_apple(apple_user_id=apple_user_id, email=apple_email, name=display_name)
+            logger.info("[AppleAuth] auto-provisioned patient apple_id=%s email=%s", apple_user_id[:12], apple_email)
 
-        # ── Issue tokens ───────────────────────────────────────────────────
         _AUTH_RATE_LIMITER.reset(client_ip)
-        access_token  = _issue_access_token(user, cfg)
+        access_token = _issue_access_token(user, cfg)
         refresh_token = await _db.issue_refresh_token(user.id, cfg.refresh_token_ttl)
         await _db.update_last_login(user.id)
-        await _db.log_event("login_success", user_id=user.id, ip_address=client_ip,
-                            detail="apple_signin")
-
-        logger.info(
-            "[AppleAuth] sign-in successful apple_id=%s role=%s IP=%s",
-            apple_user_id[:12], user.role.value, client_ip,
-        )
+        await _db.log_event("login_success", user_id=user.id, ip_address=client_ip, detail="apple_signin")
+        logger.info("[AppleAuth] sign-in successful apple_id=%s role=%s IP=%s", apple_user_id[:12], user.role.value, client_ip)
 
         return _web.json_response({
-            "access_token":  access_token,
-            "refresh_token": refresh_token,
-            "token_type":    "Bearer",
-            "expires_in":    cfg.token_ttl_seconds,
-            "user": {
-                "id":         user.id,
-                "name":       user.name,
-                "email":      user.email,
-                "role":       user.role.value,
-                "patient_id": user.patient_id,
-            },
+            "access_token": access_token, "refresh_token": refresh_token, "token_type": "Bearer", "expires_in": cfg.token_ttl_seconds,
+            "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role.value, "patient_id": user.patient_id},
         })
-
-    # ── POST /devices/register ────────────────────────────────────────────
-    #
-    # Called by the iOS app after a BLE device is paired.
-    # Registers the device in the DeviceSessionRegistry so it appears in
-    # /devices, receives RPM data, and is monitored by DeviceHealthMonitor.
 
     @_require_auth(cfg)
     async def device_register(request: _web.Request) -> _web.Response:
-        """
-        Register a patient's paired BLE device with the IoMT pipeline.
-
-        Request body (JSON)
-        -------------------
-        {
-          "device_id":   "<BLE peripheral UUID>",   # required
-          "device_type": "ecg_monitor",             # required
-          "patient_id":  "PT_12345",                # required
-          "device_name": "My ECG Monitor"           # optional
-        }
-
-        Success (200)
-        -------------
-        {
-          "device_id":  "<id>",
-          "patient_id": "<pid>",
-          "status":     "registered"
-        }
-
-        Errors
-        ------
-        400  missing_fields
-        403  patient_id_mismatch  (patient trying to register for another patient)
-        """
         user = request["user"]
-
         try:
             body = await request.json()
         except Exception:
             return _web.json_response({"error": "invalid_json"}, status=400)
 
-        device_id   = (body.get("device_id")   or "").strip()
+        device_id = (body.get("device_id") or "").strip()
         device_type = (body.get("device_type") or "ecg_monitor").strip()
-        patient_id  = (body.get("patient_id")  or "").strip()
+        patient_id = (body.get("patient_id") or "").strip()
         device_name = (body.get("device_name") or device_id[:12]).strip()
 
         if not device_id or not patient_id:
-            return _web.json_response(
-                {"error": "missing_fields",
-                 "message": "Both 'device_id' and 'patient_id' are required"},
-                status=400,
-            )
+            return _web.json_response({"error": "missing_fields", "message": "Both 'device_id' and 'patient_id' are required"}, status=400)
 
-        # Patients can only register devices for themselves
         if user.get("role") == UserRole.PATIENT.value:
             own_pid = user.get("patient_id") or user.get("sub")
             if patient_id != own_pid:
-                logger.warning(
-                    "[DeviceRegister] patient_id mismatch user=%s attempted=%s",
-                    own_pid, patient_id,
-                )
-                return _web.json_response(
-                    {"error": "patient_id_mismatch",
-                     "message": "You can only register devices for your own patient ID"},
-                    status=403,
-                )
+                logger.warning("[DeviceRegister] patient_id mismatch user=%s attempted=%s", own_pid, patient_id)
+                return _web.json_response({"error": "patient_id_mismatch", "message": "You can only register devices for your own patient ID"}, status=403)
 
-        # Register in the device session registry
         existing = bridge.registry.get(device_id)
         if existing:
-            # Re-activate if it was previously marked inactive
             existing.is_active = True
-            logger.info(
-                "[DeviceRegister] re-activated device=%s patient=%s",
-                device_id, patient_id,
-            )
+            logger.info("[DeviceRegister] re-activated device=%s patient=%s", device_id, patient_id)
         else:
             bridge.registry.register(device_id, device_type, patient_id)
-            logger.info(
-                "[DeviceRegister] registered device=%s type=%s patient=%s name=%s",
-                device_id, device_type, patient_id, device_name,
-            )
+            logger.info("[DeviceRegister] registered device=%s type=%s patient=%s name=%s", device_id, device_type, patient_id, device_name)
 
-        # Also register with the acquisition agent so the pipeline is ready
         acq_agent = bridge.system.agents["acquisition"]
         import asyncio as _asyncio
-        _asyncio.create_task(
-            acq_agent.register_device(device_id, device_type, patient_id)
-        )
+        _asyncio.create_task(acq_agent.register_device(device_id, device_type, patient_id))
 
-        return _web.json_response({
-            "device_id":  device_id,
-            "patient_id": patient_id,
-            "status":     "registered",
-        })
-
-    # ── POST /clinical/devices/register-implant ─────────────────────────
-    #
-    # Clinical staff ONLY — registers a pacemaker/ICD/other large implanted
-    # device against a patient. This is a SEPARATE path from BLE pairing
-    # above: implants are placed and registered by clinicians (at the
-    # hospital, or during a home follow-up visit), never self-paired by
-    # the patient. A patient can have BOTH a registered implant here AND
-    # a self-paired BLE wearable from the endpoint above — the two are
-    # independent and both stay active simultaneously.
+        return _web.json_response({"device_id": device_id, "patient_id": patient_id, "status": "registered"})
 
     @_require_auth(cfg)
     @require_role(UserRole.NURSE, UserRole.CARDIOLOGIST, UserRole.ADMIN)
     async def register_implant(request: _web.Request) -> _web.Response:
-        """
-        Register an implanted/large device against a patient.
-
-        Request body (JSON)
-        -------------------
-        {
-          "vendor_device_id": "MDT-SN-00123456",   # required — vendor's serial/ID
-          "vendor":            "medtronic",          # required — medtronic | abbott |
-                                                       #   boston_scientific | biotronik | other
-          "device_type":        "pacemaker",          # required — pacemaker | icd | crt_d |
-                                                       #   crt_p | implantable_loop_recorder | other
-          "patient_id":         "PT_12345",           # required
-          "model_number":       "Azure XT DR MRI",    # optional
-          "implanted_at":       "2026-01-15",         # optional, YYYY-MM-DD
-          "notes":              "Implanted post-MI"   # optional
-        }
-
-        Success (201)
-        -------------
-        {
-          "id": "<uuid>", "vendor_device_id": "...", "vendor": "...",
-          "device_type": "...", "patient_id": "...", "is_active": true
-        }
-
-        Errors
-        ------
-        400  missing_fields | invalid_vendor | invalid_device_type
-        409  already_registered  (vendor_device_id already in use)
-        """
         user = request["user"]
-
         try:
             body = await request.json()
         except Exception:
             return _web.json_response({"error": "invalid_json"}, status=400)
 
         vendor_device_id = (body.get("vendor_device_id") or "").strip()
-        vendor            = (body.get("vendor")            or "").strip().lower()
-        device_type       = (body.get("device_type")       or "").strip().lower()
-        patient_id        = (body.get("patient_id")        or "").strip()
-        model_number      = (body.get("model_number")      or "").strip() or None
-        implanted_at      = (body.get("implanted_at")       or "").strip() or None
-        notes             = (body.get("notes")              or "").strip() or None
+        vendor = (body.get("vendor") or "").strip().lower()
+        device_type = (body.get("device_type") or "").strip().lower()
+        patient_id = (body.get("patient_id") or "").strip()
+        model_number = (body.get("model_number") or "").strip() or None
+        implanted_at = (body.get("implanted_at") or "").strip() or None
+        notes = (body.get("notes") or "").strip() or None
 
         if not vendor_device_id or not vendor or not device_type or not patient_id:
-            return _web.json_response(
-                {"error": "missing_fields",
-                 "message": "vendor_device_id, vendor, device_type, and patient_id are all required"},
-                status=400,
-            )
+            return _web.json_response({"error": "missing_fields", "message": "vendor_device_id, vendor, device_type, and patient_id are all required"}, status=400)
 
         valid_vendors = {"medtronic", "abbott", "boston_scientific", "biotronik", "other"}
         if vendor not in valid_vendors:
-            return _web.json_response(
-                {"error": "invalid_vendor",
-                 "message": f"vendor must be one of: {', '.join(sorted(valid_vendors))}"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_vendor", "message": f"vendor must be one of: {', '.join(sorted(valid_vendors))}"}, status=400)
 
-        valid_types = {"pacemaker", "icd", "crt_d", "crt_p",
-                       "implantable_loop_recorder", "other"}
+        valid_types = {"pacemaker", "icd", "crt_d", "crt_p", "implantable_loop_recorder", "other"}
         if device_type not in valid_types:
-            return _web.json_response(
-                {"error": "invalid_device_type",
-                 "message": f"device_type must be one of: {', '.join(sorted(valid_types))}"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_device_type", "message": f"device_type must be one of: {', '.join(sorted(valid_types))}"}, status=400)
 
         existing = await _db.get_large_device_by_vendor_id(vendor_device_id)
         if existing is not None and existing.is_active:
-            return _web.json_response(
-                {"error": "already_registered",
-                 "message": f"Device {vendor_device_id} is already registered"},
-                status=409,
-            )
+            return _web.json_response({"error": "already_registered", "message": f"Device {vendor_device_id} is already registered"}, status=409)
 
         large_device = await _db.register_large_device(
-            vendor_device_id        = vendor_device_id,
-            vendor                   = vendor,
-            device_type              = device_type,
-            patient_id                = patient_id,
-            model_number              = model_number,
-            implanted_at               = implanted_at,
-            implanting_clinician_id    = user.get("sub"),
-            registered_by_user_id      = user.get("sub"),
-            notes                       = notes,
+            vendor_device_id=vendor_device_id, vendor=vendor, device_type=device_type, patient_id=patient_id,
+            model_number=model_number, implanted_at=implanted_at,
+            implanting_clinician_id=user.get("sub"), registered_by_user_id=user.get("sub"), notes=notes,
         )
 
-        await _db.log_event(
-            "implant_registered", user_id=user.get("sub"),
-            detail=f"vendor={vendor} device={vendor_device_id} patient={patient_id}",
-        )
-        logger.info(
-            "[Implant] clinician=%s registered %s device=%s for patient=%s",
-            user.get("sub"), vendor, vendor_device_id, patient_id,
-        )
+        await _db.log_event("implant_registered", user_id=user.get("sub"), detail=f"vendor={vendor} device={vendor_device_id} patient={patient_id}")
+        logger.info("[Implant] clinician=%s registered %s device=%s for patient=%s", user.get("sub"), vendor, vendor_device_id, patient_id)
 
         return _web.json_response({
-            "id":               large_device.id,
-            "vendor_device_id": large_device.vendor_device_id,
-            "vendor":           large_device.vendor,
-            "device_type":      large_device.device_type,
-            "patient_id":       large_device.patient_id,
-            "is_active":        large_device.is_active,
+            "id": large_device.id, "vendor_device_id": large_device.vendor_device_id, "vendor": large_device.vendor,
+            "device_type": large_device.device_type, "patient_id": large_device.patient_id, "is_active": large_device.is_active,
         }, status=201)
-
-    # ── GET /clinical/devices/implants ───────────────────────────────────
-    #
-    # Clinical staff: list registered implants, optionally filtered by
-    # patient. Patients can also call this to see their OWN implants only.
 
     @_require_auth(cfg)
     async def list_implants(request: _web.Request) -> _web.Response:
-        user       = request["user"]
+        user = request["user"]
         patient_id = request.query.get("patient_id")
-        vendor      = request.query.get("vendor")
-
-        # Patients may only see their own implants
+        vendor = request.query.get("vendor")
         if user.get("role") == UserRole.PATIENT.value:
             patient_id = user.get("patient_id") or user.get("sub")
-
-        devices = await _db.list_large_devices(patient_id=patient_id, vendor=vendor)
+        devices_ = await _db.list_large_devices(patient_id=patient_id, vendor=vendor)
         return _web.json_response([
             {
-                "id":               d.id,
-                "vendor_device_id": d.vendor_device_id,
-                "vendor":           d.vendor,
-                "device_type":      d.device_type,
-                "model_number":     d.model_number,
-                "patient_id":       d.patient_id,
-                "implanted_at":     d.implanted_at,
-                "is_active":        d.is_active,
-                "last_event_at":    d.last_event_at,
+                "id": d.id, "vendor_device_id": d.vendor_device_id, "vendor": d.vendor, "device_type": d.device_type,
+                "model_number": d.model_number, "patient_id": d.patient_id, "implanted_at": d.implanted_at,
+                "is_active": d.is_active, "last_event_at": d.last_event_at,
             }
-            for d in devices
+            for d in devices_
         ])
-
-    # ── POST /vendor-gateway/ingest ──────────────────────────────────────
-    #
-    # Called by a vendor's cloud gateway (Medtronic CareLink, Abbott
-    # Merlin.net, Boston Scientific LATITUDE, etc.) — NOT by the iOS app,
-    # NOT by a clinician. Authenticated via X-Vendor-Api-Key, not a JWT.
-    #
-    # Every raw payload is logged to vendor_events_raw regardless of
-    # outcome, normalized into the same frame shape BLE devices use, then
-    # published to Kafka topic "iomt.vendor.raw" for the consumer to pick
-    # up and feed into the 7-agent pipeline asynchronously. This endpoint
-    # returns immediately after publishing — it does NOT wait for pipeline
-    # processing, so a vendor pushing thousands of events per minute never
-    # gets backpressure from clinical AI processing time.
 
     @_require_vendor_api_key
     async def vendor_gateway_ingest(request: _web.Request) -> _web.Response:
         vendor = request["vendor"]
-
         try:
             raw_payload = await request.json()
         except Exception:
@@ -3442,9 +1840,7 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
         normalized = normalize_vendor_payload(vendor, raw_payload)
         vendor_device_id = normalized.get("vendor_device_id") if normalized else \
-                           raw_payload.get("deviceSerialNumber") or \
-                           raw_payload.get("implantId") or \
-                           raw_payload.get("device_id")
+            raw_payload.get("deviceSerialNumber") or raw_payload.get("implantId") or raw_payload.get("device_id")
 
         large_device = None
         if vendor_device_id:
@@ -3453,54 +1849,23 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         matched = large_device is not None and large_device.is_active
 
         await _db.log_vendor_event(
-            vendor            = vendor,
-            raw_payload        = raw_payload,
-            vendor_device_id   = vendor_device_id,
-            large_device_id    = large_device.id if large_device else None,
-            matched             = matched,
-            kafka_published     = bool(normalized and matched),
+            vendor=vendor, raw_payload=raw_payload, vendor_device_id=vendor_device_id,
+            large_device_id=large_device.id if large_device else None, matched=matched,
+            kafka_published=bool(normalized and matched),
         )
 
         if normalized is None:
             logger.warning("[VendorGateway] vendor=%s payload failed normalization", vendor)
-            await _kafka_producer.publish(
-                TOPIC_VENDOR_DEADLETTER, key=vendor_device_id or "unknown",
-                value={"vendor": vendor, "raw": raw_payload, "reason": "normalization_failed"},
-            )
-            return _web.json_response(
-                {"error": "normalization_failed",
-                 "message": "Payload could not be normalized for this vendor"},
-                status=422,
-            )
+            await _kafka_producer.publish(TOPIC_VENDOR_DEADLETTER, key=vendor_device_id or "unknown", value={"vendor": vendor, "raw": raw_payload, "reason": "normalization_failed"})
+            return _web.json_response({"error": "normalization_failed", "message": "Payload could not be normalized for this vendor"}, status=422)
 
         if not matched:
-            logger.warning(
-                "[VendorGateway] vendor=%s device=%s not registered or inactive — dead-lettered",
-                vendor, vendor_device_id,
-            )
-            await _kafka_producer.publish(
-                TOPIC_VENDOR_DEADLETTER, key=vendor_device_id or "unknown",
-                value={"vendor": vendor, "raw": raw_payload, "reason": "device_not_registered"},
-            )
-            return _web.json_response(
-                {"error": "device_not_registered",
-                 "message": f"Device {vendor_device_id} is not registered or is inactive. "
-                            "A clinician must register it via POST /clinical/devices/register-implant first."},
-                status=404,
-            )
+            logger.warning("[VendorGateway] vendor=%s device=%s not registered or inactive — dead-lettered", vendor, vendor_device_id)
+            await _kafka_producer.publish(TOPIC_VENDOR_DEADLETTER, key=vendor_device_id or "unknown", value={"vendor": vendor, "raw": raw_payload, "reason": "device_not_registered"})
+            return _web.json_response({"error": "device_not_registered", "message": f"Device {vendor_device_id} is not registered or is inactive."}, status=404)
 
-        await _kafka_producer.publish(
-            TOPIC_VENDOR_RAW, key=vendor_device_id, value=normalized,
-        )
-
+        await _kafka_producer.publish(TOPIC_VENDOR_RAW, key=vendor_device_id, value=normalized)
         return _web.json_response({"status": "accepted"}, status=202)
-
-    # ── POST /admin/vendor-keys ───────────────────────────────────────────
-    #
-    # Admin-only: generate a new vendor API key. The raw key is returned
-    # EXACTLY ONCE in this response — it is never recoverable afterward,
-    # only its hash is stored. Hand this value to the vendor's integration
-    # team to configure in their gateway.
 
     @_require_auth(cfg)
     @require_role(UserRole.ADMIN)
@@ -3511,113 +1876,159 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             return _web.json_response({"error": "invalid_json"}, status=400)
 
         vendor = (body.get("vendor") or "").strip().lower()
-        label  = (body.get("label")  or "").strip()
+        label = (body.get("label") or "").strip()
 
         valid_vendors = {"medtronic", "abbott", "boston_scientific", "biotronik", "other"}
         if vendor not in valid_vendors:
-            return _web.json_response(
-                {"error": "invalid_vendor",
-                 "message": f"vendor must be one of: {', '.join(sorted(valid_vendors))}"},
-                status=400,
-            )
+            return _web.json_response({"error": "invalid_vendor", "message": f"vendor must be one of: {', '.join(sorted(valid_vendors))}"}, status=400)
 
         raw_key, key_id = await _db.create_vendor_api_key(vendor=vendor, label=label)
 
         admin_user = request["user"]
-        await _db.log_event(
-            "vendor_key_created", user_id=admin_user.get("sub"),
-            detail=f"vendor={vendor} key_id={key_id}",
+        await _db.log_event("vendor_key_created", user_id=admin_user.get("sub"), detail=f"vendor={vendor} key_id={key_id}")
+        logger.info("[Admin] user_id=%s created vendor API key for vendor=%s", admin_user.get("sub"), vendor)
+
+        return _web.json_response({"key_id": key_id, "vendor": vendor, "api_key": raw_key, "warning": "This key is shown only once and cannot be recovered. Store it securely now."}, status=201)
+
+    # ── GET /admin/organizations ─────────────────────────────────────────
+    #
+    # Admin-only: list all canonical organizations, including ones that
+    # were auto-registered by a first-time signup (auto_registered=true)
+    # versus ones an admin explicitly created ahead of time.
+
+    @_require_auth(cfg)
+    @require_role(UserRole.ADMIN)
+    async def admin_list_organizations(request: _web.Request) -> _web.Response:
+        orgs = await _db.list_organizations()
+        return _web.json_response([
+            {
+                "id": o.id, "name": o.name, "allowed_domains": o.allowed_domains,
+                "auto_registered": o.auto_registered, "created_at": o.created_at,
+            }
+            for o in orgs
+        ])
+
+    # ── POST /admin/organizations ────────────────────────────────────────
+    #
+    # Admin-only: pre-register an organization with a locked domain list
+    # BEFORE any of its staff sign up. Recommended for onboarding a known
+    # hospital customer, so the first real signup is already domain-locked
+    # instead of relying on auto-registration from whichever email happens
+    # to sign up first.
+
+    @_require_auth(cfg)
+    @require_role(UserRole.ADMIN)
+    async def admin_create_organization(request: _web.Request) -> _web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        name = (body.get("name") or "").strip()
+        allowed_domains = body.get("allowed_domains") or []
+
+        if not name:
+            return _web.json_response({"error": "missing_fields", "message": "'name' is required"}, status=400)
+        if not isinstance(allowed_domains, list) or not all(isinstance(d, str) for d in allowed_domains):
+            return _web.json_response({"error": "invalid_domains", "message": "'allowed_domains' must be a list of domain strings, e.g. [\"hospital.org\"]"}, status=400)
+
+        existing = await _db.get_organization_by_name(name)
+        if existing is not None:
+            return _web.json_response({"error": "organization_exists", "message": f"'{name}' is already registered"}, status=409)
+
+        admin_user = request["user"]
+        org = await _db.create_organization(
+            name=name, allowed_domains=allowed_domains, created_by=admin_user.get("sub"), auto_registered=False,
         )
-        logger.info("[Admin] user_id=%s created vendor API key for vendor=%s",
-                    admin_user.get("sub"), vendor)
+        await _db.log_event("organization_created", user_id=admin_user.get("sub"), detail=f"name={name} domains={allowed_domains}")
+        logger.info("[Admin] user_id=%s created organization=%s domains=%s", admin_user.get("sub"), name, allowed_domains)
 
         return _web.json_response({
-            "key_id":  key_id,
-            "vendor":  vendor,
-            "api_key": raw_key,
-            "warning": "This key is shown only once and cannot be recovered. Store it securely now.",
+            "id": org.id, "name": org.name, "allowed_domains": org.allowed_domains, "auto_registered": org.auto_registered,
         }, status=201)
 
-    # ── Register routes ───────────────────────────────────────────────────
+    # ── PATCH /admin/organizations/{org_id} ──────────────────────────────
+    #
+    # Admin-only: update an organization's allowed domain list (e.g. add a
+    # second legitimate domain a hospital uses) and/or fix its canonical
+    # name. Body: { "allowed_domains": [...] } and/or { "name": "..." }
 
-    app.router.add_get( "/",                  root)
-    app.router.add_get( "/dashboard",          dashboard)
-    app.router.add_post("/auth/apple",        apple_signin)
-    app.router.add_post("/auth/login",        login)
-    app.router.add_post("/auth/signup",       signup)
-    app.router.add_post("/auth/refresh",      refresh)
-    app.router.add_post("/auth/logout",       logout)
-    app.router.add_post("/devices/register",  device_register)
+    @_require_auth(cfg)
+    @require_role(UserRole.ADMIN)
+    async def admin_update_organization(request: _web.Request) -> _web.Response:
+        org_id = request.match_info.get("org_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        org = await _db.get_organization_by_id(org_id)
+        if org is None:
+            return _web.json_response({"error": "organization_not_found"}, status=404)
+
+        allowed_domains = body.get("allowed_domains")
+        name = body.get("name")
+
+        if allowed_domains is not None and (not isinstance(allowed_domains, list) or not all(isinstance(d, str) for d in allowed_domains)):
+            return _web.json_response({"error": "invalid_domains", "message": "'allowed_domains' must be a list of domain strings"}, status=400)
+
+        updated = await _db.update_organization(org_id, allowed_domains=allowed_domains, name=name)
+
+        admin_user = request["user"]
+        await _db.log_event("organization_updated", user_id=admin_user.get("sub"), detail=f"org_id={org_id} domains={allowed_domains} name={name}")
+        logger.info("[Admin] user_id=%s updated organization=%s", admin_user.get("sub"), org_id)
+
+        return _web.json_response({
+            "id": updated.id, "name": updated.name, "allowed_domains": updated.allowed_domains, "auto_registered": updated.auto_registered,
+        })
+
+    app.router.add_get("/", root)
+    app.router.add_get("/dashboard", dashboard)
+    app.router.add_post("/auth/apple", apple_signin)
+    app.router.add_post("/auth/login", login)
+    app.router.add_post("/auth/signup", signup)
+    app.router.add_post("/auth/refresh", refresh)
+    app.router.add_post("/auth/logout", logout)
+    app.router.add_post("/devices/register", device_register)
     app.router.add_post("/clinical/devices/register-implant", register_implant)
-    app.router.add_get( "/clinical/devices/implants",          list_implants)
-    app.router.add_post("/vendor-gateway/ingest",               vendor_gateway_ingest)
-    app.router.add_get( "/health",            health)
-    app.router.add_get( "/status",            full_status)
-    app.router.add_get( "/devices",           devices)
-    app.router.add_get( "/alerts",            alerts)
-    app.router.add_get( "/reports",           reports)
-    app.router.add_get( "/admin/users",            admin_list_users)
-    app.router.add_post("/admin/users",            admin_create_user)
+    app.router.add_get("/clinical/devices/implants", list_implants)
+    app.router.add_post("/vendor-gateway/ingest", vendor_gateway_ingest)
+    app.router.add_get("/health", health)
+    app.router.add_get("/status", full_status)
+    app.router.add_get("/devices", devices)
+    app.router.add_get("/alerts", alerts)
+    app.router.add_get("/reports", reports)
+    app.router.add_get("/admin/users", admin_list_users)
+    app.router.add_post("/admin/users", admin_create_user)
     app.router.add_patch("/admin/users/{user_id}", admin_update_user)
-    app.router.add_post("/admin/vendor-keys",       admin_create_vendor_key)
+    app.router.add_post("/admin/vendor-keys", admin_create_vendor_key)
+    app.router.add_get("/admin/organizations", admin_list_organizations)
+    app.router.add_post("/admin/organizations", admin_create_organization)
+    app.router.add_patch("/admin/organizations/{org_id}", admin_update_organization)
 
     return app
 
 
-async def start_http_api(
-    bridge: "IoMTCardioAIBridge",
-    host:   str = "0.0.0.0",
-    port:   int = 8080,
-) -> Tuple["_web.AppRunner", "KafkaEventConsumer"]:
-    """
-    Start the HTTP API server, the database pool, and the Kafka vendor-event
-    pipeline. Returns (runner, kafka_consumer) — pass both to stop_http_api()
-    on shutdown.
-
-    Connects to PostgreSQL before accepting any requests. If DATABASE_URL is
-    not set or the database is unreachable, this raises and the process exits
-    — auth cannot function without a real user store, so failing fast here
-    is preferable to silently falling back to an empty/broken state.
-
-    Kafka is optional: if KAFKA_BOOTSTRAP_SERVERS is not set, the producer
-    and consumer both fall back to an in-memory queue automatically (see
-    kafka_bus.py) so large-device ingestion still works end-to-end in local
-    development without a live Kafka cluster.
-    """
+async def start_http_api(bridge: "IoMTCardioAIBridge", host: str = "0.0.0.0", port: int = 8080) -> Tuple["_web.AppRunner", "KafkaEventConsumer"]:
     await _db.connect()
     logger.info("[API] PostgreSQL connection pool established")
 
     await _kafka_producer.start()
 
-    kafka_consumer = KafkaEventConsumer(
-        producer = _kafka_producer,
-        on_event = lambda event: _consume_vendor_event(bridge, event),
-    )
+    kafka_consumer = KafkaEventConsumer(producer=_kafka_producer, on_event=lambda event: _consume_vendor_event(bridge, event))
     await kafka_consumer.start()
     logger.info("[API] Kafka vendor-event consumer started")
 
-    app    = build_http_app(bridge)
+    app = build_http_app(bridge)
     runner = _web.AppRunner(app)
     await runner.setup()
-    site   = _web.TCPSite(runner, host, port)
+    site = _web.TCPSite(runner, host, port)
     await site.start()
     logger.info("[API] HTTP server listening on http://%s:%d", host, port)
-    logger.info(
-        "[API] Routes: GET / POST /auth/apple POST /auth/login  POST /auth/refresh  "
-        "POST /auth/logout  GET /health  GET /status  GET /devices  GET /alerts  "
-        "GET /reports  POST /devices/register  POST /clinical/devices/register-implant  "
-        "GET /clinical/devices/implants  POST /vendor-gateway/ingest  "
-        "GET /admin/users  POST /admin/users  PATCH /admin/users/{id}  "
-        "POST /admin/vendor-keys"
-    )
     return runner, kafka_consumer
 
 
-async def stop_http_api(
-    runner:         "_web.AppRunner",
-    kafka_consumer: Optional["KafkaEventConsumer"] = None,
-) -> None:
-    """Clean up the HTTP API, Kafka, and the database pool."""
+async def stop_http_api(runner: "_web.AppRunner", kafka_consumer: Optional["KafkaEventConsumer"] = None) -> None:
     if kafka_consumer is not None:
         await kafka_consumer.stop()
     await _kafka_producer.stop()
@@ -3625,52 +2036,12 @@ async def stop_http_api(
     await _db.disconnect()
 
 
-# ============================================================================
-# SECTION 20 — ENTRY POINT
-# ============================================================================
-
 async def main() -> None:
-    """
-    Production entry point.
-
-    Reads all configuration from environment variables, starts the bridge
-    and/or HTTP API depending on CARDIOAI_RUN_MODE, and runs until
-    SIGINT / SIGTERM is received.
-
-    CARDIOAI_RUN_MODE values
-    -------------------------
-    all   (default) — HTTP API + outbound IoMT bridge connector in one process.
-                       Use this for a single-server deployment (Docker, VM,
-                       systemd). Requires only CARDIOAI_API_PORT to be public.
-    api             — HTTP API only. No outbound connection to the IoMT
-                       hardware server is attempted. Use this on platforms
-                       like Render.com that expose exactly one public port
-                       per service — deploy this as your public-facing
-                       'cardioai-api' service.
-    bridge          — Outbound IoMT connector only (no public HTTP port).
-                       Connects out to IOMT_SERVER_WS_URL, runs the 7-agent
-                       pipeline, and exposes no listener of its own. Deploy
-                       this as a private background worker (Render
-                       'cardioai-bridge', or a systemd service with no
-                       public ingress).
-
-    Usage
-    -----
-    export IOMT_SERVER_WS_URL="wss://iomt.hospital.local/stream"
-    export CARDIOAI_BACKEND_ID="cardioai-prod-01"
-    export IOMT_SHARED_SECRET="<32+ char secret from Vault>"
-    export IOMT_JWT_SECRET="<32+ char secret from Vault>"
-    export CARDIOAI_RUN_MODE="all"        # or "api" / "bridge"
-    python iomt_cardioai_production.py
-    """
     logger.info("[Startup] IoMT CardioAI Production Service initialising ...")
 
     run_mode = _optional_env("CARDIOAI_RUN_MODE", "all").lower()
     if run_mode not in ("all", "api", "bridge"):
-        logger.critical(
-            "[Startup] invalid CARDIOAI_RUN_MODE=%r — must be 'all', 'api', or 'bridge'",
-            run_mode,
-        )
+        logger.critical("[Startup] invalid CARDIOAI_RUN_MODE=%r — must be 'all', 'api', or 'bridge'", run_mode)
         sys.exit(1)
     logger.info("[Startup] run mode: %s", run_mode)
 
@@ -3687,7 +2058,6 @@ async def main() -> None:
 
     loop = asyncio.get_running_loop()
 
-    # Register graceful shutdown on SIGINT / SIGTERM
     import signal as _signal
     shutdown_event = asyncio.Event()
 
@@ -3699,39 +2069,20 @@ async def main() -> None:
         try:
             loop.add_signal_handler(sig, _handle_signal, sig)
         except NotImplementedError:
-            # Windows does not support loop.add_signal_handler
             pass
 
-    api_runner     = None
+    api_runner = None
     kafka_consumer = None
 
-    # ── Start HTTP API (auth + dashboard data endpoints) ───────────────────────
-    # Render.com note: this binds to $PORT via CARDIOAI_API_PORT — see render.yaml
     if run_mode in ("all", "api"):
-        api_runner, kafka_consumer = await start_http_api(
-            bridge,
-            host = cfg.api_host,
-            port = cfg.api_port,
-        )
-        logger.info(
-            "[Startup] HTTP API listening on http://%s:%d",
-            cfg.api_host, cfg.api_port,
-        )
+        api_runner, kafka_consumer = await start_http_api(bridge, host=cfg.api_host, port=cfg.api_port)
+        logger.info("[Startup] HTTP API listening on http://%s:%d", cfg.api_host, cfg.api_port)
 
-    # ── Start the 7-agent pipeline + outbound IoMT connector ───────────────────
-    # This makes an OUTBOUND connection to IOMT_SERVER_WS_URL — it does not
-    # itself listen on a public port, so it has no $PORT requirement.
     if run_mode in ("all", "bridge"):
         await bridge.start()
-        logger.info(
-            "[Startup] bridge running — outbound connection to %s",
-            cfg.iomt_server_ws_url,
-        )
+        logger.info("[Startup] bridge running — outbound connection to %s", cfg.iomt_server_ws_url)
     else:
-        logger.info(
-            "[Startup] run_mode=api — skipping outbound IoMT bridge connector. "
-            "Deploy a separate 'bridge' mode service to handle device data."
-        )
+        logger.info("[Startup] run_mode=api — skipping outbound IoMT bridge connector.")
 
     logger.info("[Startup] awaiting shutdown signal")
     await shutdown_event.wait()
@@ -3742,7 +2093,6 @@ async def main() -> None:
     if api_runner is not None:
         await stop_http_api(api_runner, kafka_consumer)
 
-    # Final status snapshot
     logger.info("[Shutdown] final status: %s", json.dumps(bridge.status(), default=str))
     logger.info("[Shutdown] clean exit")
 
