@@ -259,7 +259,7 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
     <button class="nb" onclick="sv('workflow')" id="tab-workflow"><div class="dot"></div>Clinical Workflow</button>
     <button class="nb" onclick="sv('emergency')" id="tab-emergency"><div class="dot"></div>Emergency Response</button>
     <button class="nb" onclick="sv('tests')" id="tab-tests"><div class="dot"></div>Test Suite</button>
-    <button class="nb" onclick="sv('admin');loadAdminUsers()" id="tab-admin" style="display:none"><div class="dot"></div>Admin<span class="bdg" id="admin-bdg">0</span></button>
+    <button class="nb" onclick="sv('admin');loadAdminUsers();loadAdminOrganizations()" id="tab-admin" style="display:none"><div class="dot"></div>Admin<span class="bdg" id="admin-bdg">0</span></button>
   </div>
   <div class="tb-right">
     <div class="spill" id="spill"><div class="ind"></div><span id="sptxt">Not configured</span></div>
@@ -602,6 +602,16 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
     </div>
     <div id="admin-all-list"><div class="empty-st">Loading…</div></div>
   </div>
+
+  <div class="sec-hdr b" style="margin:20px 0 10px">Organizations &amp; FHIR Configuration</div>
+  <div class="card">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <span style="font-size:.7rem;font-weight:700;color:#fff">Organizations</span>
+      <span class="mono-tag" id="admin-org-count">0</span>
+    </div>
+    <p class="cfg-sub" style="margin-bottom:12px">Each organization can push alerts to its own hospital's FHIR R4 server. Organizations without FHIR configured here fall back to this deployment's global FHIR_* environment variables.</p>
+    <div id="admin-org-list"><div class="empty-st">Loading…</div></div>
+  </div>
 </div>
 
 </div> <!-- /#appShell -->
@@ -701,6 +711,41 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
     <div class="cfg-f"><label class="cfg-lbl">Poll interval (seconds)</label><input class="cfg-input" id="cfgInt" type="number" min="2" max="60" value="5" /></div>
     <div class="cfg-row"><button class="cfg-p" onclick="applyCfg()">Save</button><button class="cfg-s" onclick="closeCfg()">Cancel</button></div>
     <div class="cfg-row"><button class="cfg-s" style="color:var(--red)" onclick="doLogout()">Sign Out</button></div>
+  </div>
+</div>
+
+<!-- ORGANIZATION FHIR CONFIGURATION — admin only -->
+<!-- Calls the existing PATCH /admin/organizations/{id} endpoint; no
+     backend changes needed. fhir_client_secret is write-only: it is
+     never returned by the API, so this form always shows it blank and
+     only sends a new value if the admin actually types one in. -->
+<div class="cfg-ov" id="orgFhirOv" onclick="maybeOrgFhirClose(event)">
+  <div class="cfg-box">
+    <h3>Configure FHIR — <span id="orgFhirName">Organization</span></h3>
+    <p class="cfg-sub">Alerts from devices registered under this organization will push to its own FHIR server instead of the global default.</p>
+    <div class="cfg-f">
+      <label class="cfg-lbl">Enabled</label>
+      <select class="cfg-input" id="orgFhirEnabled" style="font-family:var(--font)">
+        <option value="true">Enabled</option>
+        <option value="false">Disabled</option>
+      </select>
+    </div>
+    <div class="cfg-f"><label class="cfg-lbl">FHIR Base URL</label><input class="cfg-input" id="orgFhirBaseUrl" placeholder="https://fhir.hospital.org/api/FHIR/R4" /></div>
+    <div class="cfg-f"><label class="cfg-lbl">OAuth2 Token URL</label><input class="cfg-input" id="orgFhirTokenUrl" placeholder="https://hospital.org/oauth2/token" /></div>
+    <div class="cfg-f"><label class="cfg-lbl">Client ID</label><input class="cfg-input" id="orgFhirClientId" placeholder="registered app client_id" /></div>
+    <div class="cfg-f"><label class="cfg-lbl">Client Secret</label><input class="cfg-input" id="orgFhirClientSecret" type="password" placeholder="Leave blank to keep unchanged" /></div>
+    <div class="cfg-f"><label class="cfg-lbl">Patient Identifier System</label><input class="cfg-input" id="orgFhirIdentifierSystem" placeholder="urn:oid:1.2.3.4 (matches your patient_id values)" /></div>
+    <div class="cfg-f">
+      <label class="cfg-lbl">Minimum Alert Level Pushed</label>
+      <select class="cfg-input" id="orgFhirMinLevel" style="font-family:var(--font)">
+        <option value="low">Low</option>
+        <option value="medium">Medium</option>
+        <option value="high">High</option>
+        <option value="critical">Critical</option>
+      </select>
+    </div>
+    <div id="orgFhirError" style="display:none;color:var(--red);font-size:.65rem;margin-bottom:10px"></div>
+    <div class="cfg-row"><button class="cfg-p" id="orgFhirSubmitBtn" onclick="submitOrgFhirConfig()">Save Configuration</button><button class="cfg-s" onclick="closeOrgFhirModal()">Cancel</button></div>
   </div>
 </div>
 
@@ -1104,6 +1149,110 @@ function renderAdminUsers(){
         </div>`).join('');
 }
 
+// ── Admin panel: organizations & per-organization FHIR configuration ──────
+// Uses the existing GET /admin/organizations and PATCH /admin/organizations/{id}
+// endpoints — no new backend routes needed.
+let _adminOrgs = [];
+
+async function loadAdminOrganizations(){
+  if(!CFG.url||!CFG.tok||CFG.userRole!=='admin')return;
+  const listEl = document.getElementById('admin-org-list');
+  try{
+    const resp = await fetch(CFG.url+'/admin/organizations',{headers:{'Authorization':'Bearer '+CFG.tok}});
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    _adminOrgs = await resp.json();
+    renderAdminOrganizations();
+  }catch(e){
+    listEl.innerHTML = '<div class="empty-st">Could not load organizations. Check connection.</div>';
+  }
+}
+
+function renderAdminOrganizations(){
+  const listEl = document.getElementById('admin-org-list');
+  document.getElementById('admin-org-count').textContent = _adminOrgs.length;
+
+  listEl.innerHTML = _adminOrgs.length===0
+    ? '<div class="empty-st">No organizations registered yet</div>'
+    : _adminOrgs.map(o=>`
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <div style="width:6px;height:6px;border-radius:50%;background:${o.fhir_enabled?'var(--green)':'var(--muted)'};flex-shrink:0"></div>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:.68rem;font-weight:600;color:#fff">${esc(o.name)}</div>
+            <div style="font-family:var(--mono);font-size:.6rem;color:var(--text2)">${o.fhir_enabled ? 'FHIR: '+esc(o.fhir_base_url||'(no base URL set)') : 'FHIR not configured — using global default'}</div>
+          </div>
+          <button class="cfg-p" style="padding:5px 12px;font-size:.62rem;width:auto" onclick="openOrgFhirModal('${o.id}')">Configure FHIR</button>
+        </div>`).join('');
+}
+
+function openOrgFhirModal(orgId){
+  const org = _adminOrgs.find(o=>o.id===orgId);
+  if(!org)return;
+  document.getElementById('orgFhirOv').dataset.orgId = orgId;
+  document.getElementById('orgFhirName').textContent = org.name;
+  document.getElementById('orgFhirEnabled').value = org.fhir_enabled ? 'true' : 'false';
+  document.getElementById('orgFhirBaseUrl').value = org.fhir_base_url || '';
+  document.getElementById('orgFhirTokenUrl').value = '';
+  document.getElementById('orgFhirClientId').value = '';
+  document.getElementById('orgFhirClientSecret').value = '';
+  document.getElementById('orgFhirIdentifierSystem').value = '';
+  document.getElementById('orgFhirMinLevel').value = org.fhir_min_alert_level || 'medium';
+  document.getElementById('orgFhirError').style.display = 'none';
+  document.getElementById('orgFhirOv').classList.add('open');
+}
+function closeOrgFhirModal(){document.getElementById('orgFhirOv').classList.remove('open');}
+function maybeOrgFhirClose(e){if(e.target.id==='orgFhirOv')closeOrgFhirModal();}
+
+function showOrgFhirError(msg){const e=document.getElementById('orgFhirError');e.textContent=msg;e.style.display='block';}
+
+async function submitOrgFhirConfig(){
+  const orgId = document.getElementById('orgFhirOv').dataset.orgId;
+  if(!orgId)return;
+
+  const body = {
+    fhir_enabled: document.getElementById('orgFhirEnabled').value === 'true',
+    fhir_min_alert_level: document.getElementById('orgFhirMinLevel').value,
+  };
+  const baseUrl = document.getElementById('orgFhirBaseUrl').value.trim();
+  const tokenUrl = document.getElementById('orgFhirTokenUrl').value.trim();
+  const clientId = document.getElementById('orgFhirClientId').value.trim();
+  const clientSecret = document.getElementById('orgFhirClientSecret').value.trim();
+  const identifierSystem = document.getElementById('orgFhirIdentifierSystem').value.trim();
+
+  // Only send fields the admin actually filled in — this avoids
+  // accidentally overwriting existing config (especially the secret,
+  // which is write-only and never shown back) with an empty value.
+  if(baseUrl) body.fhir_base_url = baseUrl;
+  if(tokenUrl) body.fhir_token_url = tokenUrl;
+  if(clientId) body.fhir_client_id = clientId;
+  if(clientSecret) body.fhir_client_secret = clientSecret;
+  if(identifierSystem) body.fhir_patient_identifier_system = identifierSystem;
+
+  const btn = document.getElementById('orgFhirSubmitBtn');
+  btn.disabled = true; btn.textContent = 'Saving…';
+
+  try{
+    const resp = await fetch(CFG.url+'/admin/organizations/'+orgId,{
+      method:'PATCH',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+CFG.tok},
+      body:JSON.stringify(body)
+    });
+    let data = {};
+    try{ data = await resp.json(); }catch(_e){}
+
+    if(!resp.ok){
+      showOrgFhirError(data.message || data.error || ('Save failed (HTTP '+resp.status+')'));
+      return;
+    }
+
+    closeOrgFhirModal();
+    loadAdminOrganizations();
+  }catch(e){
+    showOrgFhirError('Could not reach the backend. Check the URL and your connection.');
+  }finally{
+    btn.disabled = false; btn.textContent = 'Save Configuration';
+  }
+}
+
 async function approveUser(id){
   await toggleUserActive(id, true);
 }
@@ -1167,6 +1316,7 @@ function initDashboard(){
     if(CFG.userRole==='admin'){
       adminTab.style.display='';
       loadAdminUsers();
+      loadAdminOrganizations();
     }else{
       adminTab.style.display='none';
     }
