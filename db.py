@@ -227,8 +227,16 @@ class Database:
 
     async def update_organization(
         self, org_id: str, allowed_domains: Optional[List[str]] = None, name: Optional[str] = None,
+        fhir_enabled: Optional[bool] = None, fhir_base_url: Optional[str] = None,
+        fhir_token_url: Optional[str] = None, fhir_client_id: Optional[str] = None,
+        fhir_client_secret: Optional[str] = None, fhir_patient_identifier_system: Optional[str] = None,
+        fhir_min_alert_level: Optional[str] = None,
     ) -> Optional["Organization"]:
-        """Admin-only: update an organization's allowed domains and/or rename it."""
+        """
+        Admin-only: update an organization's allowed domains, name, and/or
+        per-hospital FHIR write-back configuration (requires migration 005).
+        Only the fields explicitly passed (not None) are updated.
+        """
         pool = self._require_pool()
         sets, params = [], []
         idx = 1
@@ -238,6 +246,20 @@ class Database:
         if name is not None:
             sets.append(f"name = ${idx}"); params.append(name.strip()); idx += 1
             sets.append(f"name_normalized = ${idx}"); params.append(self._normalize_org_name(name)); idx += 1
+        if fhir_enabled is not None:
+            sets.append(f"fhir_enabled = ${idx}"); params.append(fhir_enabled); idx += 1
+        if fhir_base_url is not None:
+            sets.append(f"fhir_base_url = ${idx}"); params.append(fhir_base_url); idx += 1
+        if fhir_token_url is not None:
+            sets.append(f"fhir_token_url = ${idx}"); params.append(fhir_token_url); idx += 1
+        if fhir_client_id is not None:
+            sets.append(f"fhir_client_id = ${idx}"); params.append(fhir_client_id); idx += 1
+        if fhir_client_secret is not None:
+            sets.append(f"fhir_client_secret = ${idx}"); params.append(fhir_client_secret); idx += 1
+        if fhir_patient_identifier_system is not None:
+            sets.append(f"fhir_patient_identifier_system = ${idx}"); params.append(fhir_patient_identifier_system); idx += 1
+        if fhir_min_alert_level is not None:
+            sets.append(f"fhir_min_alert_level = ${idx}"); params.append(fhir_min_alert_level); idx += 1
         if not sets:
             return await self.get_organization_by_id(org_id)
         sets.append("updated_at = now()")
@@ -310,23 +332,32 @@ class Database:
         model_number: Optional[str] = None, implanted_at: Optional[str] = None,
         implanting_clinician_id: Optional[str] = None, registered_by_user_id: Optional[str] = None,
         vendor_account_ref: Optional[str] = None, notes: Optional[str] = None,
+        organization_id: Optional[str] = None,
     ) -> "LargeDevice":
+        """
+        organization_id links this device to the organization of the
+        clinician who registered it — see migration 005. Required for
+        multi-hospital FHIR routing in CommunicationAgent; alerts from a
+        device with no organization_id fall back to the global FHIR_*
+        environment variables (single-tenant behavior).
+        """
         pool = self._require_pool()
         row = await pool.fetchrow(
             """
             INSERT INTO large_devices (
                 vendor_device_id, vendor, device_type, patient_id,
                 model_number, implanted_at, implanting_clinician_id,
-                registered_by_user_id, vendor_account_ref, notes
+                registered_by_user_id, vendor_account_ref, notes, organization_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6::date, $7::uuid, $8::uuid, $9, $10)
+            VALUES ($1, $2, $3, $4, $5, $6::date, $7::uuid, $8::uuid, $9, $10, $11::uuid)
             ON CONFLICT (vendor_device_id) DO UPDATE
-                SET patient_id = EXCLUDED.patient_id, is_active = true
+                SET patient_id = EXCLUDED.patient_id, is_active = true,
+                    organization_id = COALESCE(EXCLUDED.organization_id, large_devices.organization_id)
             RETURNING *
             """,
             vendor_device_id, vendor, device_type, patient_id,
             model_number, implanted_at, implanting_clinician_id,
-            registered_by_user_id, vendor_account_ref, notes,
+            registered_by_user_id, vendor_account_ref, notes, organization_id,
         )
         return LargeDevice.from_row(row)
 
@@ -406,7 +437,8 @@ class Database:
 
 @dataclass
 class Organization:
-    """Canonical organization record — admin-managed allowed email domains."""
+    """Canonical organization record — admin-managed allowed email domains
+    and, optionally, per-hospital FHIR R4 write-back configuration."""
 
     id:              str
     name:            str
@@ -415,9 +447,17 @@ class Organization:
     auto_registered: bool
     created_by:      Optional[str]
     created_at:      str
+    fhir_enabled:                  bool = False
+    fhir_base_url:                 Optional[str] = None
+    fhir_token_url:                Optional[str] = None
+    fhir_client_id:                Optional[str] = None
+    fhir_client_secret:            Optional[str] = None
+    fhir_patient_identifier_system: Optional[str] = None
+    fhir_min_alert_level:          str = "medium"
 
     @classmethod
     def from_row(cls, row: asyncpg.Record) -> "Organization":
+        keys = row.keys()
         return cls(
             id              = str(row["id"]),
             name            = row["name"],
@@ -426,11 +466,29 @@ class Organization:
             auto_registered = row["auto_registered"],
             created_by      = str(row["created_by"]) if row["created_by"] else None,
             created_at      = str(row["created_at"]),
+            # Defensive: these columns only exist after migration 005.
+            # Reading a row before that migration runs should not crash —
+            # it should just report FHIR as unconfigured for this org.
+            fhir_enabled                   = row["fhir_enabled"] if "fhir_enabled" in keys else False,
+            fhir_base_url                  = row["fhir_base_url"] if "fhir_base_url" in keys else None,
+            fhir_token_url                 = row["fhir_token_url"] if "fhir_token_url" in keys else None,
+            fhir_client_id                 = row["fhir_client_id"] if "fhir_client_id" in keys else None,
+            fhir_client_secret             = row["fhir_client_secret"] if "fhir_client_secret" in keys else None,
+            fhir_patient_identifier_system = row["fhir_patient_identifier_system"] if "fhir_patient_identifier_system" in keys else None,
+            fhir_min_alert_level           = row["fhir_min_alert_level"] if "fhir_min_alert_level" in keys else "medium",
+        )
+
+    def has_fhir_config(self) -> bool:
+        """True if this org has FHIR enabled AND all required fields set."""
+        return bool(
+            self.fhir_enabled and self.fhir_base_url and self.fhir_token_url
+            and self.fhir_client_id and self.fhir_client_secret
         )
 
 
 @dataclass
 class LargeDevice:
+
     id:                      str
     vendor_device_id:        str
     vendor:                  str
@@ -444,9 +502,11 @@ class LargeDevice:
     is_active:                bool
     notes:                    Optional[str]
     last_event_at:            Optional[str]
+    organization_id:          Optional[str] = None
 
     @classmethod
     def from_row(cls, row: asyncpg.Record) -> "LargeDevice":
+        keys = row.keys()
         return cls(
             id                      = str(row["id"]),
             vendor_device_id        = row["vendor_device_id"],
@@ -461,6 +521,7 @@ class LargeDevice:
             is_active               = row["is_active"],
             notes                   = row["notes"],
             last_event_at           = str(row["last_event_at"]) if row["last_event_at"] else None,
+            organization_id         = str(row["organization_id"]) if ("organization_id" in keys and row["organization_id"]) else None,
         )
 
 
