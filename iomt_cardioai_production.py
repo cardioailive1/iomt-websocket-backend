@@ -794,6 +794,7 @@ class DeviceSessionRegistry:
                 {
                     "device_id": s.device_id, "patient_id": s.patient_id, "is_active": s.is_active,
                     "data_count": s.data_count, "last_data_at": s.last_data_at,
+                    "device_type": s.device_type.value,
                 }
                 for s in sessions
             ],
