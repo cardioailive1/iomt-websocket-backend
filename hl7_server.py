@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -79,6 +80,7 @@ class AdmissionRecord:
     location: str = ""           # PV1-3 assigned patient location, if present
     patient_class: str = ""      # PV1-2 (I=inpatient, O=outpatient, E=emergency, ...)
     last_event_type: str = ""    # e.g. "A01"
+    sending_facility: str = ""   # MSH-4 — which hospital/facility sent this
     updated_at: str = field(default_factory=_utcnow_iso)
 
 
@@ -107,6 +109,8 @@ class AdmissionRegistry:
             existing.location = event["location"]
         if event.get("patient_class"):
             existing.patient_class = event["patient_class"]
+        if event.get("sending_facility"):
+            existing.sending_facility = event["sending_facility"]
         existing.last_event_type = event_type
         existing.updated_at = _utcnow_iso()
 
@@ -130,7 +134,7 @@ class AdmissionRegistry:
                     "patient_id": r.patient_id, "patient_name": r.patient_name,
                     "status": r.status, "location": r.location,
                     "patient_class": r.patient_class, "last_event_type": r.last_event_type,
-                    "updated_at": r.updated_at,
+                    "sending_facility": r.sending_facility, "updated_at": r.updated_at,
                 }
                 for r in records
             ],
@@ -175,7 +179,11 @@ def parse_adt_message(raw: str) -> Dict[str, Any]:
     """
     Parse an ADT message into a flat event dict:
       {event_type, patient_id, patient_name, location, patient_class,
-       message_control_id, raw_message_type}
+       message_control_id, sending_facility, raw_message_type}
+
+    `sending_facility` (MSH-4) identifies which hospital/facility sent this
+    message — useful for matching against an Organization name when running
+    multi-tenant (see iomt_cardioai_production.py's admissions handling).
 
     Raises ValueError on anything that isn't parseable as HL7 v2 with an
     MSH segment — callers should catch this and NAK the message.
@@ -188,6 +196,7 @@ def parse_adt_message(raw: str) -> Dict[str, Any]:
     message_type_field = msh[8] if len(msh) > 8 else ""
     event_type = _component(message_type_field, 1) or "UNKNOWN"
     message_control_id = msh[9] if len(msh) > 9 else ""
+    sending_facility = msh[3] if len(msh) > 3 else ""
 
     pid = segments.get("PID", [[]])[0]
     patient_id = _component(pid[3], 0) if len(pid) > 3 else ""
@@ -213,8 +222,10 @@ def parse_adt_message(raw: str) -> Dict[str, Any]:
         "location": location,
         "patient_class": patient_class,
         "message_control_id": message_control_id,
+        "sending_facility": sending_facility,
         "raw_message_type": message_type_field,
     }
+
 
 
 def _build_ack(message_control_id: str, ack_code: str = "AA", text: str = "") -> bytes:
@@ -224,6 +235,111 @@ def _build_ack(message_control_id: str, ack_code: str = "AA", text: str = "") ->
     msa = f"MSA|{ack_code}|{message_control_id}|{text}"
     body = f"{msh}\r{msa}\r".encode("utf-8")
     return _START_BLOCK + body + _END_BLOCK + _CARRIAGE_RETURN
+
+
+# ============================================================================
+# Outbound HL7 v2 — ORU^R01 (observation result)
+# ============================================================================
+#
+# For hospitals/EHRs that consume HL7 v2 rather than FHIR, this sends
+# CardioAI diagnostic/alert results out as a standard ORU^R01 message —
+# the same message type used for lab results — over an outbound MLLP
+# client connection to the hospital's interface engine.
+#
+# Required environment variables (optional — omit to disable entirely)
+#   HL7_ORU_ENABLED   "true" to activate (default: "false")
+#   HL7_ORU_HOST      destination interface engine host
+#   HL7_ORU_PORT      destination interface engine port
+
+def build_oru_message(
+    patient_id: str,
+    patient_name: str,
+    observations: list[Dict[str, Any]],
+    control_id: Optional[str] = None,
+) -> bytes:
+    """
+    Build an MLLP-framed ORU^R01 message.
+
+    `observations` is a list of dicts, each either:
+      {"code": "8867-4", "system": "LN", "display": "Heart rate",
+       "value": "145", "unit": "/min"}          — numeric (OBX type NM)
+    or:
+      {"code": "ALERT", "system": "L", "display": "Alert Description",
+       "value": "Atrial Fibrillation detected"}  — text (OBX type TX)
+
+    Returns raw bytes ready to write directly to a socket.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    cid = control_id or f"CARDIOAI{int(time.time() * 1000)}"
+
+    name_parts = patient_name.split(" ", 1)
+    family = name_parts[-1] if len(name_parts) > 1 else patient_name
+    given = name_parts[0] if len(name_parts) > 1 else ""
+
+    lines = [
+        f"MSH|^~\\&|CARDIOAI|CARDIOAI|||{now}||ORU^R01|{cid}|P|2.5",
+        f"PID|1||{patient_id}^^^CARDIOAI^MR||{family}^{given}",
+        "OBR|1|||CARDIOAI^IoMT CardioAI Clinical AI Result",
+    ]
+    for i, obs in enumerate(observations, start=1):
+        code = obs.get("code", "")
+        system = obs.get("system", "L")
+        display = obs.get("display", "")
+        value = str(obs.get("value", ""))
+        unit = obs.get("unit", "")
+        value_type = "NM" if _is_numeric(value) else "TX"
+        lines.append(f"OBX|{i}|{value_type}|{code}^{display}^{system}||{value}|{unit}||||F")
+
+    body = ("\r".join(lines) + "\r").encode("utf-8")
+    return _START_BLOCK + body + _END_BLOCK + _CARRIAGE_RETURN
+
+
+def _is_numeric(value: str) -> bool:
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+async def send_oru(
+    host: str,
+    port: int,
+    patient_id: str,
+    patient_name: str,
+    observations: list[Dict[str, Any]],
+    timeout: float = 10.0,
+) -> bool:
+    """
+    Open an outbound MLLP client connection, send an ORU^R01 message, wait
+    for the ACK, then close. Returns True on a successful AA acknowledgment,
+    False on any failure (connection refused, timeout, AE/AR response, or
+    unparseable response). Never raises — this must not block or crash the
+    clinical pipeline if the receiving interface engine is unreachable.
+    """
+    message = build_oru_message(patient_id, patient_name, observations)
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        try:
+            writer.write(message)
+            await writer.drain()
+            response = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+            ack_ok = b"MSA|AA" in response
+            if ack_ok:
+                logger.info("[HL7] ORU sent and ACKed by %s:%d patient_id=%s", host, port, patient_id)
+            else:
+                logger.warning("[HL7] ORU sent to %s:%d but not ACKed (AA) — response=%r", host, port, response[:200])
+            return ack_ok
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("[HL7] failed to send ORU to %s:%d patient_id=%s", host, port, patient_id)
+        return False
+
 
 
 # ============================================================================
