@@ -53,7 +53,7 @@ from kafka_bus import (  # noqa: E402
     TOPIC_VENDOR_RAW, TOPIC_VENDOR_DEADLETTER,
 )
 from fhir_client import fhir_client  # noqa: E402
-from hl7_server import HL7MLLPServer, AdmissionRegistry  # noqa: E402
+from hl7_server import HL7MLLPServer, AdmissionRegistry, send_oru  # noqa: E402
 
 # Shared admission registry — populated by the HL7 MLLP listener (if
 # enabled), read by GET /admissions. Not yet wired into alert triage
@@ -607,9 +607,39 @@ class AlertMonitoringAgent(BaseAgent):
         level = self._triage(result)
         if level is None:
             return None
+
+        # HL7 ADT-aware reprioritization (opt-in via
+        # HL7_ADMISSION_ALERT_SUPPRESSION_ENABLED). Only ever suppresses
+        # LOW-severity findings for patients currently admitted — the
+        # rationale being that a patient already under direct inpatient/
+        # bedside monitoring doesn't need a redundant LOW-severity IoMT
+        # alert. MEDIUM/HIGH/CRITICAL are NEVER suppressed regardless of
+        # admission status — this toggle can only reduce noise, never
+        # miss something serious. See hl7_server.py module docstring.
+        admission = _admission_registry.get(result.patient_id)
+        if (
+            level == AlertLevel.LOW
+            and admission is not None
+            and admission.status == "admitted"
+            and _optional_env("HL7_ADMISSION_ALERT_SUPPRESSION_ENABLED", "false").lower() == "true"
+        ):
+            logger.debug(
+                "[Alert] suppressed LOW alert for admitted patient_id=%s (location=%s) — "
+                "already under direct inpatient monitoring",
+                result.patient_id, admission.location,
+            )
+            return None
+
+        required_actions = self._required_actions(level, result)
+        # Additive, always-on: if the patient is currently admitted, prepend
+        # their ward/location so nursing staff know where to respond —
+        # independent of the suppression toggle above.
+        if admission is not None and admission.status == "admitted" and admission.location:
+            required_actions = [f"PATIENT CURRENTLY ADMITTED — Location: {admission.location}"] + required_actions
+
         alert = Alert(
             patient_id=result.patient_id, alert_level=level, description=result.diagnosis,
-            required_actions=self._required_actions(level, result),
+            required_actions=required_actions,
             notified_parties=self._notification_list(level),
         )
         self.active_alerts[alert.alert_id] = alert
@@ -714,16 +744,65 @@ class CommunicationAgent(BaseAgent):
         self.report_store.append(report)
         logger.info("[Comms] report generated patient=%s level=%s", alert.patient_id, alert.alert_level.value)
 
-        # FHIR R4 write-back — pushes this alert to the hospital's EHR as
-        # Condition + Flag resources. Completely no-op unless FHIR_ENABLED=true
-        # is configured (see fhir_client.py). Errors are swallowed inside
-        # push_alert() itself — a FHIR server being down must never break
-        # the clinical alert pipeline, so this is deliberately fire-and-forget
-        # with its own internal exception handling, not just a bare await.
+        # ── Resolve which organization this alert belongs to, for
+        # multi-hospital FHIR/HL7 routing ──────────────────────────────
+        #
+        # IMPORTANT LIMITATION: alert.patient_id is actually set from the
+        # originating device_id (see DiagnosticAgent.process(), which
+        # copies pattern["device_id"] into DiagnosticResult.patient_id).
+        # For IMPLANT-sourced alerts, that device_id is the vendor_device_id
+        # registered in large_devices, so we CAN look it up there to find
+        # both the real clinical patient_id and the organization that
+        # registered it. For BLE-sourced alerts, device_id is the BLE
+        # peripheral's own UUID, which has no organization link — those
+        # alerts always fall back to the global FHIR_*/HL7_ORU_* environment
+        # variables (single-tenant behavior), same as before this feature.
+        organization = None
+        real_patient_id = alert.patient_id
         try:
-            await fhir_client.push_alert(alert)
+            device = await _db.get_large_device_by_vendor_id(alert.patient_id)
+            if device is not None:
+                real_patient_id = device.patient_id
+                if device.organization_id:
+                    organization = await _db.get_organization_by_id(device.organization_id)
+        except Exception:
+            logger.exception("[Comms] error resolving organization for alert=%s", alert.alert_id)
+
+        # FHIR R4 write-back — pushes this alert to the resolved hospital's
+        # EHR (or the global default) as Condition + Flag resources.
+        # Completely no-op unless FHIR is configured, either per-organization
+        # or via the FHIR_* environment variables (see fhir_client.py).
+        # Errors are swallowed inside push_alert() itself — a FHIR server
+        # being down must never break the clinical alert pipeline, so this
+        # is deliberately fire-and-forget with its own internal exception
+        # handling, not just a bare await.
+        try:
+            await fhir_client.push_alert(alert, organization=organization)
         except Exception:
             logger.exception("[Comms] unexpected error calling fhir_client.push_alert")
+
+        # HL7 v2 outbound (ORU^R01) — optional, for EHRs that consume HL7 v2
+        # rather than FHIR. Sends the alert description and level as a
+        # standard observation-result message. Opt-in via HL7_ORU_ENABLED;
+        # no-op otherwise. Single-tenant only for now (one destination
+        # interface engine per deployment) — see hl7_server.py.
+        if _optional_env("HL7_ORU_ENABLED", "false").lower() == "true":
+            oru_host = _optional_env("HL7_ORU_HOST", "")
+            oru_port_raw = _optional_env("HL7_ORU_PORT", "")
+            if oru_host and oru_port_raw:
+                try:
+                    await send_oru(
+                        host=oru_host, port=int(oru_port_raw),
+                        patient_id=real_patient_id, patient_name="",
+                        observations=[
+                            {"code": "ALERT", "system": "L", "display": "Alert Description", "value": alert.description},
+                            {"code": "ALERT-LEVEL", "system": "L", "display": "Alert Level", "value": alert.alert_level.value},
+                        ],
+                    )
+                except Exception:
+                    logger.exception("[Comms] unexpected error calling send_oru")
+            else:
+                logger.warning("[Comms] HL7_ORU_ENABLED=true but HL7_ORU_HOST/HL7_ORU_PORT not set — skipping")
 
     @staticmethod
     def _format_summary(alert: Alert) -> str:
@@ -1818,10 +1897,29 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         if existing is not None and existing.is_active:
             return _web.json_response({"error": "already_registered", "message": f"Device {vendor_device_id} is already registered"}, status=409)
 
+        # Resolve the registering clinician's organization so this device
+        # (and every alert it later generates) can be routed to that
+        # hospital's own FHIR/HL7 configuration, rather than only the
+        # global single-tenant FHIR_*/HL7_ORU_* environment variables.
+        # If the clinician's user record has no organization set, or it
+        # doesn't match a canonical organizations row, organization_id is
+        # simply left null — the device still registers normally and
+        # falls back to global config, exactly as before this feature.
+        organization_id = None
+        try:
+            clinician_user = await _load_user_by_id(user.get("sub"))
+            if clinician_user and clinician_user.organization:
+                org = await _db.get_organization_by_name(clinician_user.organization)
+                if org:
+                    organization_id = org.id
+        except Exception:
+            logger.exception("[Implant] error resolving organization for clinician_id=%s", user.get("sub"))
+
         large_device = await _db.register_large_device(
             vendor_device_id=vendor_device_id, vendor=vendor, device_type=device_type, patient_id=patient_id,
             model_number=model_number, implanted_at=implanted_at,
             implanting_clinician_id=user.get("sub"), registered_by_user_id=user.get("sub"), notes=notes,
+            organization_id=organization_id,
         )
 
         await _db.log_event("implant_registered", user_id=user.get("sub"), detail=f"vendor={vendor} device={vendor_device_id} patient={patient_id}")
@@ -1923,6 +2021,9 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             {
                 "id": o.id, "name": o.name, "allowed_domains": o.allowed_domains,
                 "auto_registered": o.auto_registered, "created_at": o.created_at,
+                "fhir_enabled": o.fhir_enabled, "fhir_base_url": o.fhir_base_url,
+                "fhir_min_alert_level": o.fhir_min_alert_level,
+                # fhir_client_secret is intentionally never returned in any response.
             }
             for o in orgs
         ])
@@ -1987,18 +2088,40 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
         allowed_domains = body.get("allowed_domains")
         name = body.get("name")
+        fhir_enabled = body.get("fhir_enabled")
+        fhir_base_url = body.get("fhir_base_url")
+        fhir_token_url = body.get("fhir_token_url")
+        fhir_client_id = body.get("fhir_client_id")
+        fhir_client_secret = body.get("fhir_client_secret")
+        fhir_patient_identifier_system = body.get("fhir_patient_identifier_system")
+        fhir_min_alert_level = body.get("fhir_min_alert_level")
 
         if allowed_domains is not None and (not isinstance(allowed_domains, list) or not all(isinstance(d, str) for d in allowed_domains)):
             return _web.json_response({"error": "invalid_domains", "message": "'allowed_domains' must be a list of domain strings"}, status=400)
 
-        updated = await _db.update_organization(org_id, allowed_domains=allowed_domains, name=name)
+        if fhir_min_alert_level is not None and fhir_min_alert_level not in ("low", "medium", "high", "critical"):
+            return _web.json_response({"error": "invalid_fhir_min_alert_level", "message": "must be one of: low, medium, high, critical"}, status=400)
+
+        updated = await _db.update_organization(
+            org_id, allowed_domains=allowed_domains, name=name,
+            fhir_enabled=fhir_enabled, fhir_base_url=fhir_base_url, fhir_token_url=fhir_token_url,
+            fhir_client_id=fhir_client_id, fhir_client_secret=fhir_client_secret,
+            fhir_patient_identifier_system=fhir_patient_identifier_system, fhir_min_alert_level=fhir_min_alert_level,
+        )
 
         admin_user = request["user"]
-        await _db.log_event("organization_updated", user_id=admin_user.get("sub"), detail=f"org_id={org_id} domains={allowed_domains} name={name}")
+        await _db.log_event(
+            "organization_updated", user_id=admin_user.get("sub"),
+            # Deliberately exclude fhir_client_secret from the audit log detail.
+            detail=f"org_id={org_id} domains={allowed_domains} name={name} fhir_enabled={fhir_enabled}",
+        )
         logger.info("[Admin] user_id=%s updated organization=%s", admin_user.get("sub"), org_id)
 
         return _web.json_response({
-            "id": updated.id, "name": updated.name, "allowed_domains": updated.allowed_domains, "auto_registered": updated.auto_registered,
+            "id": updated.id, "name": updated.name, "allowed_domains": updated.allowed_domains,
+            "auto_registered": updated.auto_registered, "fhir_enabled": updated.fhir_enabled,
+            "fhir_base_url": updated.fhir_base_url, "fhir_min_alert_level": updated.fhir_min_alert_level,
+            # fhir_client_secret is intentionally never returned in any response.
         })
 
     # ── GET /admissions ───────────────────────────────────────────────────
