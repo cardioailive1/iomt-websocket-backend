@@ -52,6 +52,13 @@ from kafka_bus import (  # noqa: E402
     KafkaEventProducer, KafkaEventConsumer,
     TOPIC_VENDOR_RAW, TOPIC_VENDOR_DEADLETTER,
 )
+from fhir_client import fhir_client  # noqa: E402
+from hl7_server import HL7MLLPServer, AdmissionRegistry  # noqa: E402
+
+# Shared admission registry — populated by the HL7 MLLP listener (if
+# enabled), read by GET /admissions. Not yet wired into alert triage
+# logic; see hl7_server.py module docstring for the intended hook point.
+_admission_registry = AdmissionRegistry()
 
 
 def _build_logger() -> logging.Logger:
@@ -706,6 +713,17 @@ class CommunicationAgent(BaseAgent):
         }
         self.report_store.append(report)
         logger.info("[Comms] report generated patient=%s level=%s", alert.patient_id, alert.alert_level.value)
+
+        # FHIR R4 write-back — pushes this alert to the hospital's EHR as
+        # Condition + Flag resources. Completely no-op unless FHIR_ENABLED=true
+        # is configured (see fhir_client.py). Errors are swallowed inside
+        # push_alert() itself — a FHIR server being down must never break
+        # the clinical alert pipeline, so this is deliberately fire-and-forget
+        # with its own internal exception handling, not just a bare await.
+        try:
+            await fhir_client.push_alert(alert)
+        except Exception:
+            logger.exception("[Comms] unexpected error calling fhir_client.push_alert")
 
     @staticmethod
     def _format_summary(alert: Alert) -> str:
@@ -1983,6 +2001,24 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             "id": updated.id, "name": updated.name, "allowed_domains": updated.allowed_domains, "auto_registered": updated.auto_registered,
         })
 
+    # ── GET /admissions ───────────────────────────────────────────────────
+    #
+    # Read-only view of current admission status, populated by the HL7 v2
+    # MLLP listener (hl7_server.py) if HL7_MLLP_ENABLED=true. Returns an
+    # empty list if HL7 isn't configured — this endpoint is always safe
+    # to call regardless of whether HL7 is set up. Patients see only their
+    # own admission record, matching the pattern used for /devices and
+    # /alerts.
+
+    @_require_auth(cfg)
+    async def admissions(request: _web.Request) -> _web.Response:
+        user = request["user"]
+        summary = _admission_registry.summary()
+        if user.get("role") == UserRole.PATIENT.value:
+            pid = user.get("patient_id")
+            summary = {**summary, "patients": [p for p in summary["patients"] if p["patient_id"] == pid]}
+        return _web.json_response(summary)
+
     app.router.add_get("/", root)
     app.router.add_get("/dashboard", dashboard)
     app.router.add_post("/auth/apple", apple_signin)
@@ -2006,6 +2042,7 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     app.router.add_get("/admin/organizations", admin_list_organizations)
     app.router.add_post("/admin/organizations", admin_create_organization)
     app.router.add_patch("/admin/organizations/{org_id}", admin_update_organization)
+    app.router.add_get("/admissions", admissions)
 
     return app
 
@@ -2074,10 +2111,23 @@ async def main() -> None:
 
     api_runner = None
     kafka_consumer = None
+    hl7_server = None
 
     if run_mode in ("all", "api"):
         api_runner, kafka_consumer = await start_http_api(bridge, host=cfg.api_host, port=cfg.api_port)
         logger.info("[Startup] HTTP API listening on http://%s:%d", cfg.api_host, cfg.api_port)
+
+        # HL7 v2 MLLP listener — separate TCP port from the HTTP API, since
+        # HL7 v2/MLLP is not an HTTP protocol. Only starts if HL7_MLLP_ENABLED
+        # is set; on Render this requires a TCP-capable service (a Private
+        # Service or a paid plan with a non-HTTP port exposed), since the
+        # free web service tier only routes HTTP traffic to $PORT.
+        if _optional_env("HL7_MLLP_ENABLED", "false").lower() == "true":
+            hl7_server = HL7MLLPServer(_admission_registry)
+            await hl7_server.start()
+            logger.info("[Startup] HL7 v2 MLLP listener started")
+        else:
+            logger.info("[Startup] HL7_MLLP_ENABLED not set — HL7 ADT listener not started")
 
     if run_mode in ("all", "bridge"):
         await bridge.start()
@@ -2091,6 +2141,8 @@ async def main() -> None:
     logger.info("[Shutdown] stopping services ...")
     if run_mode in ("all", "bridge"):
         await bridge.stop()
+    if hl7_server is not None:
+        await hl7_server.stop()
     if api_runner is not None:
         await stop_http_api(api_runner, kafka_consumer)
 
