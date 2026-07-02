@@ -46,6 +46,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -59,53 +60,107 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
+@dataclass
+class FHIRConfig:
+    """
+    Resolved FHIR configuration for a single push — either the global
+    single-tenant config (from environment variables) or a per-organization
+    override (from the `organizations` table, migration 005).
+    """
+    base_url: str
+    token_url: str
+    client_id: str
+    client_secret: str
+    patient_identifier_system: str
+    min_alert_level: str = "medium"
+
+    @property
+    def is_complete(self) -> bool:
+        return bool(self.base_url and self.token_url and self.client_id and self.client_secret)
+
+    @classmethod
+    def from_env(cls) -> "FHIRConfig":
+        return cls(
+            base_url=_env("FHIR_BASE_URL").rstrip("/"),
+            token_url=_env("FHIR_TOKEN_URL"),
+            client_id=_env("FHIR_CLIENT_ID"),
+            client_secret=_env("FHIR_CLIENT_SECRET"),
+            patient_identifier_system=_env("FHIR_PATIENT_IDENTIFIER_SYSTEM"),
+            min_alert_level=_env("FHIR_MIN_ALERT_LEVEL", "medium").lower(),
+        )
+
+    @classmethod
+    def from_organization(cls, org: Any) -> Optional["FHIRConfig"]:
+        """
+        Build a config from an Organization row (db.py). Returns None if
+        the organization doesn't have FHIR fully configured — callers
+        should fall back to the global env-based config in that case.
+        """
+        if not getattr(org, "has_fhir_config", lambda: False)():
+            return None
+        return cls(
+            base_url=(org.fhir_base_url or "").rstrip("/"),
+            token_url=org.fhir_token_url or "",
+            client_id=org.fhir_client_id or "",
+            client_secret=org.fhir_client_secret or "",
+            patient_identifier_system=org.fhir_patient_identifier_system or "",
+            min_alert_level=(org.fhir_min_alert_level or "medium").lower(),
+        )
+
+
 class FHIRClient:
     """
     Thin async FHIR R4 client scoped to exactly what CardioAI needs:
     OAuth2 client-credentials auth, patient identifier resolution, and
     posting Condition/Flag resources. Not a general-purpose FHIR SDK.
+
+    Multi-hospital support: every method takes an explicit FHIRConfig
+    rather than reading from `self` — this lets ONE client instance serve
+    both the global single-tenant config (self.default_config, from
+    environment variables) and any number of per-organization configs
+    (built via FHIRConfig.from_organization()) without them colliding.
+    Token and patient-identifier caches are keyed by base_url so different
+    hospitals' credentials/patients are never mixed up.
     """
 
     def __init__(self) -> None:
         self.enabled = _env("FHIR_ENABLED", "false").lower() == "true"
-        self.base_url = _env("FHIR_BASE_URL").rstrip("/")
-        self.token_url = _env("FHIR_TOKEN_URL")
-        self.client_id = _env("FHIR_CLIENT_ID")
-        self.client_secret = _env("FHIR_CLIENT_SECRET")
-        self.patient_identifier_system = _env("FHIR_PATIENT_IDENTIFIER_SYSTEM")
-        self.min_alert_level = _env("FHIR_MIN_ALERT_LEVEL", "medium").lower()
+        self.default_config = FHIRConfig.from_env()
 
-        if self.enabled and not (self.base_url and self.token_url and self.client_id and self.client_secret):
+        if self.enabled and not self.default_config.is_complete:
             logger.warning(
                 "[FHIR] FHIR_ENABLED=true but one or more of FHIR_BASE_URL / "
                 "FHIR_TOKEN_URL / FHIR_CLIENT_ID / FHIR_CLIENT_SECRET is "
-                "missing — FHIR write-back will be skipped until all are set."
+                "missing — global FHIR write-back will be skipped until all "
+                "are set. Per-organization FHIR config (if any) is unaffected."
             )
-            self.enabled = False
 
-        self._token: Optional[str] = None
-        self._token_expires_at: float = 0.0
-        self._patient_id_cache: Dict[str, Optional[str]] = {}
+        # Keyed by base_url so multiple hospitals' tokens/patient caches
+        # never collide within one running process.
+        self._tokens: Dict[str, str] = {}
+        self._token_expires_at: Dict[str, float] = {}
+        self._patient_id_cache: Dict[str, Dict[str, Optional[str]]] = {}
 
-        if self.enabled:
-            logger.info("[FHIR] write-back enabled — base_url=%s", self.base_url)
+        if self.enabled and self.default_config.is_complete:
+            logger.info("[FHIR] global write-back enabled — base_url=%s", self.default_config.base_url)
         else:
-            logger.info("[FHIR] write-back disabled (FHIR_ENABLED not set to 'true')")
+            logger.info("[FHIR] global write-back disabled (set FHIR_ENABLED=true to activate)")
 
     # ── Auth ─────────────────────────────────────────────────────────────
 
-    async def _get_token(self, session: aiohttp.ClientSession) -> Optional[str]:
+    async def _get_token(self, session: aiohttp.ClientSession, config: FHIRConfig) -> Optional[str]:
         now = time.time()
-        if self._token and now < self._token_expires_at - 30:
-            return self._token
+        cached = self._tokens.get(config.base_url)
+        if cached and now < self._token_expires_at.get(config.base_url, 0) - 30:
+            return cached
 
         try:
             async with session.post(
-                self.token_url,
+                config.token_url,
                 data={
                     "grant_type": "client_credentials",
-                    "client_id": self.client_id,
-                    "client_secret": self.client_secret,
+                    "client_id": config.client_id,
+                    "client_secret": config.client_secret,
                     "scope": "system/Condition.write system/Flag.write system/Patient.read",
                 },
                 headers={"Accept": "application/json"},
@@ -113,63 +168,65 @@ class FHIRClient:
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
-                    logger.error("[FHIR] token request failed status=%s body=%s", resp.status, body[:300])
+                    logger.error("[FHIR] token request failed base_url=%s status=%s body=%s", config.base_url, resp.status, body[:300])
                     return None
                 data = await resp.json()
-                self._token = data.get("access_token")
+                token = data.get("access_token")
                 expires_in = int(data.get("expires_in", 300))
-                self._token_expires_at = now + expires_in
-                return self._token
+                self._tokens[config.base_url] = token
+                self._token_expires_at[config.base_url] = now + expires_in
+                return token
         except Exception:
-            logger.exception("[FHIR] token request raised an exception")
+            logger.exception("[FHIR] token request raised an exception base_url=%s", config.base_url)
             return None
 
     # ── Patient identity resolution ─────────────────────────────────────
 
-    async def _resolve_patient_fhir_id(self, session: aiohttp.ClientSession, token: str, patient_id: str) -> Optional[str]:
-        if patient_id in self._patient_id_cache:
-            return self._patient_id_cache[patient_id]
+    async def _resolve_patient_fhir_id(self, session: aiohttp.ClientSession, token: str, config: FHIRConfig, patient_id: str) -> Optional[str]:
+        cache = self._patient_id_cache.setdefault(config.base_url, {})
+        if patient_id in cache:
+            return cache[patient_id]
 
-        if not self.patient_identifier_system:
+        if not config.patient_identifier_system:
             logger.warning(
-                "[FHIR] FHIR_PATIENT_IDENTIFIER_SYSTEM not set — cannot safely "
+                "[FHIR] no patient_identifier_system configured for base_url=%s — cannot safely "
                 "resolve internal patient_id=%s to a FHIR Patient.id. Skipping.",
-                patient_id,
+                config.base_url, patient_id,
             )
-            self._patient_id_cache[patient_id] = None
+            cache[patient_id] = None
             return None
 
         try:
             async with session.get(
-                f"{self.base_url}/Patient",
-                params={"identifier": f"{self.patient_identifier_system}|{patient_id}"},
+                f"{config.base_url}/Patient",
+                params={"identifier": f"{config.patient_identifier_system}|{patient_id}"},
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/fhir+json"},
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status != 200:
-                    logger.error("[FHIR] Patient search failed status=%s patient_id=%s", resp.status, patient_id)
-                    self._patient_id_cache[patient_id] = None
+                    logger.error("[FHIR] Patient search failed base_url=%s status=%s patient_id=%s", config.base_url, resp.status, patient_id)
+                    cache[patient_id] = None
                     return None
                 bundle = await resp.json()
                 entries = bundle.get("entry", [])
                 if not entries:
-                    logger.warning("[FHIR] no matching Patient found for patient_id=%s", patient_id)
-                    self._patient_id_cache[patient_id] = None
+                    logger.warning("[FHIR] no matching Patient found base_url=%s patient_id=%s", config.base_url, patient_id)
+                    cache[patient_id] = None
                     return None
                 fhir_id = entries[0]["resource"]["id"]
-                self._patient_id_cache[patient_id] = fhir_id
+                cache[patient_id] = fhir_id
                 return fhir_id
         except Exception:
-            logger.exception("[FHIR] Patient search raised an exception for patient_id=%s", patient_id)
-            self._patient_id_cache[patient_id] = None
+            logger.exception("[FHIR] Patient search raised an exception base_url=%s patient_id=%s", config.base_url, patient_id)
+            cache[patient_id] = None
             return None
 
     # ── Resource creation ────────────────────────────────────────────────
 
-    async def _create_resource(self, session: aiohttp.ClientSession, token: str, resource_type: str, resource: Dict[str, Any]) -> bool:
+    async def _create_resource(self, session: aiohttp.ClientSession, token: str, config: FHIRConfig, resource_type: str, resource: Dict[str, Any]) -> bool:
         try:
             async with session.post(
-                f"{self.base_url}/{resource_type}",
+                f"{config.base_url}/{resource_type}",
                 json=resource,
                 headers={
                     "Authorization": f"Bearer {token}",
@@ -181,13 +238,13 @@ class FHIRClient:
                 if resp.status not in (200, 201):
                     body = await resp.text()
                     logger.error(
-                        "[FHIR] %s create failed status=%s body=%s",
-                        resource_type, resp.status, body[:500],
+                        "[FHIR] %s create failed base_url=%s status=%s body=%s",
+                        resource_type, config.base_url, resp.status, body[:500],
                     )
                     return False
                 return True
         except Exception:
-            logger.exception("[FHIR] %s create raised an exception", resource_type)
+            logger.exception("[FHIR] %s create raised an exception base_url=%s", resource_type, config.base_url)
             return False
 
     # ── Resource builders ────────────────────────────────────────────────
@@ -240,41 +297,57 @@ class FHIRClient:
 
     # ── Public entry point ───────────────────────────────────────────────
 
-    async def push_alert(self, alert) -> None:
+    async def push_alert(self, alert, organization: Any = None) -> None:
         """
-        Push an Alert to the configured FHIR server as Condition + Flag
-        resources. No-op if FHIR isn't enabled/configured, or if the
-        alert's level is below FHIR_MIN_ALERT_LEVEL. Never raises —
-        failures are logged and swallowed so the clinical pipeline is
-        never affected by FHIR server availability.
+        Push an Alert to a FHIR server as Condition + Flag resources.
+
+        Config resolution order:
+          1. If `organization` is provided and has FHIR fully configured
+             (org.has_fhir_config()), use that hospital's own FHIR server.
+          2. Otherwise fall back to the global FHIR_* environment variables
+             (self.default_config) — the original single-tenant behavior.
+          3. If neither is configured/enabled, this is a no-op.
+
+        No-op if the resolved config's min_alert_level is above this
+        alert's level. Never raises — failures are logged and swallowed
+        so the clinical pipeline is never affected by FHIR server
+        availability, regardless of which hospital's server is involved.
         """
-        if not self.enabled:
-            return
+        config: Optional[FHIRConfig] = None
+        if organization is not None:
+            config = FHIRConfig.from_organization(organization)
+            if config:
+                logger.debug("[FHIR] using per-organization config for org=%s", getattr(organization, "name", "?"))
+
+        if config is None:
+            if not (self.enabled and self.default_config.is_complete):
+                return
+            config = self.default_config
 
         level = alert.alert_level.value if hasattr(alert.alert_level, "value") else str(alert.alert_level)
-        if _ALERT_LEVEL_RANK.get(level, 0) < _ALERT_LEVEL_RANK.get(self.min_alert_level, 1):
+        if _ALERT_LEVEL_RANK.get(level, 0) < _ALERT_LEVEL_RANK.get(config.min_alert_level, 1):
             return
 
         try:
             async with aiohttp.ClientSession() as session:
-                token = await self._get_token(session)
+                token = await self._get_token(session, config)
                 if not token:
                     return
 
-                fhir_patient_id = await self._resolve_patient_fhir_id(session, token, alert.patient_id)
+                fhir_patient_id = await self._resolve_patient_fhir_id(session, token, config, alert.patient_id)
                 if not fhir_patient_id:
                     return
 
                 condition = self._build_condition(fhir_patient_id, alert)
                 flag = self._build_flag(fhir_patient_id, alert)
 
-                cond_ok = await self._create_resource(session, token, "Condition", condition)
-                flag_ok = await self._create_resource(session, token, "Flag", flag)
+                cond_ok = await self._create_resource(session, token, config, "Condition", condition)
+                flag_ok = await self._create_resource(session, token, config, "Flag", flag)
 
                 if cond_ok and flag_ok:
                     logger.info(
-                        "[FHIR] pushed alert=%s patient_id=%s (fhir_id=%s) level=%s",
-                        alert.alert_id, alert.patient_id, fhir_patient_id, level,
+                        "[FHIR] pushed alert=%s patient_id=%s (fhir_id=%s) level=%s base_url=%s",
+                        alert.alert_id, alert.patient_id, fhir_patient_id, level, config.base_url,
                     )
         except Exception:
             # Belt-and-braces: absolutely nothing from this module should
