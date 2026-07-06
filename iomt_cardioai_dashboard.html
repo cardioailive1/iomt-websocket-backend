@@ -255,7 +255,7 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
     <button class="nb" onclick="sv('agents')" id="tab-agents"><div class="dot"></div>7 Agents</button>
     <button class="nb" onclick="sv('handshake')" id="tab-handshake"><div class="dot"></div>Handshake</button>
     <button class="nb" onclick="sv('alerts')" id="tab-alerts"><div class="dot"></div>Alerts<span class="bdg" id="al-bdg">0</span></button>
-    <button class="nb" onclick="sv('devices')" id="tab-devices"><div class="dot"></div>Devices</button>
+    <button class="nb" onclick="sv('devices');if(['nurse','cardiologist','admin'].includes(CFG.userRole))loadBLEConfigDevices()" id="tab-devices"><div class="dot"></div>Devices</button>
     <button class="nb" onclick="sv('workflow')" id="tab-workflow"><div class="dot"></div>Clinical Workflow</button>
     <button class="nb" onclick="sv('emergency')" id="tab-emergency"><div class="dot"></div>Emergency Response</button>
     <button class="nb" onclick="sv('tests')" id="tab-tests"><div class="dot"></div>Test Suite</button>
@@ -359,6 +359,17 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
   <table class="dv-table" style="margin-bottom:20px"><thead><tr><th>Status</th><th>Device ID</th><th>Type</th><th>Patient ID</th><th>Frames</th><th>Last data</th></tr></thead><tbody id="dv-body-ble"><tr><td colspan="6"><div class="empty-st">Connect to backend to see live devices</div></td></tr></tbody></table>
   <div class="sec-hdr p" style="margin-bottom:8px">Implanted Devices — Clinician-Registered</div>
   <table class="dv-table"><thead><tr><th>Status</th><th>Device ID</th><th>Type</th><th>Patient ID</th><th>Frames</th><th>Last data</th></tr></thead><tbody id="dv-body-implant"><tr><td colspan="6"><div class="empty-st">No implanted devices registered</div></td></tr></tbody></table>
+
+  <div class="sec-hdr b" id="ble-config-header" style="margin:20px 0 8px;display:none">Patient BLE Devices — Hospital Configuration</div>
+  <p class="cfg-sub" id="ble-config-sub" style="display:none;margin-bottom:12px">Patients pair these from the app themselves. Assign each one to your organization so its alerts route to your hospital's systems.</p>
+  <div class="card" id="ble-config-card" style="display:none">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+      <button class="f-chip on" id="ble-filter-pending" onclick="setBLEFilter(true)">Needs Configuration</button>
+      <button class="f-chip" id="ble-filter-all" onclick="setBLEFilter(false)">All Devices</button>
+      <span class="mono-tag" id="ble-config-count" style="margin-left:auto">0</span>
+    </div>
+    <div id="ble-config-list"><div class="empty-st">Loading…</div></div>
+  </div>
 </div>
 </div>
 
@@ -749,6 +760,26 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
   </div>
 </div>
 
+<!-- CONFIGURE PATIENT BLE DEVICE — clinical staff only -->
+<!-- Calls the existing PATCH /clinical/devices/ble/{device_id} endpoint;
+     organization dropdown populated from GET /clinical/organizations
+     (id+name only — no FHIR config details, unlike the admin-only
+     /admin/organizations endpoint). -->
+<div class="cfg-ov" id="bleConfigOv" onclick="maybeBLEConfigClose(event)">
+  <div class="cfg-box">
+    <h3>Configure device for your hospital</h3>
+    <p class="cfg-sub" id="bleConfigDeviceInfo">Device</p>
+    <div class="cfg-f">
+      <label class="cfg-lbl">Organization</label>
+      <select class="cfg-input" id="bleConfigOrgSelect" style="font-family:var(--font)">
+        <option value="">Loading organizations…</option>
+      </select>
+    </div>
+    <div id="bleConfigError" style="display:none;color:var(--red);font-size:.65rem;margin-bottom:10px"></div>
+    <div class="cfg-row"><button class="cfg-p" id="bleConfigSubmitBtn" onclick="submitBLEConfig()">Assign to Organization</button><button class="cfg-s" onclick="closeBLEConfigModal()">Cancel</button></div>
+  </div>
+</div>
+
 <!-- REGISTER IMPLANT DEVICE — clinical staff only (nurse/cardiologist/admin) -->
 <!-- Calls the existing POST /clinical/devices/register-implant endpoint;
      no backend changes needed. Patients never see this button/modal. -->
@@ -1086,6 +1117,119 @@ function renderDevices(){
     : implants.map(deviceRow).join('');
 }
 
+// ── Patient BLE Device configuration (clinical staff only) ────────────────
+// Uses the existing GET /clinical/devices/ble, PATCH /clinical/devices/ble/{id},
+// and GET /clinical/organizations endpoints — no additional backend routes.
+let _bleConfigDevices = [];
+let _bleConfigOrgs    = [];
+let _bleFilterPendingOnly = true;
+
+async function loadBLEConfigDevices(){
+  if(!CFG.url||!CFG.tok)return;
+  const listEl = document.getElementById('ble-config-list');
+  try{
+    const url = CFG.url+'/clinical/devices/ble'+(_bleFilterPendingOnly ? '?unconfigured=true' : '');
+    const resp = await fetch(url,{headers:{'Authorization':'Bearer '+CFG.tok}});
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    _bleConfigDevices = await resp.json();
+    renderBLEConfigDevices();
+  }catch(e){
+    listEl.innerHTML = '<div class="empty-st">Could not load devices. Check connection.</div>';
+  }
+}
+
+function setBLEFilter(pendingOnly){
+  _bleFilterPendingOnly = pendingOnly;
+  document.getElementById('ble-filter-pending').className = pendingOnly ? 'f-chip on' : 'f-chip';
+  document.getElementById('ble-filter-all').className = pendingOnly ? 'f-chip' : 'f-chip on';
+  loadBLEConfigDevices();
+}
+
+function renderBLEConfigDevices(){
+  const listEl = document.getElementById('ble-config-list');
+  document.getElementById('ble-config-count').textContent = _bleConfigDevices.length;
+
+  listEl.innerHTML = _bleConfigDevices.length===0
+    ? `<div class="empty-st">${_bleFilterPendingOnly ? 'No devices waiting for configuration' : 'No patient BLE devices found'}</div>`
+    : _bleConfigDevices.map(d=>`
+        <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+          <div style="width:6px;height:6px;border-radius:50%;background:${d.is_configured?'var(--green)':'var(--amber, #d97706)'};flex-shrink:0"></div>
+          <div style="flex:1;min-width:0">
+            <div style="font-size:.68rem;font-weight:600;color:#fff">${esc(d.device_name || deviceTypeLabel(d.device_type))} <span style="color:var(--muted);font-weight:400">· ${esc(deviceTypeLabel(d.device_type))}</span></div>
+            <div style="font-family:var(--mono);font-size:.6rem;color:var(--text2)">Patient: ${esc(d.patient_id)} · Device ID: ${esc(d.device_id.slice(0,16))}${d.device_id.length>16?'…':''}</div>
+            ${d.is_configured ? '<div style="font-size:.6rem;color:var(--green)">Configured</div>' : ''}
+          </div>
+          <button class="cfg-p" style="padding:5px 12px;font-size:.62rem;width:auto" onclick="openBLEConfigModal('${d.device_id}')">${d.is_configured?'Reassign':'Configure'}</button>
+        </div>`).join('');
+}
+
+async function openBLEConfigModal(deviceId){
+  const device = _bleConfigDevices.find(d=>d.device_id===deviceId);
+  if(!device)return;
+
+  document.getElementById('bleConfigOv').dataset.deviceId = deviceId;
+  document.getElementById('bleConfigDeviceInfo').textContent =
+    `${device.device_name || deviceTypeLabel(device.device_type)} — Patient: ${device.patient_id}`;
+  document.getElementById('bleConfigError').style.display = 'none';
+
+  const select = document.getElementById('bleConfigOrgSelect');
+  select.innerHTML = '<option value="">Loading organizations…</option>';
+  document.getElementById('bleConfigOv').classList.add('open');
+
+  try{
+    const resp = await fetch(CFG.url+'/clinical/organizations',{headers:{'Authorization':'Bearer '+CFG.tok}});
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    _bleConfigOrgs = await resp.json();
+    select.innerHTML = _bleConfigOrgs.length===0
+      ? '<option value="">No organizations available</option>'
+      : _bleConfigOrgs.map(o=>`<option value="${o.id}" ${o.id===device.organization_id?'selected':''}>${esc(o.name)}</option>`).join('');
+  }catch(e){
+    select.innerHTML = '<option value="">Could not load organizations</option>';
+  }
+}
+
+function closeBLEConfigModal(){document.getElementById('bleConfigOv').classList.remove('open');}
+function maybeBLEConfigClose(e){if(e.target.id==='bleConfigOv')closeBLEConfigModal();}
+
+async function submitBLEConfig(){
+  const deviceId = document.getElementById('bleConfigOv').dataset.deviceId;
+  const orgId = document.getElementById('bleConfigOrgSelect').value;
+  const errEl = document.getElementById('bleConfigError');
+
+  if(!orgId){
+    errEl.textContent = 'Please select an organization.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  const btn = document.getElementById('bleConfigSubmitBtn');
+  btn.disabled = true; btn.textContent = 'Saving…';
+
+  try{
+    const resp = await fetch(CFG.url+'/clinical/devices/ble/'+encodeURIComponent(deviceId),{
+      method:'PATCH',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+CFG.tok},
+      body:JSON.stringify({organization_id: orgId})
+    });
+    let data = {};
+    try{ data = await resp.json(); }catch(_e){}
+
+    if(!resp.ok){
+      errEl.textContent = data.message || data.error || ('Save failed (HTTP '+resp.status+')');
+      errEl.style.display = 'block';
+      return;
+    }
+
+    closeBLEConfigModal();
+    loadBLEConfigDevices();
+  }catch(e){
+    errEl.textContent = 'Could not reach the backend. Check the URL and your connection.';
+    errEl.style.display = 'block';
+  }finally{
+    btn.disabled = false; btn.textContent = 'Assign to Organization';
+  }
+}
+
 let _af='all';
 function setAlertFilter(f,btn){_af=f;document.querySelectorAll('#filt-btns button').forEach(b=>{b.className='f-chip';});btn.className='f-chip '+(f==='critical'?'on-crit':'on');renderAlerts();}
 function renderAlerts(){const fb=document.getElementById('filt-btns');if(!fb.children.length){['All','Critical','High','Medium','Low'].forEach((lbl,i)=>{const b=document.createElement('button');b.className='f-chip'+(i===0?' on':'');b.textContent=lbl;const fl=lbl.toLowerCase();b.onclick=()=>setAlertFilter(fl,b);fb.appendChild(b);});}const filtered=_af==='all'?cache.alerts:cache.alerts.filter(x=>x.level===_af);const list=document.getElementById('alerts-list');if(filtered.length===0){list.innerHTML='<div class="empty-st">No alerts</div>';return;}list.innerHTML=filtered.map(al=>`<div class="al-item ${al.level}" style="margin-bottom:8px;border-radius:10px"><div style="display:flex;align-items:center;gap:8px;margin-bottom:6px"><span class="al-badge ${al.level}">${al.level.toUpperCase()}</span><span style="font-size:.6rem;color:var(--muted);margin-left:auto">Patient: ${esc(al.patient_id)}</span><span style="font-size:.58rem;color:var(--dim)">${ft(al.timestamp)}</span></div><div class="al-desc">${esc(al.description)}</div>${al.actions&&al.actions.length?`<div style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px">${al.actions.slice(0,3).map(a=>`<span style="font-size:.55rem;padding:2px 7px;border-radius:99px;background:var(--card2);border:1px solid var(--border);color:var(--text2)">${esc(a.replace(/_/g,' '))}</span>`).join('')}</div>`:''}</div>`).join('');}
@@ -1325,10 +1469,20 @@ function initDashboard(){
   // Register Implant button: clinical staff only (nurse/cardiologist/admin).
   // Patients never see this — they don't register implants, clinicians do.
   const implantBtn = document.getElementById('btn-register-implant');
+  const clinicalRoles = ['nurse','cardiologist','admin'];
+  const isClinicalStaff = clinicalRoles.includes(CFG.userRole);
   if(implantBtn){
-    const clinicalRoles = ['nurse','cardiologist','admin'];
-    implantBtn.style.display = clinicalRoles.includes(CFG.userRole) ? '' : 'none';
+    implantBtn.style.display = isClinicalStaff ? '' : 'none';
   }
+
+  // Patient BLE Devices configuration panel: clinical staff only. Patients
+  // pair their own devices from the app; this panel is where a nurse/
+  // cardiologist/admin assigns those pairings to their organization.
+  ['ble-config-header','ble-config-sub','ble-config-card'].forEach(id=>{
+    const el = document.getElementById(id);
+    if(el) el.style.display = isClinicalStaff ? '' : 'none';
+  });
+  if(isClinicalStaff) loadBLEConfigDevices();
 }
 
 // Clock runs immediately (harmless, no patient data, just a wall clock).
