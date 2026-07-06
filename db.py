@@ -434,6 +434,123 @@ class Database:
         except Exception as exc:
             logger.warning("[DB] vendor event audit write failed: %s", exc)
 
+    # ── Patient-paired BLE devices ───────────────────────────────────────
+    #
+    # Persists what previously only lived in the in-memory
+    # DeviceSessionRegistry — BLE pairings now survive restarts, and
+    # clinical staff can query/configure them (assign an organization)
+    # after a patient self-pairs. See migration 006.
+
+    async def upsert_ble_device(
+        self, device_id: str, device_type: str, patient_id: str,
+        device_name: Optional[str] = None, paired_by_user_id: Optional[str] = None,
+    ) -> "BLEDevice":
+        """
+        Called from POST /devices/register (patient self-pairing). Re-pairing
+        an already-known device_id updates its type/name/active status but
+        deliberately does NOT touch organization_id — once clinical staff
+        have configured a device for their hospital, a patient simply
+        re-pairing it shouldn't silently un-configure it.
+        """
+        pool = self._require_pool()
+        row = await pool.fetchrow(
+            """
+            INSERT INTO ble_devices (device_id, device_type, device_name, patient_id, paired_by_user_id)
+            VALUES ($1, $2, $3, $4, $5::uuid)
+            ON CONFLICT (device_id) DO UPDATE
+                SET device_type = EXCLUDED.device_type,
+                    device_name = COALESCE(EXCLUDED.device_name, ble_devices.device_name),
+                    patient_id  = EXCLUDED.patient_id,
+                    is_active   = true,
+                    updated_at  = now()
+            RETURNING *
+            """,
+            device_id, device_type, device_name, patient_id, paired_by_user_id,
+        )
+        return BLEDevice.from_row(row)
+
+    async def get_ble_device_by_device_id(self, device_id: str) -> Optional["BLEDevice"]:
+        pool = self._require_pool()
+        row = await pool.fetchrow("SELECT * FROM ble_devices WHERE device_id = $1", device_id)
+        return BLEDevice.from_row(row) if row else None
+
+    async def list_ble_devices(
+        self, patient_id: Optional[str] = None, unconfigured_only: bool = False,
+    ) -> List["BLEDevice"]:
+        pool = self._require_pool()
+        conditions, params = [], []
+        if patient_id:
+            params.append(patient_id)
+            conditions.append(f"patient_id = ${len(params)}")
+        if unconfigured_only:
+            conditions.append("organization_id IS NULL")
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = await pool.fetch(f"SELECT * FROM ble_devices {where} ORDER BY created_at DESC", *params)
+        return [BLEDevice.from_row(r) for r in rows]
+
+    async def configure_ble_device(
+        self, device_id: str, organization_id: str, configured_by_user_id: str,
+    ) -> Optional["BLEDevice"]:
+        """Clinical staff action: assign a patient-paired BLE device to their organization."""
+        pool = self._require_pool()
+        row = await pool.fetchrow(
+            """
+            UPDATE ble_devices
+            SET organization_id = $1::uuid, configured_by_user_id = $2::uuid,
+                configured_at = now(), updated_at = now()
+            WHERE device_id = $3
+            RETURNING *
+            """,
+            organization_id, configured_by_user_id, device_id,
+        )
+        return BLEDevice.from_row(row) if row else None
+
+    async def touch_ble_device_last_data(self, device_id: str) -> None:
+        pool = self._require_pool()
+        await pool.execute(
+            "UPDATE ble_devices SET last_data_at = now() WHERE device_id = $1", device_id,
+        )
+
+
+@dataclass
+class BLEDevice:
+    """A patient-paired BLE wearable, persisted so it survives restarts
+    and can be configured (assigned an organization) by clinical staff."""
+
+    id:                    str
+    device_id:             str
+    device_type:           str
+    device_name:           Optional[str]
+    patient_id:            str
+    paired_by_user_id:     Optional[str]
+    organization_id:       Optional[str]
+    configured_by_user_id: Optional[str]
+    configured_at:         Optional[str]
+    is_active:             bool
+    last_data_at:          Optional[str]
+    created_at:            str
+
+    @classmethod
+    def from_row(cls, row: asyncpg.Record) -> "BLEDevice":
+        return cls(
+            id                    = str(row["id"]),
+            device_id             = row["device_id"],
+            device_type           = row["device_type"],
+            device_name           = row["device_name"],
+            patient_id            = row["patient_id"],
+            paired_by_user_id     = str(row["paired_by_user_id"]) if row["paired_by_user_id"] else None,
+            organization_id       = str(row["organization_id"]) if row["organization_id"] else None,
+            configured_by_user_id = str(row["configured_by_user_id"]) if row["configured_by_user_id"] else None,
+            configured_at         = str(row["configured_at"]) if row["configured_at"] else None,
+            is_active             = row["is_active"],
+            last_data_at          = str(row["last_data_at"]) if row["last_data_at"] else None,
+            created_at            = str(row["created_at"]),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        return self.organization_id is not None
+
 
 @dataclass
 class Organization:
