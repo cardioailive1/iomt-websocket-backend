@@ -747,16 +747,16 @@ class CommunicationAgent(BaseAgent):
         # ── Resolve which organization this alert belongs to, for
         # multi-hospital FHIR/HL7 routing ──────────────────────────────
         #
-        # IMPORTANT LIMITATION: alert.patient_id is actually set from the
-        # originating device_id (see DiagnosticAgent.process(), which
-        # copies pattern["device_id"] into DiagnosticResult.patient_id).
-        # For IMPLANT-sourced alerts, that device_id is the vendor_device_id
-        # registered in large_devices, so we CAN look it up there to find
-        # both the real clinical patient_id and the organization that
-        # registered it. For BLE-sourced alerts, device_id is the BLE
-        # peripheral's own UUID, which has no organization link — those
-        # alerts always fall back to the global FHIR_*/HL7_ORU_* environment
-        # variables (single-tenant behavior), same as before this feature.
+        # alert.patient_id is actually set from the originating device_id
+        # (see DiagnosticAgent.process(), which copies pattern["device_id"]
+        # into DiagnosticResult.patient_id) — so we look it up first against
+        # large_devices (implants) and then ble_devices (patient-paired
+        # wearables) to find both the real clinical patient_id and whichever
+        # organization has been assigned to that device. If neither table
+        # has an organization set for this device (e.g. a BLE device a
+        # patient just paired that no clinician has configured yet), this
+        # falls back to the global FHIR_*/HL7_ORU_* environment variables,
+        # same as before either device type had organization linking.
         organization = None
         real_patient_id = alert.patient_id
         try:
@@ -765,6 +765,13 @@ class CommunicationAgent(BaseAgent):
                 real_patient_id = device.patient_id
                 if device.organization_id:
                     organization = await _db.get_organization_by_id(device.organization_id)
+            else:
+                ble_device = await _db.get_ble_device_by_device_id(alert.patient_id)
+                if ble_device is not None:
+                    real_patient_id = ble_device.patient_id
+                    await _db.touch_ble_device_last_data(alert.patient_id)
+                    if ble_device.organization_id:
+                        organization = await _db.get_organization_by_id(ble_device.organization_id)
         except Exception:
             logger.exception("[Comms] error resolving organization for alert=%s", alert.alert_id)
 
@@ -1859,6 +1866,19 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             bridge.registry.register(device_id, device_type, patient_id)
             logger.info("[DeviceRegister] registered device=%s type=%s patient=%s name=%s", device_id, device_type, patient_id, device_name)
 
+        # Persist to the database so this pairing survives restarts and is
+        # visible to clinical staff for configuration (assigning it to
+        # their hospital's organization). Previously this only lived in
+        # bridge.registry (in-memory) — a redeploy would silently lose
+        # every patient's paired-device record.
+        try:
+            await _db.upsert_ble_device(
+                device_id=device_id, device_type=device_type, patient_id=patient_id,
+                device_name=device_name, paired_by_user_id=user.get("sub"),
+            )
+        except Exception:
+            logger.exception("[DeviceRegister] failed to persist BLE device=%s to database", device_id)
+
         acq_agent = bridge.system.agents["acquisition"]
         import asyncio as _asyncio
         _asyncio.create_task(acq_agent.register_device(device_id, device_type, patient_id))
@@ -1947,6 +1967,76 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             for d in devices_
         ])
 
+    # ── GET /clinical/devices/ble ─────────────────────────────────────────
+    #
+    # Clinical staff: list patient-paired BLE devices, optionally filtered
+    # to only those NOT yet configured (organization_id is null) — this is
+    # the "needs attention" queue for a nurse/admin to work through after
+    # patients pair devices from the app on their own.
+
+    @_require_auth(cfg)
+    @require_role(UserRole.NURSE, UserRole.CARDIOLOGIST, UserRole.ADMIN)
+    async def list_ble_devices(request: _web.Request) -> _web.Response:
+        patient_id = request.query.get("patient_id")
+        unconfigured_only = request.query.get("unconfigured", "").lower() == "true"
+        devices_ = await _db.list_ble_devices(patient_id=patient_id, unconfigured_only=unconfigured_only)
+        return _web.json_response([
+            {
+                "id": d.id, "device_id": d.device_id, "device_type": d.device_type,
+                "device_name": d.device_name, "patient_id": d.patient_id,
+                "organization_id": d.organization_id, "is_configured": d.is_configured,
+                "configured_at": d.configured_at, "is_active": d.is_active,
+                "last_data_at": d.last_data_at, "created_at": d.created_at,
+            }
+            for d in devices_
+        ])
+
+    # ── PATCH /clinical/devices/ble/{device_id} ──────────────────────────
+    #
+    # Clinical staff: assign a patient-paired BLE device to their
+    # organization, so its future alerts route to that hospital's FHIR/HL7
+    # configuration instead of falling back to the global default. This is
+    # the "register/config" step requested — the patient already paired
+    # the device from the app; this is the hospital-side acknowledgment
+    # that links it to their care.
+
+    @_require_auth(cfg)
+    @require_role(UserRole.NURSE, UserRole.CARDIOLOGIST, UserRole.ADMIN)
+    async def configure_ble_device(request: _web.Request) -> _web.Response:
+        device_id = request.match_info.get("device_id", "")
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        organization_id = (body.get("organization_id") or "").strip()
+        if not organization_id:
+            return _web.json_response({"error": "missing_fields", "message": "'organization_id' is required"}, status=400)
+
+        existing = await _db.get_ble_device_by_device_id(device_id)
+        if existing is None:
+            return _web.json_response({"error": "device_not_found", "message": f"No BLE device found with device_id={device_id}"}, status=404)
+
+        org = await _db.get_organization_by_id(organization_id)
+        if org is None:
+            return _web.json_response({"error": "organization_not_found"}, status=404)
+
+        user = request["user"]
+        updated = await _db.configure_ble_device(
+            device_id=device_id, organization_id=organization_id, configured_by_user_id=user.get("sub"),
+        )
+        await _db.log_event(
+            "ble_device_configured", user_id=user.get("sub"),
+            detail=f"device_id={device_id} organization={org.name} patient_id={existing.patient_id}",
+        )
+        logger.info("[BLEConfig] clinician=%s assigned device=%s to organization=%s", user.get("sub"), device_id, org.name)
+
+        return _web.json_response({
+            "id": updated.id, "device_id": updated.device_id, "patient_id": updated.patient_id,
+            "organization_id": updated.organization_id, "is_configured": updated.is_configured,
+            "configured_at": updated.configured_at,
+        })
+
     @_require_vendor_api_key
     async def vendor_gateway_ingest(request: _web.Request) -> _web.Response:
         vendor = request["vendor"]
@@ -2012,6 +2102,21 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     # Admin-only: list all canonical organizations, including ones that
     # were auto-registered by a first-time signup (auto_registered=true)
     # versus ones an admin explicitly created ahead of time.
+
+    # ── GET /clinical/organizations ──────────────────────────────────────
+    #
+    # Any clinical staff role (not just admin): a minimal id+name listing
+    # for populating the "assign this device to an organization" dropdown
+    # when configuring a patient-paired BLE device. Deliberately does NOT
+    # include fhir_enabled/fhir_base_url/etc — those stay admin-only via
+    # GET /admin/organizations, since a nurse configuring a device doesn't
+    # need visibility into another hospital's FHIR integration status.
+
+    @_require_auth(cfg)
+    @require_role(UserRole.NURSE, UserRole.CARDIOLOGIST, UserRole.ADMIN)
+    async def list_organizations_minimal(request: _web.Request) -> _web.Response:
+        orgs = await _db.list_organizations()
+        return _web.json_response([{"id": o.id, "name": o.name} for o in orgs])
 
     @_require_auth(cfg)
     @require_role(UserRole.ADMIN)
@@ -2152,6 +2257,9 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     app.router.add_post("/devices/register", device_register)
     app.router.add_post("/clinical/devices/register-implant", register_implant)
     app.router.add_get("/clinical/devices/implants", list_implants)
+    app.router.add_get("/clinical/devices/ble", list_ble_devices)
+    app.router.add_patch("/clinical/devices/ble/{device_id}", configure_ble_device)
+    app.router.add_get("/clinical/organizations", list_organizations_minimal)
     app.router.add_post("/vendor-gateway/ingest", vendor_gateway_ingest)
     app.router.add_get("/health", health)
     app.router.add_get("/status", full_status)
