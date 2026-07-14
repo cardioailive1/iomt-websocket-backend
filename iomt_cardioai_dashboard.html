@@ -353,6 +353,7 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
     <span class="mono-tag" style="color:var(--green)">Active: <strong id="dv-act">&#8212;</strong></span>
     <span class="mono-tag" style="color:var(--red)">Inactive: <strong id="dv-inact">&#8212;</strong></span>
     <button class="cfg-btn" id="btn-register-implant" style="display:none;color:var(--green);border-color:var(--green)" onclick="openRegisterImplant()">+ Register Implant Device</button>
+    <button class="cfg-btn" id="btn-register-ble" style="display:none;color:var(--blue);border-color:var(--blue)" onclick="openRegisterBLEModal()">+ Register BLE Device (Bedside)</button>
     <button class="cfg-btn" style="margin-left:auto" onclick="fetchAll()">&#8635; Refresh</button>
   </div>
   <div class="sec-hdr b" style="margin-bottom:8px">BLE Wearables — Patient Self-Paired (RPM)</div>
@@ -818,6 +819,48 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
   </div>
 </div>
 
+<!-- REGISTER BLE DEVICE (BEDSIDE) — clinical staff only -->
+<!-- For patients who cannot use their own phone to pair a device (e.g.
+     unconscious, incapacitated, or arriving without their phone). Uses
+     the browser's Web Bluetooth API to physically scan for and identify
+     the device, then calls the existing POST /devices/register endpoint
+     — the same one patients use — with the clinician's own Bearer token.
+     The backend already allows clinical staff to register on behalf of
+     any patient_id (only PATIENTS are restricted to their own ID), and
+     auto-assigns the registering clinician's organization at the same
+     time, so no separate configuration step is needed afterward. -->
+<div class="cfg-ov" id="bleRegisterOv" onclick="maybeBLERegisterClose(event)">
+  <div class="cfg-box">
+    <h3>Register BLE device (bedside)</h3>
+    <p class="cfg-sub">For patients who can't pair from their own phone. This only identifies the device for the record — for continuous monitoring, a dedicated tablet/phone running the CardioAI app must stay near the patient to actually relay the data, the same way a patient's own phone would.</p>
+
+    <div id="bleRegisterUnsupported" style="display:none;background:rgba(217,119,6,.1);border:1px solid rgba(217,119,6,.3);border-radius:8px;padding:10px;margin-bottom:14px;font-size:.65rem;color:#d97706">
+      Web Bluetooth isn't supported in this browser. Use <strong>Google Chrome</strong> or <strong>Microsoft Edge</strong> on a computer or Android device — this doesn't work in Safari, Firefox, or on iPhone/iPad.
+    </div>
+
+    <div id="bleRegisterForm">
+      <div class="cfg-f"><label class="cfg-lbl">Patient ID</label><input class="cfg-input" id="bleRegPatientId" placeholder="PT_12345 or hospital MRN" /></div>
+      <div class="cfg-f">
+        <label class="cfg-lbl">Device Type</label>
+        <select class="cfg-input" id="bleRegDeviceType" style="font-family:var(--font)">
+          <option value="ecg_monitor">ECG Monitor</option>
+          <option value="bp_monitor">BP Cuff</option>
+          <option value="pulse_oximeter">Pulse Oximeter</option>
+          <option value="activity_tracker">Activity Tracker</option>
+        </select>
+      </div>
+      <div class="cfg-f">
+        <label class="cfg-lbl">Detected Device</label>
+        <div id="bleRegDetectedDevice" style="padding:10px 12px;background:var(--card2);border:1px solid var(--border);border-radius:8px;font-size:.65rem;color:var(--muted)">No device scanned yet</div>
+      </div>
+      <div class="cfg-row"><button class="cfg-s" id="bleRegScanBtn" onclick="scanForBLEDevice()">Scan for Nearby Device</button></div>
+    </div>
+
+    <div id="bleRegisterError" style="display:none;color:var(--red);font-size:.65rem;margin:10px 0"></div>
+    <div class="cfg-row"><button class="cfg-p" id="bleRegisterSubmitBtn" onclick="submitBLERegistration()" disabled>Register Device</button><button class="cfg-s" onclick="closeBLERegisterModal()">Cancel</button></div>
+  </div>
+</div>
+
 <script>
 const SUITE_DATA = [{"id": "TestDataModels", "label": "Data Models", "passed": 5, "failed": 0, "tests": [{"suite": "TestDataModels", "name": "test_device_data_default_quality", "status": "PASSED", "pct": 0}, {"suite": "TestDataModels", "name": "test_alert_notified_parties_starts_empty", "status": "PASSED", "pct": 1}, {"suite": "TestDataModels", "name": "test_device_type_enum_values", "status": "PASSED", "pct": 1}, {"suite": "TestDataModels", "name": "test_alert_level_enum_values", "status": "PASSED", "pct": 2}, {"suite": "TestDataModels", "name": "test_all_arrhythmia_types_present", "status": "PASSED", "pct": 2}]}, {"id": "TestMessageBus", "label": "Message Bus", "passed": 7, "failed": 0, "tests": [{"suite": "TestMessageBus", "name": "test_subscribe_and_receive", "status": "PASSED", "pct": 3}, {"suite": "TestMessageBus", "name": "test_async_subscriber", "status": "PASSED", "pct": 3}, {"suite": "TestMessageBus", "name": "test_multiple_subscribers_same_topic", "status": "PASSED", "pct": 4}, {"suite": "TestMessageBus", "name": "test_no_bleed_between_topics", "status": "PASSED", "pct": 4}, {"suite": "TestMessageBus", "name": "test_message_history_appended", "status": "PASSED", "pct": 5}, {"suite": "TestMessageBus", "name": "test_subscriber_exception_does_not_crash_bus", "status": "PASSED", "pct": 5}, {"suite": "TestMessageBus", "name": "test_publish_to_topic_with_no_subscribers", "status": "PASSED", "pct": 6}]}, {"id": "TestBaseAgent", "label": "Base Agent", "passed": 3, "failed": 0, "tests": [{"suite": "TestBaseAgent", "name": "test_start_sets_running_true", "status": "PASSED", "pct": 6}, {"suite": "TestBaseAgent", "name": "test_stop_sets_running_false", "status": "PASSED", "pct": 7}, {"suite": "TestBaseAgent", "name": "test_agent_id_stored", "status": "PASSED", "pct": 7}]}, {"id": "TestDataAcquisitionAgent", "label": "Acquisition Agent", "passed": 15, "failed": 0, "tests": [{"suite": "TestDataAcquisitionAgent", "name": "test_register_device_stores_entry", "status": "PASSED", "pct": 8}, {"suite": "TestDataAcquisitionAgent", "name": "test_register_creates_stream_queue", "status": "PASSED", "pct": 8}, {"suite": "TestDataAcquisitionAgent", "name": "test_register_publishes_device_registered", "status": "PASSED", "pct": 9}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_unknown_device_silent", "status": "PASSED", "pct": 9}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_publishes_data_raw", "status": "PASSED", "pct": 10}, {"suite": "TestDataAcquisitionAgent", "name": "test_stream_data_updates_last_seen", "status": "PASSED", "pct": 10}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_normal_data", "status": "PASSED", "pct": 11}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_none_value", "status": "PASSED", "pct": 11}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_extreme_hr_high", "status": "PASSED", "pct": 12}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_penalises_extreme_hr_low", "status": "PASSED", "pct": 12}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_boundary_hr_exactly_30", "status": "PASSED", "pct": 13}, {"suite": "TestDataAcquisitionAgent", "name": "test_quality_boundary_hr_exactly_250", "status": "PASSED", "pct": 13}, {"suite": "TestDataAcquisitionAgent", "name": "test_process_dispatches_stream", "status": "PASSED", "pct": 14}, {"suite": "TestDataAcquisitionAgent", "name": "test_process_ignores_non_dict", "status": "PASSED", "pct": 14}, {"suite": "TestDataAcquisitionAgent", "name": "test_bus_device_register_topic_triggers_register", "status": "PASSED", "pct": 15}]}, {"id": "TestDataProcessingAgent", "label": "Processing Agent", "passed": 12, "failed": 0, "tests": [{"suite": "TestDataProcessingAgent", "name": "test_low_quality_dropped", "status": "PASSED", "pct": 15}, {"suite": "TestDataProcessingAgent", "name": "test_quality_threshold_boundary_accepted", "status": "PASSED", "pct": 16}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_signal_type", "status": "PASSED", "pct": 16}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_features_populated", "status": "PASSED", "pct": 17}, {"suite": "TestDataProcessingAgent", "name": "test_ecg_rr_mean_from_hr", "status": "PASSED", "pct": 17}, {"suite": "TestDataProcessingAgent", "name": "test_bp_signal_type", "status": "PASSED", "pct": 18}, {"suite": "TestDataProcessingAgent", "name": "test_bp_features_correct", "status": "PASSED", "pct": 18}, {"suite": "TestDataProcessingAgent", "name": "test_bp_map_formula", "status": "PASSED", "pct": 19}, {"suite": "TestDataProcessingAgent", "name": "test_spo2_features", "status": "PASSED", "pct": 19}, {"suite": "TestDataProcessingAgent", "name": "test_generic_passthrough", "status": "PASSED", "pct": 20}, {"suite": "TestDataProcessingAgent", "name": "test_dispatch_routes_ecg", "status": "PASSED", "pct": 20}, {"suite": "TestDataProcessingAgent", "name": "test_dispatch_routes_bp", "status": "PASSED", "pct": 21}]}, {"id": "TestPatternRecognitionAgent", "label": "Pattern Recognition", "passed": 30, "failed": 0, "tests": [{"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[40-30-100-ArrhythmiaType.BRADYCARDIA]", "status": "PASSED", "pct": 21}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[72-30-95-ArrhythmiaType.NORMAL_SINUS]", "status": "PASSED", "pct": 22}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[115-80-90-ArrhythmiaType.ATRIAL_FIBRILLATION]", "status": "PASSED", "pct": 22}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[160-20-135-ArrhythmiaType.VENTRICULAR_TACHYCARDIA]", "status": "PASSED", "pct": 23}, {"suite": "TestPatternRecognitionAgent", "name": "test_arrhythmia_detection[110-25-90-ArrhythmiaType.TACHYCARDIA]", "status": "PASSED", "pct": 23}, {"suite": "TestPatternRecognitionAgent", "name": "test_bradycardia_priority_over_wide_qrs", "status": "PASSED", "pct": 24}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.2-True]", "status": "PASSED", "pct": 24}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[-0.15-True]", "status": "PASSED", "pct": 25}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.05-False]", "status": "PASSED", "pct": 25}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.1-False]", "status": "PASSED", "pct": 26}, {"suite": "TestPatternRecognitionAgent", "name": "test_ischemia_detection[0.101-True]", "status": "PASSED", "pct": 26}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[115-75-normal]", "status": "PASSED", "pct": 27}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[122-79-elevated]", "status": "PASSED", "pct": 27}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[132-82-stage_1]", "status": "PASSED", "pct": 28}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[145-92-stage_2]", "status": "PASSED", "pct": 28}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[185-125-hypertensive_crisis]", "status": "PASSED", "pct": 29}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[200-110-hypertensive_crisis]", "status": "PASSED", "pct": 29}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[120-80-stage_1]", "status": "PASSED", "pct": 30}, {"suite": "TestPatternRecognitionAgent", "name": "test_hypertension_staging[130-80-stage_1]", "status": "PASSED", "pct": 30}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_pattern_required_keys", "status": "PASSED", "pct": 31}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_pattern_type_label", "status": "PASSED", "pct": 31}, {"suite": "TestPatternRecognitionAgent", "name": "test_ecg_confidence_range", "status": "PASSED", "pct": 32}, {"suite": "TestPatternRecognitionAgent", "name": "test_abnormal_qt_high", "status": "PASSED", "pct": 32}, {"suite": "TestPatternRecognitionAgent", "name": "test_abnormal_qt_low", "status": "PASSED", "pct": 33}, {"suite": "TestPatternRecognitionAgent", "name": "test_normal_qt", "status": "PASSED", "pct": 33}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_pattern_type", "status": "PASSED", "pct": 34}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_hypotension_flag", "status": "PASSED", "pct": 34}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_no_hypotension_normal", "status": "PASSED", "pct": 35}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_wide_pulse_pressure", "status": "PASSED", "pct": 35}, {"suite": "TestPatternRecognitionAgent", "name": "test_bp_publishes_to_bus", "status": "PASSED", "pct": 36}]}, {"id": "TestDiagnosticAgent", "label": "Diagnostic Agent", "passed": 21, "failed": 0, "tests": [{"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-Atrial Fibrillation]", "status": "PASSED", "pct": 36}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.VENTRICULAR_TACHYCARDIA-Critical]", "status": "PASSED", "pct": 37}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.NORMAL_SINUS-Normal]", "status": "PASSED", "pct": 37}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.BRADYCARDIA-Bradycardia]", "status": "PASSED", "pct": 38}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_arrhythmia[ArrhythmiaType.TACHYCARDIA-Tachycardia]", "status": "PASSED", "pct": 38}, {"suite": "TestDiagnosticAgent", "name": "test_interpret_pattern_bp_includes_stage", "status": "PASSED", "pct": 39}, {"suite": "TestDiagnosticAgent", "name": "test_ascvd_in_range", "status": "PASSED", "pct": 39}, {"suite": "TestDiagnosticAgent", "name": "test_hf_risk_in_range", "status": "PASSED", "pct": 40}, {"suite": "TestDiagnosticAgent", "name": "test_stroke_risk_elevated_for_afib", "status": "PASSED", "pct": 40}, {"suite": "TestDiagnosticAgent", "name": "test_stroke_risk_low_without_afib", "status": "PASSED", "pct": 41}, {"suite": "TestDiagnosticAgent", "name": "test_scd_high_for_vtach", "status": "PASSED", "pct": 41}, {"suite": "TestDiagnosticAgent", "name": "test_scd_low_for_normal", "status": "PASSED", "pct": 42}, {"suite": "TestDiagnosticAgent", "name": "test_afib_anticoagulation_recommended", "status": "PASSED", "pct": 42}, {"suite": "TestDiagnosticAgent", "name": "test_vtach_immediate_intervention", "status": "PASSED", "pct": 43}, {"suite": "TestDiagnosticAgent", "name": "test_high_ascvd_statin", "status": "PASSED", "pct": 43}, {"suite": "TestDiagnosticAgent", "name": "test_ischemia_recommendations", "status": "PASSED", "pct": 44}, {"suite": "TestDiagnosticAgent", "name": "test_normal_no_recommendations", "status": "PASSED", "pct": 44}, {"suite": "TestDiagnosticAgent", "name": "test_generate_diagnosis_type", "status": "PASSED", "pct": 45}, {"suite": "TestDiagnosticAgent", "name": "test_generate_diagnosis_risk_scores_present", "status": "PASSED", "pct": 45}, {"suite": "TestDiagnosticAgent", "name": "test_process_stores_patient_history", "status": "PASSED", "pct": 46}, {"suite": "TestDiagnosticAgent", "name": "test_process_publishes_to_bus", "status": "PASSED", "pct": 46}]}, {"id": "TestAlertMonitoringAgent", "label": "Alert Monitoring", "passed": 22, "failed": 0, "tests": [{"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.VENTRICULAR_TACHYCARDIA-supporting0-AlertLevel.CRITICAL]", "status": "PASSED", "pct": 47}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.VENTRICULAR_FIBRILLATION-supporting1-AlertLevel.CRITICAL]", "status": "PASSED", "pct": 47}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-supporting2-AlertLevel.HIGH]", "status": "PASSED", "pct": 48}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_arrhythmia[ArrhythmiaType.ATRIAL_FIBRILLATION-supporting3-AlertLevel.MEDIUM]", "status": "PASSED", "pct": 48}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_high_scd_risk", "status": "PASSED", "pct": 49}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_high_stroke_is_medium", "status": "PASSED", "pct": 49}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_ischemia_is_high", "status": "PASSED", "pct": 50}, {"suite": "TestAlertMonitoringAgent", "name": "test_alert_level_normal_is_none", "status": "PASSED", "pct": 50}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.CRITICAL-PREPARE_DEFIBRILLATOR]", "status": "PASSED", "pct": 51}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.CRITICAL-ACTIVATE_RAPID_RESPONSE]", "status": "PASSED", "pct": 51}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.HIGH-NOTIFY_CARDIOLOGIST]", "status": "PASSED", "pct": 52}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.HIGH-REVIEW_WITHIN_15_MIN]", "status": "PASSED", "pct": 52}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.MEDIUM-NOTIFY_PRIMARY_CARE]", "status": "PASSED", "pct": 53}, {"suite": "TestAlertMonitoringAgent", "name": "test_required_actions[AlertLevel.LOW-ROUTINE_REVIEW]", "status": "PASSED", "pct": 53}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.CRITICAL-emergency_services]", "status": "PASSED", "pct": 54}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.CRITICAL-rapid_response_team]", "status": "PASSED", "pct": 54}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.HIGH-primary_cardiologist]", "status": "PASSED", "pct": 55}, {"suite": "TestAlertMonitoringAgent", "name": "test_notification_list[AlertLevel.MEDIUM-primary_care_physician]", "status": "PASSED", "pct": 55}, {"suite": "TestAlertMonitoringAgent", "name": "test_create_alert_stored", "status": "PASSED", "pct": 56}, {"suite": "TestAlertMonitoringAgent", "name": "test_create_alert_correct_level", "status": "PASSED", "pct": 56}, {"suite": "TestAlertMonitoringAgent", "name": "test_dispatch_publishes_to_bus", "status": "PASSED", "pct": 57}, {"suite": "TestAlertMonitoringAgent", "name": "test_dispatch_populates_notified_parties", "status": "PASSED", "pct": 57}]}, {"id": "TestPersonalizationAgent", "label": "Personalization", "passed": 11, "failed": 0, "tests": [{"suite": "TestPersonalizationAgent", "name": "test_new_patient_profile_created", "status": "PASSED", "pct": 58}, {"suite": "TestPersonalizationAgent", "name": "test_sample_count_increments", "status": "PASSED", "pct": 58}, {"suite": "TestPersonalizationAgent", "name": "test_running_average_stable_on_constant_input", "status": "PASSED", "pct": 59}, {"suite": "TestPersonalizationAgent", "name": "test_learn_from_alert_stores_entry", "status": "PASSED", "pct": 59}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[heart_rate_high-100]", "status": "PASSED", "pct": 60}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[spo2_low-92]", "status": "PASSED", "pct": 60}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[systolic_high-140]", "status": "PASSED", "pct": 61}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[diastolic_high-90]", "status": "PASSED", "pct": 61}, {"suite": "TestPersonalizationAgent", "name": "test_default_thresholds[unknown_param-0]", "status": "PASSED", "pct": 62}, {"suite": "TestPersonalizationAgent", "name": "test_personalized_threshold_falls_back_to_default", "status": "PASSED", "pct": 62}, {"suite": "TestPersonalizationAgent", "name": "test_non_numeric_features_skipped", "status": "PASSED", "pct": 63}]}, {"id": "TestCommunicationAgent", "label": "Communication", "passed": 8, "failed": 0, "tests": [{"suite": "TestCommunicationAgent", "name": "test_summary_contains_patient_id", "status": "PASSED", "pct": 63}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_level", "status": "PASSED", "pct": 64}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_action", "status": "PASSED", "pct": 64}, {"suite": "TestCommunicationAgent", "name": "test_summary_contains_notified", "status": "PASSED", "pct": 65}, {"suite": "TestCommunicationAgent", "name": "test_generate_report_stored", "status": "PASSED", "pct": 65}, {"suite": "TestCommunicationAgent", "name": "test_report_structure", "status": "PASSED", "pct": 66}, {"suite": "TestCommunicationAgent", "name": "test_multiple_reports_accumulate", "status": "PASSED", "pct": 66}, {"suite": "TestCommunicationAgent", "name": "test_handle_alert_no_exception", "status": "PASSED", "pct": 67}]}, {"id": "TestCardioAISystem", "label": "CardioAI Coordinator", "passed": 13, "failed": 0, "tests": [{"suite": "TestCardioAISystem", "name": "test_seven_agents_initialised", "status": "PASSED", "pct": 67}, {"suite": "TestCardioAISystem", "name": "test_all_expected_agent_keys", "status": "PASSED", "pct": 68}, {"suite": "TestCardioAISystem", "name": "test_start_all_running", "status": "PASSED", "pct": 68}, {"suite": "TestCardioAISystem", "name": "test_stop_all_stopped", "status": "PASSED", "pct": 69}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[normal-60-90]", "status": "PASSED", "pct": 69}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[afib-110-150]", "status": "PASSED", "pct": 70}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[vtach-150-200]", "status": "PASSED", "pct": 70}, {"suite": "TestCardioAISystem", "name": "test_ecg_data_generator[bradycardia-35-50]", "status": "PASSED", "pct": 71}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[normal-110-130]", "status": "PASSED", "pct": 71}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[hypertension-140-170]", "status": "PASSED", "pct": 72}, {"suite": "TestCardioAISystem", "name": "test_bp_data_generator[hypertensive_crisis-180-220]", "status": "PASSED", "pct": 72}, {"suite": "TestCardioAISystem", "name": "test_simulate_ecg_registers_device", "status": "PASSED", "pct": 73}, {"suite": "TestCardioAISystem", "name": "test_all_agents_share_same_bus", "status": "PASSED", "pct": 73}]}, {"id": "TestProtocolHelpers", "label": "Protocol Helpers", "passed": 6, "failed": 0, "tests": [{"suite": "TestProtocolHelpers", "name": "test_build_message_fields", "status": "PASSED", "pct": 74}, {"suite": "TestProtocolHelpers", "name": "test_build_message_unique_ids", "status": "PASSED", "pct": 74}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_valid", "status": "PASSED", "pct": 75}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_invalid_json", "status": "PASSED", "pct": 75}, {"suite": "TestProtocolHelpers", "name": "test_parse_message_empty_string", "status": "PASSED", "pct": 76}, {"suite": "TestProtocolHelpers", "name": "test_all_msg_types_roundtrip", "status": "PASSED", "pct": 76}]}, {"id": "TestHandshakeConfig", "label": "Handshake Config", "passed": 5, "failed": 0, "tests": [{"suite": "TestHandshakeConfig", "name": "test_default_port", "status": "PASSED", "pct": 77}, {"suite": "TestHandshakeConfig", "name": "test_default_queue_size", "status": "PASSED", "pct": 77}, {"suite": "TestHandshakeConfig", "name": "test_default_reconnect_attempts", "status": "PASSED", "pct": 78}, {"suite": "TestHandshakeConfig", "name": "test_default_jwt_algorithm", "status": "PASSED", "pct": 78}, {"suite": "TestHandshakeConfig", "name": "test_override_values", "status": "PASSED", "pct": 79}]}, {"id": "TestSecurityManager", "label": "Security Manager", "passed": 12, "failed": 0, "tests": [{"suite": "TestSecurityManager", "name": "test_challenge_decodes_to_16_bytes", "status": "PASSED", "pct": 79}, {"suite": "TestSecurityManager", "name": "test_challenge_unique", "status": "PASSED", "pct": 80}, {"suite": "TestSecurityManager", "name": "test_sign_is_deterministic", "status": "PASSED", "pct": 80}, {"suite": "TestSecurityManager", "name": "test_verify_correct_signature", "status": "PASSED", "pct": 81}, {"suite": "TestSecurityManager", "name": "test_verify_wrong_signature", "status": "PASSED", "pct": 81}, {"suite": "TestSecurityManager", "name": "test_verify_tampered_challenge", "status": "PASSED", "pct": 82}, {"suite": "TestSecurityManager", "name": "test_token_is_string", "status": "PASSED", "pct": 82}, {"suite": "TestSecurityManager", "name": "test_token_correct_sub", "status": "PASSED", "pct": 83}, {"suite": "TestSecurityManager", "name": "test_token_device_ids", "status": "PASSED", "pct": 83}, {"suite": "TestSecurityManager", "name": "test_expired_token_rejected", "status": "PASSED", "pct": 84}, {"suite": "TestSecurityManager", "name": "test_wrong_jwt_secret_rejected", "status": "PASSED", "pct": 84}, {"suite": "TestSecurityManager", "name": "test_different_secrets_different_sigs", "status": "PASSED", "pct": 85}]}, {"id": "TestDeviceSessionRegistry", "label": "Device Registry", "passed": 12, "failed": 0, "tests": [{"suite": "TestDeviceSessionRegistry", "name": "test_register_returns_session", "status": "PASSED", "pct": 85}, {"suite": "TestDeviceSessionRegistry", "name": "test_get_registered", "status": "PASSED", "pct": 86}, {"suite": "TestDeviceSessionRegistry", "name": "test_get_unknown_returns_none", "status": "PASSED", "pct": 86}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_increments_count", "status": "PASSED", "pct": 87}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_sets_last_data_at", "status": "PASSED", "pct": 87}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_resets_missed_heartbeats", "status": "PASSED", "pct": 88}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_inactive", "status": "PASSED", "pct": 88}, {"suite": "TestDeviceSessionRegistry", "name": "test_active_devices_excludes_inactive", "status": "PASSED", "pct": 89}, {"suite": "TestDeviceSessionRegistry", "name": "test_summary_counts", "status": "PASSED", "pct": 89}, {"suite": "TestDeviceSessionRegistry", "name": "test_summary_device_entry_fields", "status": "PASSED", "pct": 90}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_data_on_unknown_is_silent", "status": "PASSED", "pct": 90}, {"suite": "TestDeviceSessionRegistry", "name": "test_mark_inactive_on_unknown_is_silent", "status": "PASSED", "pct": 91}]}, {"id": "TestRPMDataPump", "label": "RPM Data Pump", "passed": 5, "failed": 0, "tests": [{"suite": "TestRPMDataPump", "name": "test_pump_processes_frame", "status": "PASSED", "pct": 91}, {"suite": "TestRPMDataPump", "name": "test_stats_start_at_zero", "status": "PASSED", "pct": 92}, {"suite": "TestRPMDataPump", "name": "test_auto_register_unknown_device", "status": "PASSED", "pct": 92}, {"suite": "TestRPMDataPump", "name": "test_optional_callback_invoked", "status": "PASSED", "pct": 93}, {"suite": "TestRPMDataPump", "name": "test_stop_event_exits_run", "status": "PASSED", "pct": 93}]}, {"id": "TestDeviceHealthMonitor", "label": "Health Monitor", "passed": 3, "failed": 0, "tests": [{"suite": "TestDeviceHealthMonitor", "name": "test_stale_device_marked_inactive_and_event_published", "status": "PASSED", "pct": 94}, {"suite": "TestDeviceHealthMonitor", "name": "test_fresh_device_stays_active", "status": "PASSED", "pct": 94}, {"suite": "TestDeviceHealthMonitor", "name": "test_device_never_sent_data_not_flagged", "status": "PASSED", "pct": 95}]}, {"id": "TestEndToEndPipeline", "label": "End-to-End Pipeline", "passed": 7, "failed": 0, "tests": [{"suite": "TestEndToEndPipeline", "name": "test_vtach_produces_critical_alert", "status": "PASSED", "pct": 95}, {"suite": "TestEndToEndPipeline", "name": "test_afib_produces_medium_or_high_alert", "status": "PASSED", "pct": 96}, {"suite": "TestEndToEndPipeline", "name": "test_hypertensive_crisis_diagnosis_text", "status": "PASSED", "pct": 96}, {"suite": "TestEndToEndPipeline", "name": "test_personalization_updated_after_signal", "status": "PASSED", "pct": 97}, {"suite": "TestEndToEndPipeline", "name": "test_communication_report_stored", "status": "PASSED", "pct": 97}, {"suite": "TestEndToEndPipeline", "name": "test_acquisition_to_diagnosis_full_path", "status": "PASSED", "pct": 98}, {"suite": "TestEndToEndPipeline", "name": "test_normal_ecg_does_not_produce_critical", "status": "PASSED", "pct": 98}]}, {"id": "TestWebSocketHandshakeLoopback", "label": "WebSocket Loopback", "passed": 2, "failed": 0, "tests": [{"suite": "TestWebSocketHandshakeLoopback", "name": "test_full_3way_hmac_handshake", "status": "PASSED", "pct": 99}, {"suite": "TestWebSocketHandshakeLoopback", "name": "test_wrong_secret_fails_auth", "status": "PASSED", "pct": 99}]}, {"id": "TestBackPressure", "label": "Back-Pressure", "passed": 1, "failed": 0, "tests": [{"suite": "TestBackPressure", "name": "test_full_queue_evicts_oldest_frame", "status": "PASSED", "pct": 100}]}];
 const CFG={
@@ -921,6 +964,113 @@ async function submitRegisterImplant(){
     fetchAll();
   }catch(e){
     showImplantError('Could not reach the backend. Check the URL and your connection.');
+  }finally{
+    btn.disabled = false; btn.textContent = 'Register Device';
+  }
+}
+
+// ── Register BLE Device (Bedside) — clinical staff only ───────────────────
+// Uses the browser's Web Bluetooth API to identify a nearby device, then
+// registers it via the existing POST /devices/register endpoint (the same
+// one patients use to self-pair). Chrome/Edge only — Web Bluetooth is not
+// supported in Safari or Firefox, and not available on iOS at all.
+let _bleRegDetectedDevice = null;
+
+function openRegisterBLEModal(){
+  document.getElementById('bleRegPatientId').value = '';
+  document.getElementById('bleRegDeviceType').value = 'ecg_monitor';
+  document.getElementById('bleRegDetectedDevice').textContent = 'No device scanned yet';
+  document.getElementById('bleRegDetectedDevice').style.color = 'var(--muted)';
+  document.getElementById('bleRegisterError').style.display = 'none';
+  document.getElementById('bleRegisterSubmitBtn').disabled = true;
+  _bleRegDetectedDevice = null;
+
+  const supported = 'bluetooth' in navigator;
+  document.getElementById('bleRegisterUnsupported').style.display = supported ? 'none' : 'block';
+  document.getElementById('bleRegisterForm').style.display = supported ? '' : 'none';
+
+  document.getElementById('bleRegisterOv').classList.add('open');
+}
+
+function closeBLERegisterModal(){document.getElementById('bleRegisterOv').classList.remove('open');}
+function maybeBLERegisterClose(e){if(e.target.id==='bleRegisterOv')closeBLERegisterModal();}
+
+function showBLERegisterError(msg){const e=document.getElementById('bleRegisterError');e.textContent=msg;e.style.display='block';}
+
+async function scanForBLEDevice(){
+  const scanBtn = document.getElementById('bleRegScanBtn');
+  document.getElementById('bleRegisterError').style.display = 'none';
+  scanBtn.disabled = true; scanBtn.textContent = 'Scanning…';
+
+  try{
+    // Standard Bluetooth SIG GATT service names — matches the same
+    // services the iOS app scans for (heart rate, blood pressure, pulse
+    // oximeter). Any compliant device, not just ones branded "CardioAI",
+    // shows up here — same as on the phone.
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [
+        {services: ['heart_rate']},
+        {services: ['blood_pressure']},
+        {services: ['pulse_oximeter']}
+      ],
+      optionalServices: ['device_information']
+    });
+
+    _bleRegDetectedDevice = { id: device.id, name: device.name || 'Unnamed device' };
+    document.getElementById('bleRegDetectedDevice').textContent = `${_bleRegDetectedDevice.name} (${device.id.slice(0,12)}…)`;
+    document.getElementById('bleRegDetectedDevice').style.color = 'var(--green)';
+    document.getElementById('bleRegisterSubmitBtn').disabled = false;
+  }catch(e){
+    // User cancelled the picker, or no compatible device was found nearby
+    // — both surface as a rejected promise from requestDevice().
+    if(e.name !== 'NotFoundError'){
+      showBLERegisterError('Could not scan: '+(e.message || e.name || 'unknown error'));
+    }
+  }finally{
+    scanBtn.disabled = false; scanBtn.textContent = 'Scan for Nearby Device';
+  }
+}
+
+async function submitBLERegistration(){
+  const patient_id = document.getElementById('bleRegPatientId').value.trim();
+  const device_type = document.getElementById('bleRegDeviceType').value;
+
+  if(!patient_id){
+    showBLERegisterError('Patient ID is required.');
+    return;
+  }
+  if(!_bleRegDetectedDevice){
+    showBLERegisterError('Scan for a device first.');
+    return;
+  }
+
+  const btn = document.getElementById('bleRegisterSubmitBtn');
+  btn.disabled = true; btn.textContent = 'Registering…';
+
+  try{
+    const resp = await fetch(CFG.url+'/devices/register',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+CFG.tok},
+      body:JSON.stringify({
+        device_id: _bleRegDetectedDevice.id,
+        device_type,
+        patient_id,
+        device_name: _bleRegDetectedDevice.name,
+      })
+    });
+    let data = {};
+    try{ data = await resp.json(); }catch(_e){}
+
+    if(!resp.ok){
+      showBLERegisterError(data.message || data.error || ('Registration failed (HTTP '+resp.status+')'));
+      return;
+    }
+
+    closeBLERegisterModal();
+    fetchAll();
+    if(typeof loadBLEConfigDevices === 'function') loadBLEConfigDevices();
+  }catch(e){
+    showBLERegisterError('Could not reach the backend. Check the URL and your connection.');
   }finally{
     btn.disabled = false; btn.textContent = 'Register Device';
   }
@@ -1469,10 +1619,14 @@ function initDashboard(){
   // Register Implant button: clinical staff only (nurse/cardiologist/admin).
   // Patients never see this — they don't register implants, clinicians do.
   const implantBtn = document.getElementById('btn-register-implant');
+  const bleRegBtn = document.getElementById('btn-register-ble');
   const clinicalRoles = ['nurse','cardiologist','admin'];
   const isClinicalStaff = clinicalRoles.includes(CFG.userRole);
   if(implantBtn){
     implantBtn.style.display = isClinicalStaff ? '' : 'none';
+  }
+  if(bleRegBtn){
+    bleRegBtn.style.display = isClinicalStaff ? '' : 'none';
   }
 
   // Patient BLE Devices configuration panel: clinical staff only. Patients
