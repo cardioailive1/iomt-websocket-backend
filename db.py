@@ -112,6 +112,17 @@ class Database:
         row = await pool.fetchrow("SELECT * FROM users WHERE apple_user_id = $1", apple_user_id)
         return HospitalUser.from_row(row) if row else None
 
+    async def get_patient_by_patient_id(self, patient_id: str) -> Optional[HospitalUser]:
+        """
+        Look up a patient by their patient_id (not their user UUID). Used
+        to validate a clinician-entered patient_id before registering a
+        device on that patient's behalf — a typo shouldn't silently create
+        a device tied to a nonexistent patient record.
+        """
+        pool = self._require_pool()
+        row = await pool.fetchrow("SELECT * FROM users WHERE patient_id = $1 AND role = 'patient'", patient_id)
+        return HospitalUser.from_row(row) if row else None
+
     async def create_patient_from_apple(self, apple_user_id: str, email: str, name: str) -> HospitalUser:
         pool = self._require_pool()
         row = await pool.fetchrow(
@@ -444,28 +455,44 @@ class Database:
     async def upsert_ble_device(
         self, device_id: str, device_type: str, patient_id: str,
         device_name: Optional[str] = None, paired_by_user_id: Optional[str] = None,
+        organization_id: Optional[str] = None, configured_by_user_id: Optional[str] = None,
     ) -> "BLEDevice":
         """
-        Called from POST /devices/register (patient self-pairing). Re-pairing
-        an already-known device_id updates its type/name/active status but
-        deliberately does NOT touch organization_id — once clinical staff
-        have configured a device for their hospital, a patient simply
-        re-pairing it shouldn't silently un-configure it.
+        Called from POST /devices/register — used by BOTH paths:
+
+        - Patient self-pairing (organization_id=None): re-pairing an
+          already-known device_id updates its type/name/active status but
+          deliberately does NOT touch organization_id — once clinical staff
+          have configured a device for their hospital, a patient simply
+          re-pairing it shouldn't silently un-configure it.
+
+        - Clinician registering on a patient's behalf (e.g. an unconscious
+          patient who can't use their own phone) — organization_id IS
+          provided and set immediately, since the registering clinician's
+          own hospital affiliation is already known at registration time.
+          No separate "configure" step is needed afterward for this path.
         """
         pool = self._require_pool()
         row = await pool.fetchrow(
             """
-            INSERT INTO ble_devices (device_id, device_type, device_name, patient_id, paired_by_user_id)
-            VALUES ($1, $2, $3, $4, $5::uuid)
+            INSERT INTO ble_devices (
+                device_id, device_type, device_name, patient_id, paired_by_user_id,
+                organization_id, configured_by_user_id, configured_at
+            )
+            VALUES ($1, $2, $3, $4, $5::uuid, $6::uuid, $7::uuid, CASE WHEN $6::uuid IS NOT NULL THEN now() ELSE NULL END)
             ON CONFLICT (device_id) DO UPDATE
                 SET device_type = EXCLUDED.device_type,
                     device_name = COALESCE(EXCLUDED.device_name, ble_devices.device_name),
                     patient_id  = EXCLUDED.patient_id,
                     is_active   = true,
-                    updated_at  = now()
+                    updated_at  = now(),
+                    organization_id       = COALESCE(EXCLUDED.organization_id, ble_devices.organization_id),
+                    configured_by_user_id = COALESCE(EXCLUDED.configured_by_user_id, ble_devices.configured_by_user_id),
+                    configured_at         = COALESCE(EXCLUDED.configured_at, ble_devices.configured_at)
             RETURNING *
             """,
             device_id, device_type, device_name, patient_id, paired_by_user_id,
+            organization_id, configured_by_user_id,
         )
         return BLEDevice.from_row(row)
 
