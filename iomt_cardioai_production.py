@@ -1857,6 +1857,14 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             if patient_id != own_pid:
                 logger.warning("[DeviceRegister] patient_id mismatch user=%s attempted=%s", own_pid, patient_id)
                 return _web.json_response({"error": "patient_id_mismatch", "message": "You can only register devices for your own patient ID"}, status=403)
+        # NOTE: when a clinician registers on a patient's behalf, patient_id
+        # is treated as clinician-supplied free text (e.g. a hospital MRN)
+        # — same as the existing implant registration path. It is
+        # deliberately NOT validated against an existing `users` record,
+        # because a patient may be unconscious/incapacitated and have
+        # never signed into the app before (no Apple Sign-In yet means no
+        # users row exists at all). Requiring a pre-existing account would
+        # block exactly the emergency scenario this feature exists for.
 
         existing = bridge.registry.get(device_id)
         if existing:
@@ -1865,6 +1873,29 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         else:
             bridge.registry.register(device_id, device_type, patient_id)
             logger.info("[DeviceRegister] registered device=%s type=%s patient=%s name=%s", device_id, device_type, patient_id, device_name)
+
+        # If a CLINICIAN (not the patient) is registering this device —
+        # e.g. attaching a bedside ECG monitor to an unconscious patient
+        # who can't use their own phone to pair it — resolve the
+        # clinician's own organization and assign it immediately. This
+        # means no separate "configure" step is needed afterward, unlike
+        # a patient's own self-pairing (which intentionally leaves
+        # organization_id unset until a clinician configures it later).
+        organization_id = None
+        configured_by_user_id = None
+        is_clinical_registration = user.get("role") in (
+            UserRole.NURSE.value, UserRole.CARDIOLOGIST.value, UserRole.ADMIN.value,
+        )
+        if is_clinical_registration:
+            try:
+                clinician_user = await _load_user_by_id(user.get("sub"))
+                if clinician_user and clinician_user.organization:
+                    org = await _db.get_organization_by_name(clinician_user.organization)
+                    if org:
+                        organization_id = org.id
+                        configured_by_user_id = user.get("sub")
+            except Exception:
+                logger.exception("[DeviceRegister] error resolving organization for clinician_id=%s", user.get("sub"))
 
         # Persist to the database so this pairing survives restarts and is
         # visible to clinical staff for configuration (assigning it to
@@ -1875,6 +1906,7 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             await _db.upsert_ble_device(
                 device_id=device_id, device_type=device_type, patient_id=patient_id,
                 device_name=device_name, paired_by_user_id=user.get("sub"),
+                organization_id=organization_id, configured_by_user_id=configured_by_user_id,
             )
         except Exception:
             logger.exception("[DeviceRegister] failed to persist BLE device=%s to database", device_id)
@@ -1883,7 +1915,10 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         import asyncio as _asyncio
         _asyncio.create_task(acq_agent.register_device(device_id, device_type, patient_id))
 
-        return _web.json_response({"device_id": device_id, "patient_id": patient_id, "status": "registered"})
+        return _web.json_response({
+            "device_id": device_id, "patient_id": patient_id, "status": "registered",
+            "organization_configured": organization_id is not None,
+        })
 
     @_require_auth(cfg)
     @require_role(UserRole.NURSE, UserRole.CARDIOLOGIST, UserRole.ADMIN)
