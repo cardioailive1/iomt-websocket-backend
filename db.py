@@ -30,6 +30,7 @@ class HospitalUser:
     password_hash: str = field(repr=False)
     organization:  str = ""
     apple_user_id: Optional[str] = None
+    google_user_id: Optional[str] = None
     is_active:     bool = True
     mfa_secret:    Optional[str] = field(default=None, repr=False)
 
@@ -63,6 +64,7 @@ class HospitalUser:
             apple_user_id = row["apple_user_id"] if "apple_user_id" in keys else (
                               row["apple_sub"] if "apple_sub" in keys else None
                            ),
+            google_user_id = row["google_user_id"] if "google_user_id" in keys else None,
             is_active     = row["is_active"],
             mfa_secret    = row["mfa_secret"] if "mfa_secret" in keys else None,
         )
@@ -137,9 +139,80 @@ class Database:
         logger.info("[DB] provisioned patient via Apple: %s", email)
         return HospitalUser.from_row(row)
 
+    async def get_user_by_google_id(self, google_user_id: str) -> Optional[HospitalUser]:
+        pool = self._require_pool()
+        row = await pool.fetchrow("SELECT * FROM users WHERE google_user_id = $1", google_user_id)
+        return HospitalUser.from_row(row) if row else None
+
+    async def create_patient_from_google(self, google_user_id: str, email: str, name: str) -> HospitalUser:
+        """
+        Android equivalent of create_patient_from_apple() — Android has no
+        native platform sign-in tied to this backend, so patients on
+        Android use Google Sign-In instead, auto-provisioned the same way
+        iOS patients are via Apple Sign-In. Requires migration 007.
+        """
+        pool = self._require_pool()
+        row = await pool.fetchrow(
+            """
+            INSERT INTO users (email, name, role, patient_id, google_user_id, password_hash, is_active)
+            VALUES ($1, $2, 'patient', $3, $4, '', true)
+            ON CONFLICT (email) DO UPDATE SET google_user_id = EXCLUDED.google_user_id
+            RETURNING *
+            """,
+            email, name, google_user_id, google_user_id,
+        )
+        logger.info("[DB] provisioned patient via Google: %s", email)
+        return HospitalUser.from_row(row)
+
     async def update_last_login(self, user_id: str) -> None:
         pool = self._require_pool()
         await pool.execute("UPDATE users SET last_login_at = now() WHERE id = $1::uuid", user_id)
+
+    async def delete_account(self, user_id: str) -> None:
+        """
+        Self-service account deletion, called from DELETE /account.
+
+        IMPORTANT — this is anonymization, not a hard delete, and that's a
+        deliberate design choice, not a corner cut:
+
+        - Login credentials (password_hash, apple_user_id, google_user_id)
+          and all refresh tokens are wiped, so the account can never be
+          signed into again — this is the part that must happen
+          unconditionally.
+        - Directly-identifying fields (name, email) are overwritten with
+          an anonymized placeholder.
+        - Clinical data tied to this patient_id — alerts, reports, device
+          readings — is NOT deleted here. Unlike a typical consumer app,
+          medical record retention law in most jurisdictions does NOT
+          grant an unconditional right to erasure the way GDPR does for
+          general personal data (HIPAA, for instance, does not require —
+          and many state laws affirmatively require RETAINING — clinical
+          records for a fixed number of years regardless of a patient's
+          deletion request). The hospital/organization, not the patient's
+          own app-level request, is typically the actual data controller
+          for that clinical record.
+
+        This function deliberately does not decide that legal question —
+        it implements the technical half (credentials gone, identity
+        anonymized) and leaves the clinical-data-retention policy as an
+        explicit, visible decision for whoever configures this deployment,
+        rather than silently hard-deleting data that may be legally
+        required to persist, or silently retaining data a user was told
+        would be deleted.
+        """
+        pool = self._require_pool()
+        await self.revoke_all_refresh_tokens(user_id)
+        anonymized_email = f"deleted-user-{user_id}@deleted.cardioailive.com"
+        await pool.execute(
+            """
+            UPDATE users
+            SET name = 'Deleted User', email = $2,
+                password_hash = '', apple_user_id = NULL, google_user_id = NULL,
+                is_active = false, updated_at = now()
+            WHERE id = $1::uuid
+            """,
+            user_id, anonymized_email,
+        )
 
     async def list_users(self, role: Optional[UserRole] = None, limit: int = 100, offset: int = 0) -> List[HospitalUser]:
         pool = self._require_pool()
@@ -536,6 +609,122 @@ class Database:
         pool = self._require_pool()
         await pool.execute(
             "UPDATE ble_devices SET last_data_at = now() WHERE device_id = $1", device_id,
+        )
+
+    # ── Subscription linking (App Store / Play Billing → internal user) ──
+    #
+    # StoreKit 2 and Play Billing entitlement checks only ever gate the
+    # app UI on the client — the backend has no independent knowledge of
+    # subscription state unless something tells it. This is that
+    # something: the app calls link_subscription() once right after a
+    # successful purchase (see POST /subscription/link), and Apple's/
+    # Google's server notification webhooks call
+    # update_subscription_status_by_transaction() on every renewal,
+    # cancellation, or expiration after that.
+
+    async def link_subscription(
+        self, user_id: str, platform: str, transaction_id: str, product_id: str,
+        status: str = "active", expires_at: Optional[str] = None,
+    ) -> "SubscriptionLink":
+        """
+        Called right after a client-confirmed purchase. Optimistically
+        records status='active' immediately (good UX — don't make the
+        user wait for a webhook round-trip to unlock the app), which the
+        next webhook notification will correct if the store's authoritative
+        status actually differs.
+        """
+        pool = self._require_pool()
+        row = await pool.fetchrow(
+            """
+            INSERT INTO subscription_links (user_id, platform, transaction_id, product_id, status, expires_at)
+            VALUES ($1::uuid, $2, $3, $4, $5, $6::timestamptz)
+            ON CONFLICT (user_id) DO UPDATE
+                SET platform = EXCLUDED.platform, transaction_id = EXCLUDED.transaction_id,
+                    product_id = EXCLUDED.product_id, status = EXCLUDED.status,
+                    expires_at = EXCLUDED.expires_at, updated_at = now()
+            RETURNING *
+            """,
+            user_id, platform, transaction_id, product_id, status, expires_at,
+        )
+        return SubscriptionLink.from_row(row)
+
+    async def update_subscription_status_by_transaction(
+        self, platform: str, transaction_id: str, status: str,
+        expires_at: Optional[str] = None, auto_renew_status: Optional[bool] = None,
+    ) -> Optional["SubscriptionLink"]:
+        """
+        Called from the Apple/Google webhook handlers — this is the
+        authoritative update path. Looks up the subscription_links row by
+        (platform, transaction_id), NOT by user_id, since that's all the
+        webhook payload actually gives us.
+        """
+        pool = self._require_pool()
+        sets, params = ["status = $1", "updated_at = now()"], [status]
+        idx = 2
+        if expires_at is not None:
+            sets.append(f"expires_at = ${idx}::timestamptz"); params.append(expires_at); idx += 1
+        if auto_renew_status is not None:
+            sets.append(f"auto_renew_status = ${idx}"); params.append(auto_renew_status); idx += 1
+        params.extend([platform, transaction_id])
+        query = f"""
+            UPDATE subscription_links SET {', '.join(sets)}
+            WHERE platform = ${idx} AND transaction_id = ${idx + 1}
+            RETURNING *
+        """
+        row = await pool.fetchrow(query, *params)
+        if row is None:
+            logger.warning("[Subscription] webhook for unknown transaction platform=%s transaction_id=%s", platform, transaction_id)
+            return None
+        return SubscriptionLink.from_row(row)
+
+    async def get_subscription_status(self, user_id: str) -> Optional["SubscriptionLink"]:
+        pool = self._require_pool()
+        row = await pool.fetchrow("SELECT * FROM subscription_links WHERE user_id = $1::uuid", user_id)
+        return SubscriptionLink.from_row(row) if row else None
+
+    async def is_subscription_active(self, user_id: str) -> bool:
+        """
+        The actual enforcement check. 'active' and 'grace_period' both
+        count as active — a grace period means a renewal payment failed
+        but the store is still retrying and the user should keep access
+        while that plays out, matching what Apple/Google themselves
+        consider still-entitled states.
+        """
+        link = await self.get_subscription_status(user_id)
+        if link is None:
+            return False
+        return link.status in ("active", "grace_period")
+
+
+@dataclass
+class SubscriptionLink:
+    """Links a store subscription purchase to an internal user, and
+    tracks its current status — see migration 008."""
+
+    id:                str
+    user_id:           str
+    platform:          str
+    transaction_id:    str
+    product_id:        str
+    status:            str
+    expires_at:        Optional[str]
+    auto_renew_status: bool
+    created_at:        str
+    updated_at:        str
+
+    @classmethod
+    def from_row(cls, row: asyncpg.Record) -> "SubscriptionLink":
+        return cls(
+            id                = str(row["id"]),
+            user_id           = str(row["user_id"]),
+            platform          = row["platform"],
+            transaction_id    = row["transaction_id"],
+            product_id        = row["product_id"],
+            status            = row["status"],
+            expires_at        = str(row["expires_at"]) if row["expires_at"] else None,
+            auto_renew_status = row["auto_renew_status"],
+            created_at        = str(row["created_at"]),
+            updated_at        = str(row["updated_at"]),
         )
 
 
