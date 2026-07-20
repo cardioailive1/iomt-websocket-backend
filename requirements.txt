@@ -4,6 +4,9 @@ aiokafka
 bcrypt
 PyJWT
 websockets
+numpy
+httpx
+python-jose
 app-store-server-library
 google-api-python-client
 google-auth
