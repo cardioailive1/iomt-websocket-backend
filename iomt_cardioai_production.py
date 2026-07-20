@@ -54,6 +54,7 @@ from kafka_bus import (  # noqa: E402
 )
 from fhir_client import fhir_client  # noqa: E402
 from hl7_server import HL7MLLPServer, AdmissionRegistry, send_oru  # noqa: E402
+import subscription_verification as _sub_verify  # noqa: E402
 
 # Shared admission registry — populated by the HL7 MLLP listener (if
 # enabled), read by GET /admissions. Not yet wired into alert triage
@@ -1292,6 +1293,33 @@ def require_role(*allowed_roles: "UserRole"):
     return decorator
 
 
+# ── Subscription enforcement ─────────────────────────────────────────────
+#
+# NOTE: this decorator exists but is NOT applied anywhere below as a
+# blanket decorator. Every candidate endpoint (devices, alerts, reports,
+# admissions, device registration) turned out to be shared between
+# patients viewing their own data AND clinical staff viewing/managing
+# their patients' data via the web dashboard, using the SAME endpoint
+# with internal role-based filtering. A blanket decorator would have
+# gated the entire clinical dashboard on each individual clinician's
+# personal subscription status — a real bug, caught during
+# implementation, not a hypothetical. Each endpoint instead has an
+# inline, role-conditional check: only enforced when the calling user's
+# role is PATIENT. This decorator is kept available for any genuinely
+# patient-only endpoint added later.
+
+def require_active_subscription(handler):
+    @_wraps(handler)
+    async def wrapper(request: _web.Request) -> _web.Response:
+        user = request.get("user")
+        if user is None:
+            raise _web.HTTPUnauthorized(reason="Authentication required")
+        if not await _db.is_subscription_active(user["sub"]):
+            raise _web.HTTPPaymentRequired(reason="An active CardioAI Live Premium subscription is required")
+        return await handler(request)
+    return wrapper
+
+
 def _require_vendor_api_key(handler):
     @_wraps(handler)
     async def wrapper(request: _web.Request) -> _web.Response:
@@ -1584,6 +1612,152 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         logger.info("[Auth] logout user_id=%s revoked=%d", user_payload["sub"], revoked)
         return _web.json_response({"message": "Signed out successfully", "tokens_revoked": revoked})
 
+    # ── DELETE /account ──────────────────────────────────────────────────
+    #
+    # Self-service account deletion — required by both Apple App Store
+    # Review Guideline 5.1.1(v) and Google Play's account deletion policy
+    # for any app that supports account creation. Any authenticated user
+    # (patient or clinical staff) can delete their own account; this is
+    # NOT an admin action on someone else's account.
+    #
+    # See db.delete_account() for the important nuance this implements:
+    # credentials are wiped unconditionally (the account can never be
+    # signed into again), but clinical data tied to this patient_id is
+    # preserved rather than hard-deleted, since medical record retention
+    # law in most jurisdictions does not grant an unconditional right to
+    # erasure the way it might for a non-healthcare consumer app.
+
+    @_require_auth(cfg)
+    async def delete_account(request: _web.Request) -> _web.Response:
+        user_payload = request["user"]
+        user_id = user_payload["sub"]
+
+        user = await _db.get_user_by_id(user_id)
+        if user is None:
+            return _web.json_response({"error": "user_not_found"}, status=404)
+
+        await _db.delete_account(user_id)
+        await _db.log_event("account_deleted", user_id=user_id, ip_address=request.remote or "unknown", detail=f"role={user.role}")
+        logger.info("[Account] user_id=%s (role=%s) deleted their account", user_id, user.role)
+
+        return _web.json_response({
+            "message": "Your account has been deleted. You will not be able to sign in again.",
+            "clinical_data_note": (
+                "Vitals, alerts, and clinical reports associated with your care are retained "
+                "as part of the medical record, consistent with healthcare record-keeping "
+                "requirements, and are not deleted by this action."
+            ),
+        })
+
+    # ── POST /subscription/link ──────────────────────────────────────────
+    #
+    # Called by the app once, immediately after a client-confirmed
+    # purchase (StoreKit 2 on iOS, Play Billing on Android). This is what
+    # connects a store transaction/purchase token to an internal user —
+    # without it, the webhook handlers below have no way to know which
+    # user a given Apple/Google notification belongs to, since store
+    # notifications identify purchases, not your internal user IDs.
+    #
+    # Optimistically records status='active' immediately for good UX —
+    # the user shouldn't have to wait for a webhook round-trip after
+    # paying. The next real webhook notification corrects this if the
+    # store's authoritative status actually differs.
+
+    @_require_auth(cfg)
+    async def link_subscription(request: _web.Request) -> _web.Response:
+        user = request["user"]
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        platform = (body.get("platform") or "").strip().lower()
+        transaction_id = (body.get("transaction_id") or "").strip()
+        product_id = (body.get("product_id") or "").strip()
+
+        if platform not in ("apple", "google"):
+            return _web.json_response({"error": "invalid_platform", "message": "'platform' must be 'apple' or 'google'"}, status=400)
+        if not transaction_id or not product_id:
+            return _web.json_response({"error": "missing_fields", "message": "'transaction_id' and 'product_id' are required"}, status=400)
+
+        link = await _db.link_subscription(
+            user_id=user["sub"], platform=platform, transaction_id=transaction_id, product_id=product_id,
+        )
+        logger.info("[Subscription] linked user_id=%s platform=%s transaction_id=%s", user["sub"], platform, transaction_id[:16])
+
+        return _web.json_response({
+            "status": link.status, "platform": link.platform, "product_id": link.product_id,
+        })
+
+    # ── POST /webhooks/apple-subscription ────────────────────────────────
+    #
+    # Apple App Store Server Notifications V2. Configure this URL in
+    # App Store Connect → your app → App Information → App Store Server
+    # Notifications. No JWT auth here — Apple authenticates itself via
+    # the cryptographically signed payload, verified below.
+
+    async def apple_subscription_webhook(request: _web.Request) -> _web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        signed_payload = body.get("signedPayload")
+        if not signed_payload:
+            return _web.json_response({"error": "missing_signed_payload"}, status=400)
+
+        event = _sub_verify.verify_apple_notification(signed_payload)
+        if event is None:
+            # Either verification failed, or this notification type
+            # doesn't map to an entitlement change (e.g. a TEST
+            # notification) — either way, respond 200 so Apple doesn't
+            # keep retrying a notification we're deliberately not acting on.
+            return _web.json_response({"status": "ignored"})
+
+        updated = await _db.update_subscription_status_by_transaction(
+            platform="apple", transaction_id=event.transaction_id, status=event.status,
+            expires_at=event.expires_at, auto_renew_status=event.auto_renew_status,
+        )
+        if updated:
+            logger.info("[Subscription] Apple webhook updated transaction_id=%s status=%s", event.transaction_id[:16], event.status)
+        return _web.json_response({"status": "processed"})
+
+    # ── POST /webhooks/google-subscription ───────────────────────────────
+    #
+    # Google Play Real-time Developer Notifications, delivered via a
+    # Cloud Pub/Sub push subscription. Configure the push subscription's
+    # endpoint URL as:
+    #   https://your-backend.com/webhooks/google-subscription?token=<GOOGLE_WEBHOOK_TOKEN>
+    # No JWT auth — authenticated via the URL token instead, since Pub/Sub
+    # push requests aren't from your app's own users.
+
+    async def google_subscription_webhook(request: _web.Request) -> _web.Response:
+        token = request.query.get("token")
+        if not _sub_verify.verify_google_webhook_token(token):
+            logger.warning("[Subscription] Google webhook called with invalid/missing token")
+            return _web.json_response({"error": "unauthorized"}, status=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json"}, status=400)
+
+        rtdn_payload = _sub_verify.parse_google_pubsub_envelope(body)
+        if rtdn_payload is None:
+            return _web.json_response({"status": "ignored"})
+
+        event = _sub_verify.normalize_google_notification(rtdn_payload)
+        if event is None:
+            return _web.json_response({"status": "ignored"})
+
+        updated = await _db.update_subscription_status_by_transaction(
+            platform="google", transaction_id=event.transaction_id, status=event.status,
+            expires_at=event.expires_at, auto_renew_status=event.auto_renew_status,
+        )
+        if updated:
+            logger.info("[Subscription] Google webhook updated transaction_id=%s status=%s", event.transaction_id[:16], event.status)
+        return _web.json_response({"status": "processed"})
+
     async def root(request: _web.Request) -> _web.Response:
         return _web.json_response({
             "service": "IoMT CardioAI Backend", "status": "running", "bridge_id": cfg.cardioai_backend_id,
@@ -1631,6 +1805,16 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     @_require_auth(cfg)
     async def devices(request: _web.Request) -> _web.Response:
         user = request["user"]
+        # Subscription enforcement is role-conditional here, not a
+        # blanket decorator — this same endpoint serves the web dashboard
+        # for clinical staff (viewing all their patients' devices) using
+        # the CLINICIAN's own JWT. Gating it on the calling user's
+        # subscription would incorrectly block a nurse/cardiologist's
+        # dashboard access over their own personal billing status, which
+        # has nothing to do with the patients they're monitoring.
+        if user.get("role") == UserRole.PATIENT.value:
+            if not await _db.is_subscription_active(user["sub"]):
+                raise _web.HTTPPaymentRequired(reason="An active CardioAI Live Premium subscription is required")
         summary = bridge.registry.summary()
         if user.get("role") == UserRole.PATIENT.value:
             pid = user.get("patient_id")
@@ -1640,6 +1824,12 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     @_require_auth(cfg)
     async def alerts(request: _web.Request) -> _web.Response:
         user = request["user"]
+        # Role-conditional, same rationale as /devices above — clinical
+        # staff use this endpoint for their dashboard's aggregate alert
+        # view; only patients viewing their own alerts are gated.
+        if user.get("role") == UserRole.PATIENT.value:
+            if not await _db.is_subscription_active(user["sub"]):
+                raise _web.HTTPPaymentRequired(reason="An active CardioAI Live Premium subscription is required")
         agent = bridge.system.agents["alert_monitoring"]
         all_alerts = [
             {
@@ -1657,6 +1847,10 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     @_require_auth(cfg)
     async def reports(request: _web.Request) -> _web.Response:
         user = request["user"]
+        # Role-conditional, same rationale as /devices and /alerts above.
+        if user.get("role") == UserRole.PATIENT.value:
+            if not await _db.is_subscription_active(user["sub"]):
+                raise _web.HTTPPaymentRequired(reason="An active CardioAI Live Premium subscription is required")
         store = bridge.system.agents["communication"].report_store
         if user.get("role") == UserRole.PATIENT.value:
             pid = user.get("patient_id")
@@ -1836,9 +2030,106 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
             "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role.value, "patient_id": user.patient_id},
         })
 
+    # ── POST /auth/google ──────────────────────────────────────────────────
+    #
+    # Android equivalent of POST /auth/apple. Android has no native platform
+    # sign-in tied to this backend, so Android patients sign in with Google
+    # instead — auto-provisioned the very first time, exactly like Apple
+    # Sign-In does for iOS patients. Verifies the Google ID token against
+    # Google's tokeninfo endpoint (simplest correct verification path;
+    # equivalent in rigor to Apple's JWKS verification above, just using
+    # Google's own hosted verification endpoint instead of manually
+    # validating a JWKS signature).
+
+    async def google_signin(request: _web.Request) -> _web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return _web.json_response({"error": "invalid_json", "message": "Request body must be valid JSON"}, status=400)
+
+        id_token = (body.get("id_token") or "").strip()
+        first_name = (body.get("first_name") or "").strip()
+        last_name = (body.get("last_name") or "").strip()
+
+        if not id_token:
+            return _web.json_response({"error": "missing_fields", "message": "'id_token' is required"}, status=400)
+
+        client_ip = request.remote or "unknown"
+        if not _AUTH_RATE_LIMITER.is_allowed(client_ip):
+            logger.warning("[GoogleAuth] rate limited IP=%s", client_ip)
+            return _web.json_response({"error": "rate_limited", "message": "Too many sign-in attempts. Try again in 5 minutes."}, status=429)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    "https://oauth2.googleapis.com/tokeninfo",
+                    params={"id_token": id_token},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning("[GoogleAuth] tokeninfo rejected token, status=%s", resp.status)
+                        return _web.json_response({"error": "invalid_google_token", "message": "Google ID token is invalid or expired"}, status=401)
+                    google_payload = await resp.json()
+
+            expected_client_id = _optional_env("GOOGLE_OAUTH_CLIENT_ID", "")
+            if expected_client_id and google_payload.get("aud") != expected_client_id:
+                logger.warning("[GoogleAuth] token audience mismatch")
+                return _web.json_response({"error": "invalid_google_token", "message": "Token was not issued for this app"}, status=401)
+        except Exception as exc:
+            logger.warning("[GoogleAuth] token verification failed: %s", exc)
+            return _web.json_response({"error": "invalid_google_token", "message": "Could not verify Google ID token"}, status=401)
+
+        google_user_id = google_payload.get("sub", "")
+        if not google_user_id:
+            return _web.json_response({"error": "invalid_google_token", "message": "Google token missing subject claim"}, status=401)
+
+        google_email = google_payload.get("email", "")
+        if not google_email:
+            return _web.json_response({"error": "invalid_google_token", "message": "Google token missing email claim"}, status=401)
+
+        display_name = f"{first_name} {last_name}".strip()
+        if not display_name:
+            display_name = google_payload.get("name", "") or google_email.split("@")[0].replace(".", " ").title()
+
+        existing_user = await _db.get_user_by_google_id(google_user_id) or await _load_user_by_email(google_email)
+
+        if existing_user:
+            user = existing_user
+            if not user.is_active:
+                return _web.json_response({"error": "account_disabled", "message": "Your account has been disabled. Contact your administrator."}, status=403)
+        else:
+            user = await _db.create_patient_from_google(google_user_id=google_user_id, email=google_email, name=display_name)
+            logger.info("[GoogleAuth] auto-provisioned patient google_id=%s email=%s", google_user_id[:12], google_email)
+
+        _AUTH_RATE_LIMITER.reset(client_ip)
+        access_token = _issue_access_token(user, cfg)
+        refresh_token = await _db.issue_refresh_token(user.id, cfg.refresh_token_ttl)
+        await _db.update_last_login(user.id)
+        await _db.log_event("login_success", user_id=user.id, ip_address=client_ip, detail="google_signin")
+        logger.info("[GoogleAuth] sign-in successful google_id=%s role=%s IP=%s", google_user_id[:12], user.role.value, client_ip)
+
+        return _web.json_response({
+            "access_token": access_token, "refresh_token": refresh_token, "token_type": "Bearer", "expires_in": cfg.token_ttl_seconds,
+            "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role.value, "patient_id": user.patient_id},
+        })
+
     @_require_auth(cfg)
     async def device_register(request: _web.Request) -> _web.Response:
         user = request["user"]
+
+        # NOTE: subscription enforcement here is deliberately role-
+        # conditional, not a blanket decorator — this endpoint is shared
+        # by both patients self-pairing their own device AND clinical
+        # staff registering a bedside device on behalf of a patient who
+        # can't use their own phone (e.g. unconscious/incapacitated).
+        # Blocking that second path because the CLINICIAN's own personal
+        # subscription lapsed would be a real bug, not just an edge case
+        # — it would break emergency device registration over a billing
+        # technicality that has nothing to do with the patient being
+        # monitored.
+        if user.get("role") == UserRole.PATIENT.value:
+            if not await _db.is_subscription_active(user["sub"]):
+                raise _web.HTTPPaymentRequired(reason="An active CardioAI Live Premium subscription is required")
         try:
             body = await request.json()
         except Exception:
@@ -2276,6 +2567,10 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     @_require_auth(cfg)
     async def admissions(request: _web.Request) -> _web.Response:
         user = request["user"]
+        # Role-conditional, same rationale as /devices, /alerts, /reports.
+        if user.get("role") == UserRole.PATIENT.value:
+            if not await _db.is_subscription_active(user["sub"]):
+                raise _web.HTTPPaymentRequired(reason="An active CardioAI Live Premium subscription is required")
         summary = _admission_registry.summary()
         if user.get("role") == UserRole.PATIENT.value:
             pid = user.get("patient_id")
@@ -2285,10 +2580,15 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
     app.router.add_get("/", root)
     app.router.add_get("/dashboard", dashboard)
     app.router.add_post("/auth/apple", apple_signin)
+    app.router.add_post("/auth/google", google_signin)
     app.router.add_post("/auth/login", login)
     app.router.add_post("/auth/signup", signup)
     app.router.add_post("/auth/refresh", refresh)
     app.router.add_post("/auth/logout", logout)
+    app.router.add_delete("/account", delete_account)
+    app.router.add_post("/subscription/link", link_subscription)
+    app.router.add_post("/webhooks/apple-subscription", apple_subscription_webhook)
+    app.router.add_post("/webhooks/google-subscription", google_subscription_webhook)
     app.router.add_post("/devices/register", device_register)
     app.router.add_post("/clinical/devices/register-implant", register_implant)
     app.router.add_get("/clinical/devices/implants", list_implants)
