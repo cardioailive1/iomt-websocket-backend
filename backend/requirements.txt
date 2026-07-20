@@ -1,0 +1,9 @@
+aiohttp
+asyncpg
+aiokafka
+bcrypt
+PyJWT
+websockets
+app-store-server-library
+google-api-python-client
+google-auth
