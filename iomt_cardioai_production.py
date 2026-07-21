@@ -1782,6 +1782,8 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         })
 
     _DASHBOARD_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "iomt_cardioai_dashboard.html")
+    _PRIVACY_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "privacy-policy.html")
+    _TERMS_HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "terms-of-use.html")
 
     async def dashboard(request: _web.Request) -> _web.Response:
         try:
@@ -1790,6 +1792,40 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
         except FileNotFoundError:
             return _web.Response(
                 text="<h1>Dashboard file not found</h1><p>iomt_cardioai_dashboard.html is missing from the deploy.</p>",
+                content_type="text/html", status=500,
+            )
+        return _web.Response(text=html, content_type="text/html")
+
+    # ── GET /privacy and GET /terms ──────────────────────────────────────
+    #
+    # Serves the Privacy Policy and Terms of Use directly from this same
+    # Render deployment, at:
+    #   https://<your-render-domain>/privacy
+    #   https://<your-render-domain>/terms
+    # These are the URLs to paste into App Store Connect's Privacy Policy
+    # URL field, TestFlight's Test Information Privacy Policy URL field,
+    # and the paywall's Terms of Use / Privacy Policy links. No separate
+    # hosting needed — the HTML files just need to sit alongside this
+    # script in the deployed repo, same as the dashboard file already does.
+
+    async def privacy_policy(request: _web.Request) -> _web.Response:
+        try:
+            with open(_PRIVACY_HTML_PATH, "r", encoding="utf-8") as f:
+                html = f.read()
+        except FileNotFoundError:
+            return _web.Response(
+                text="<h1>Not found</h1><p>privacy-policy.html is missing from the deploy.</p>",
+                content_type="text/html", status=500,
+            )
+        return _web.Response(text=html, content_type="text/html")
+
+    async def terms_of_use(request: _web.Request) -> _web.Response:
+        try:
+            with open(_TERMS_HTML_PATH, "r", encoding="utf-8") as f:
+                html = f.read()
+        except FileNotFoundError:
+            return _web.Response(
+                text="<h1>Not found</h1><p>terms-of-use.html is missing from the deploy.</p>",
                 content_type="text/html", status=500,
             )
         return _web.Response(text=html, content_type="text/html")
@@ -2579,6 +2615,8 @@ def build_http_app(bridge: "IoMTCardioAIBridge") -> _web.Application:
 
     app.router.add_get("/", root)
     app.router.add_get("/dashboard", dashboard)
+    app.router.add_get("/privacy", privacy_policy)
+    app.router.add_get("/terms", terms_of_use)
     app.router.add_post("/auth/apple", apple_signin)
     app.router.add_post("/auth/google", google_signin)
     app.router.add_post("/auth/login", login)
