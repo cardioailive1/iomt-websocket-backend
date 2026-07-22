@@ -68,10 +68,11 @@
   <tr><th>Source</th><th>Data collected</th></tr>
   <tr><td>Bluetooth (BLE) medical devices you pair</td><td>Heart rate, ECG waveform data, blood pressure readings, blood oxygen saturation (SpO2), depending on the device type</td></tr>
   <tr><td>Apple Health / HealthKit</td><td>Heart rate data written to Apple Health by your Apple Watch or other HealthKit-connected sources, read with your explicit permission</td></tr>
-  <tr><td>Fitbit (via Google Health API)</td><td>Heart rate data, if you choose to connect a Fitbit account</td></tr>
   <tr><td>Clinician-registered devices</td><td>If a clinician registers a bedside monitoring device on your behalf (for example, if you are unable to pair a device yourself), the same categories of vitals data apply</td></tr>
 </table>
 <p>We also generate <strong>derived clinical data</strong> from the above: AI-detected patterns (such as possible arrhythmia indicators), alert records, and clinical summary reports.</p>
+
+<p><strong>Fitness data (steps, active energy, workouts).</strong> If you use the App's Fitness tab, we also read step count, active energy burned, and workout data from Apple Health, with your explicit permission. This is meaningfully different from the vitals data described above: fitness data is used only to display your own activity trends within the App. It is <strong>not sent to our servers, not processed by the clinical AI pipeline, and not shared with your care team.</strong> It stays on your device and in your own Apple Health store, the same way it would for any other fitness app you use.</p>
 
 <h3>2.3 Device and Technical Information</h3>
 <p>We collect device identifiers for paired Bluetooth devices, app version information, and connection/session logs needed to operate the Service securely (for example, authentication tokens and audit logs of sign-ins and data-access events).</p>
@@ -102,11 +103,10 @@
 <p><strong>We do not sell your personal information or health data to third parties, and we do not share it with advertisers.</strong></p>
 
 <h2 id="healthkit">5. Apple Health, HealthKit & Third-Party Health Data</h2>
-<p>If you choose to connect Apple Health, the App requests permission to read heart rate data written by other apps or devices (such as Apple Watch). You control this permission entirely through iOS Settings and can revoke it at any time. In accordance with Apple's requirements:</p>
+<p>If you choose to connect Apple Health, the App requests permission to read heart rate data written by other apps or devices (such as Apple Watch), and, if you use the Fitness tab, step count, active energy burned, and workout data as well. You control each of these permissions individually through iOS Settings and can revoke any of them at any time. In accordance with Apple's requirements:</p>
 <ul>
-  <li>Health data obtained through HealthKit is used solely to support your remote monitoring within the Service and is not used for advertising or marketing purposes.</li>
+  <li>Heart rate data obtained through HealthKit is used to support your remote monitoring within the Service; step count, active energy, and workout data are used only to display your own activity trends in the Fitness tab. Neither is used for advertising or marketing purposes.</li>
   <li>Health data obtained through HealthKit is not shared with third-party advertising networks or data brokers.</li>
-  <li>If you connect a Fitbit account, data is obtained through the Google Health API under a separate authorization you grant directly to Google; you can revoke this access at any time through your Google Account settings.</li>
 </ul>
 
 <h2 id="retention">6. Data Retention</h2>
@@ -124,7 +124,7 @@
   <li><strong>Access:</strong> you can view your own vitals, alerts, and reports at any time within the App.</li>
   <li><strong>Correction:</strong> if you believe information in your account (such as your name or email) is inaccurate, contact us using the information in Section 13.</li>
   <li><strong>Deletion:</strong> see Section 6 above.</li>
-  <li><strong>Device disconnection:</strong> you can disconnect any paired BLE device, Apple Health connection, or Fitbit connection at any time from the App's Connect tab.</li>
+  <li><strong>Device disconnection:</strong> you can disconnect any paired BLE device or Apple Health connection at any time from the App's Connect tab.</li>
   <li><strong>Subscription management:</strong> manage or cancel your subscription at any time through Settings → Subscription &amp; Account, which opens Apple's official subscription management screen.</li>
 </ul>
 
